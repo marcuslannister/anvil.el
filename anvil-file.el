@@ -1058,6 +1058,127 @@ MCP Parameters:
   (anvil-server-with-error-handling
     (format "%S" (anvil-file-append path content))))
 
+;;;; --- batch operations ----------------------------------------------------
+;;
+;; Execute multiple file operations in a single MCP call.  This is the
+;; most token-efficient way to perform bulk edits: instead of N round
+;; trips through MCP, one call with a JSON array of operations.
+;;
+;; Operations JSON format:
+;;   [
+;;     {"op": "replace", "old": "text", "new": "replacement"},
+;;     {"op": "replace-regexp", "pattern": "re", "replacement": "str"},
+;;     {"op": "insert-at-line", "line": 10, "content": "text"},
+;;     {"op": "delete-lines", "start": 5, "end": 8},
+;;     {"op": "append", "content": "text"},
+;;     {"op": "prepend", "content": "text"}
+;;   ]
+;;
+;; All operations run sequentially on the same temp buffer, so line
+;; numbers in later operations reflect changes made by earlier ones.
+;; The file is written once at the end (atomic).
+
+(defun anvil-file--batch-get (op key)
+  "Get KEY from operation alist OP, trying both symbol and string keys."
+  (or (alist-get key op)
+      (alist-get (symbol-name key) op nil nil #'equal)))
+
+(defun anvil-file--batch-get-number (op key)
+  "Get KEY from OP and coerce to number if string."
+  (let ((v (anvil-file--batch-get op key)))
+    (when v (if (stringp v) (string-to-number v) v))))
+
+(defun anvil-file-batch (path operations)
+  "Execute a list of OPERATIONS on file at PATH in a single pass.
+OPERATIONS is a list of alists, each with an `op' key and operation-specific
+keys.  All operations run on the same buffer; the file is written once at end.
+Returns (:ok t :operations N :file PATH) on success."
+  (let ((abs (anvil--prepare-path path))
+        (op-count 0))
+    (with-temp-buffer
+      (anvil--insert-file abs)
+      (dolist (op operations)
+        (let ((type (anvil-file--batch-get op 'op)))
+          (pcase type
+            ("replace"
+             (let ((old (anvil-file--batch-get op 'old))
+                   (new (anvil-file--batch-get op 'new))
+                   (limit (anvil-file--batch-get-number op 'max-count)))
+               (goto-char (point-min))
+               (let ((count 0))
+                 (while (and (search-forward old nil t)
+                             (or (null limit) (< count limit)))
+                   (replace-match new t t)
+                   (cl-incf count))
+                 (when (zerop count)
+                   (error "batch: replace not found: %s"
+                          (truncate-string-to-width old 80))))))
+            ("replace-regexp"
+             (let ((pattern (anvil-file--batch-get op 'pattern))
+                   (replacement (anvil-file--batch-get op 'replacement))
+                   (limit (anvil-file--batch-get-number op 'max-count)))
+               (goto-char (point-min))
+               (let ((count 0))
+                 (while (and (re-search-forward pattern nil t)
+                             (or (null limit) (< count limit)))
+                   (replace-match replacement nil nil)
+                   (cl-incf count))
+                 (when (zerop count)
+                   (error "batch: regexp not found: %s" pattern)))))
+            ("insert-at-line"
+             (let ((line (anvil-file--batch-get-number op 'line))
+                   (content (anvil-file--batch-get op 'content)))
+               (goto-char (point-min))
+               (forward-line (1- line))
+               (insert (if (string-suffix-p "\n" content)
+                           content
+                         (concat content "\n")))))
+            ("delete-lines"
+             (let ((start (anvil-file--batch-get-number op 'start))
+                   (end (anvil-file--batch-get-number op 'end)))
+               (goto-char (point-min))
+               (forward-line (1- start))
+               (let ((beg (point)))
+                 (forward-line (1+ (- end start)))
+                 (delete-region beg (point)))))
+            ("append"
+             (goto-char (point-max))
+             (unless (bolp) (insert "\n"))
+             (insert (anvil-file--batch-get op 'content)))
+            ("prepend"
+             (goto-char (point-min))
+             (let ((c (anvil-file--batch-get op 'content)))
+               (insert (if (string-suffix-p "\n" c) c (concat c "\n")))))
+            (_
+             (error "batch: unknown op: %s" type))))
+        (cl-incf op-count))
+      (anvil--write-current-buffer-to abs))
+    (list :ok t :operations op-count :file abs)))
+
+(defun anvil-file--tool-batch (path operations)
+  "Execute multiple file operations on PATH in a single call.
+OPERATIONS is a JSON array of operation objects.  Each object must have
+an \"op\" field and operation-specific fields.
+
+Supported operations:
+  {\"op\": \"replace\", \"old\": \"text\", \"new\": \"replacement\", \"max-count\": 1}
+  {\"op\": \"replace-regexp\", \"pattern\": \"re\", \"replacement\": \"str\"}
+  {\"op\": \"insert-at-line\", \"line\": 10, \"content\": \"text to insert\"}
+  {\"op\": \"delete-lines\", \"start\": 5, \"end\": 8}
+  {\"op\": \"append\", \"content\": \"text to add at end\"}
+  {\"op\": \"prepend\", \"content\": \"text to add at start\"}
+
+All operations run sequentially on the same buffer.  Line numbers in
+later operations reflect changes from earlier ones.  The file is
+written atomically once at the end.
+
+MCP Parameters:
+  path - Absolute path to the file to edit
+  operations - JSON array of operation objects (as a string)"
+  (anvil-server-with-error-handling
+    (let ((ops (json-parse-string operations :object-type 'alist :array-type 'list)))
+      (format "%S" (anvil-file-batch path ops)))))
+
 ;;;; --- module enable/disable -----------------------------------------------
 
 (defun anvil-file-enable ()
@@ -1115,6 +1236,18 @@ and limit to read specific sections."
    :description
    "Append text to the end of a file.  A leading newline is added
 if the file does not end with one.  Safe for files over 1.2MB."
+   :server-id anvil-file--server-id)
+
+  (anvil-server-register-tool
+   #'anvil-file--tool-batch
+   :id "file-batch"
+   :description
+   "Execute multiple file operations in a single call.  Most token-efficient
+way to perform bulk edits: N operations in 1 round trip instead of N calls.
+The operations parameter is a JSON array string.  Supported ops:
+replace, replace-regexp, insert-at-line, delete-lines, append, prepend.
+All operations run sequentially on the same buffer and the file is written
+once atomically at the end.  Safe for files over 1.2MB."
    :server-id anvil-file--server-id))
 
 (defun anvil-file-disable ()
@@ -1124,7 +1257,8 @@ if the file does not end with one.  Safe for files over 1.2MB."
   (anvil-server-unregister-tool "file-insert-at-line" anvil-file--server-id)
   (anvil-server-unregister-tool "file-delete-lines" anvil-file--server-id)
   (anvil-server-unregister-tool "file-read" anvil-file--server-id)
-  (anvil-server-unregister-tool "file-append" anvil-file--server-id))
+  (anvil-server-unregister-tool "file-append" anvil-file--server-id)
+  (anvil-server-unregister-tool "file-batch" anvil-file--server-id))
 
 (provide 'anvil-helpers)
 (provide 'anvil-file)
