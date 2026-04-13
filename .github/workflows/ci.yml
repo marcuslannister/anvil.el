@@ -12,18 +12,19 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        emacs-version: ['27.1', '29.4']
+        emacs-version: ['28.2', '29.4']
       fail-fast: false
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Emacs
-        uses: purcell/setup-emacs@master
+        uses: jcs090218/setup-emacs@master
         with:
           version: ${{ matrix.emacs-version }}
 
-      - name: Byte-compile
+      - name: Byte-compile (Unix)
+        if: runner.os != 'Windows'
         run: |
           emacs --batch -L . \
             -f batch-byte-compile \
@@ -33,9 +34,20 @@ jobs:
             anvil.el \
             anvil-eval.el
 
-      - name: Run tests
+      - name: Byte-compile (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          emacs --batch -L . -f batch-byte-compile anvil-server-metrics.el anvil-server.el anvil-server-commands.el anvil.el anvil-eval.el
+
+      - name: Run tests (Unix)
+        if: runner.os != 'Windows'
         run: |
           emacs --batch -L . \
             -l ert \
             -l tests/anvil-test.el \
             -f ert-run-tests-batch-and-exit
+
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          emacs --batch -L . -l ert -l tests/anvil-test.el -f ert-run-tests-batch-and-exit
