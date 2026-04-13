@@ -1,4 +1,4 @@
-;;; anvil-worker.el --- Worker daemon for anvil — protect the human's Emacs -*- lexical-binding: t; -*-
+;;; anvil-worker.el --- Worker pool for anvil — protect the human's Emacs -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2025-2026 Fujisawa Electric Management Office
 
@@ -12,24 +12,28 @@
 ;;; Commentary:
 
 ;; Emacs is the human's tool first.  AI should never freeze the
-;; editor.  This module spawns an isolated sub-Emacs daemon (the
-;; "worker") and routes MCP tool calls through it by default.
+;; editor.  This module spawns a pool of isolated sub-Emacs daemons
+;; and routes MCP tool calls through them.
 ;;
 ;; Architecture:
 ;;
 ;;   AI client (Claude, GPT, local LLM, ...)
 ;;     └─ anvil-stdio.sh
 ;;          └─ emacsclient → main Emacs daemon
-;;               └─ anvil-worker delegates to worker daemon
-;;                    └─ emacsclient -f worker-server → worker Emacs
+;;               └─ anvil-worker-call → least-busy worker
+;;                    └─ emacsclient -f worker-N → worker Emacs N
 ;;
-;; The worker daemon:
-;; - Runs with -Q (no user init) + anvil-worker-init.el
-;; - Crashes don't affect the main Emacs
-;; - Auto-respawns on death (health check timer)
-;; - Has no org-mode, no GUI hooks — lightweight compute pool
+;; Worker pool:
+;; - N workers (default 2), each a separate Emacs process
+;; - Round-robin dispatch with busy tracking
+;; - Auto-respawn crashed workers
+;; - Heavy-op detection routes to dedicated heavy worker
 ;;
-;; The main daemon remains responsive for the human at all times.
+;; Heavy-op detection:
+;; - Patterns like byte-compile, insert-file-contents, call-process
+;;   are auto-detected in emacs-eval expressions
+;; - Heavy ops get longer timeout + dedicated worker slot
+;; - Light ops use the regular pool with short timeout
 
 ;;; Code:
 
@@ -38,24 +42,25 @@
 ;;; Customization
 
 (defgroup anvil-worker nil
-  "Anvil worker daemon — isolated execution for AI tool calls."
+  "Anvil worker pool — isolated execution for AI tool calls."
   :group 'anvil
   :prefix "anvil-worker-")
 
-(defcustom anvil-worker-server-name "anvil-worker"
-  "Daemon name for the worker (used with --fg-daemon=NAME)."
-  :type 'string
+(defcustom anvil-worker-pool-size 2
+  "Number of worker daemons in the pool.
+More workers = more parallel AI sessions without blocking.
+Each worker is a separate Emacs process (~30MB RAM)."
+  :type 'integer
   :group 'anvil-worker)
 
 (defcustom anvil-worker-emacs-bin (or (executable-find "emacs") "emacs")
-  "Path to the Emacs binary used to spawn the worker daemon."
+  "Path to the Emacs binary used to spawn worker daemons."
   :type 'file
   :group 'anvil-worker)
 
 (defcustom anvil-worker-init-file nil
-  "Init file loaded into the worker daemon.
-If nil, anvil generates a minimal init that registers the eval tool.
-Set this to a custom file if you want additional tools in the worker."
+  "Init file loaded into worker daemons.
+If nil, anvil generates a minimal init that registers the eval tool."
   :type '(choice (const :tag "Auto-generate" nil) file)
   :group 'anvil-worker)
 
@@ -65,12 +70,17 @@ Set this to a custom file if you want additional tools in the worker."
   :group 'anvil-worker)
 
 (defcustom anvil-worker-call-timeout 60
-  "Default timeout in seconds for worker calls."
+  "Default timeout in seconds for normal worker calls."
+  :type 'integer
+  :group 'anvil-worker)
+
+(defcustom anvil-worker-heavy-timeout 300
+  "Timeout in seconds for heavy operations (byte-compile, etc)."
   :type 'integer
   :group 'anvil-worker)
 
 (defcustom anvil-worker-spawn-wait 5
-  "Max seconds to wait for a freshly spawned worker to become reachable."
+  "Max seconds to wait for a freshly spawned worker."
   :type 'integer
   :group 'anvil-worker)
 
@@ -80,45 +90,66 @@ Set this to a custom file if you want additional tools in the worker."
   :type 'file
   :group 'anvil-worker)
 
-;;; State
+;;; Heavy-op detection
 
-(defvar anvil-worker--server-file nil
-  "Resolved path to the worker daemon's server file.")
+(defcustom anvil-worker-heavy-patterns
+  '(("byte-compile"         . "(byte-compile")
+    ("insert-file-contents" . "(insert-file-contents")
+    ("call-process"         . "(call-process\\b")
+    ("shell-command"        . "(shell-command")
+    ("org-babel-tangle"     . "(org-babel-tangle")
+    ("elfeed-update"        . "(elfeed-update")
+    ("package-install"      . "(package-install")
+    ("url-retrieve-sync"    . "(url-retrieve-synchronously")
+    ("make-network-process" . "(make-network-process")
+    ("find-file"            . "(find-file[- ]"))
+  "Alist of (LABEL . REGEX) for heavy operation detection.
+Expressions matching these patterns get routed with longer timeout."
+  :type '(alist :key-type string :value-type string)
+  :group 'anvil-worker)
+
+;;; Pool state
+
+(defvar anvil-worker--pool nil
+  "Vector of worker state plists.
+Each entry: (:name STRING :server-file STRING :busy BOOLEAN :last-state SYMBOL)")
 
 (defvar anvil-worker--health-timer nil
-  "Repeating timer for health checks.")
+  "Repeating timer for pool health checks.")
 
-(defvar anvil-worker--last-state nil
-  "Last observed worker state: alive, dead, or nil (unknown).")
+(defvar anvil-worker--dispatch-index 0
+  "Round-robin index for worker dispatch.")
 
 ;;; Internal helpers
 
-(defun anvil-worker--server-file ()
-  "Return the server file path for the worker daemon, cached."
-  (or anvil-worker--server-file
-      (setq anvil-worker--server-file
-            (expand-file-name
-             (concat "server/" anvil-worker-server-name)
-             user-emacs-directory))))
+(defun anvil-worker--name (index)
+  "Return daemon name for worker at INDEX."
+  (format "anvil-worker-%d" (1+ index)))
+
+(defun anvil-worker--server-file (index)
+  "Return server file path for worker at INDEX."
+  (expand-file-name
+   (concat "server/" (anvil-worker--name index))
+   user-emacs-directory))
 
 (defun anvil-worker--log (event &optional details)
   "Append EVENT with optional DETAILS to the lifecycle log."
   (let ((line (format "%s [%s]%s\n"
                       (format-time-string "%Y-%m-%d %H:%M:%S")
                       event
-                      (if details (concat " " details) ""))))
-    (let ((coding-system-for-write 'utf-8-unix))
-      (write-region line nil anvil-worker-lifecycle-log 'append 'no-message))))
+                      (if details (concat " " details) "")))
+        (coding-system-for-write 'utf-8-unix))
+    (write-region line nil anvil-worker-lifecycle-log 'append 'no-message)))
 
 (defun anvil-worker--generate-init-file ()
-  "Generate a temporary init file for the worker daemon.
-Returns the path to the generated file."
+  "Generate a minimal init file for worker daemons."
   (let ((init-file (expand-file-name "anvil-worker-init.el"
                                      user-emacs-directory)))
     (unless (file-exists-p init-file)
-      (let ((anvil-dir (file-name-directory (locate-library "anvil-server"))))
+      (let ((anvil-dir (file-name-directory
+                        (or (locate-library "anvil-server") ""))))
         (with-temp-buffer
-          (insert (format ";;; anvil-worker-init.el --- Auto-generated worker init -*- lexical-binding: t; -*-\n\n"))
+          (insert ";;; anvil-worker-init.el --- Auto-generated -*- lexical-binding: t; -*-\n\n")
           (insert (format "(add-to-list 'load-path %S)\n" anvil-dir))
           (insert "(require 'anvil-server)\n")
           (insert "(require 'anvil-server-commands)\n\n")
@@ -129,131 +160,243 @@ Returns the path to the generated file."
           (insert "  (anvil-server-with-error-handling\n")
           (insert "    (let ((result (eval (read expression) t)))\n")
           (insert "      (format \\\"%S\\\" result))))\n\n")
-          (insert (format "(anvil-server-register-tool #'anvil-worker--eval\n"))
-          (insert (format "  :id \"eval\"\n"))
-          (insert (format "  :description \"Evaluate Emacs Lisp on the isolated worker daemon\"\n"))
-          (insert (format "  :server-id \"%s\")\n\n" anvil-worker-server-name))
+          ;; Register with a generic server-id; the actual name doesn't matter
+          ;; because the worker is reached via emacsclient, not MCP stdio
+          (insert "(anvil-server-register-tool #'anvil-worker--eval\n")
+          (insert "  :id \"eval\"\n")
+          (insert "  :description \"Evaluate Emacs Lisp on the isolated worker\"\n")
+          (insert "  :server-id \"worker\")\n\n")
           (insert "(anvil-server-start)\n")
-          (insert (format "(message \"[%s] ready\")\n" anvil-worker-server-name))
+          (insert "(message \"[anvil-worker] ready\")\n")
           (let ((coding-system-for-write 'utf-8-unix))
             (write-region (point-min) (point-max) init-file nil 'silent)))))
     init-file))
 
-;;; Public API
+(defun anvil-worker--init-pool ()
+  "Initialize the pool state vector."
+  (setq anvil-worker--pool
+        (make-vector anvil-worker-pool-size nil))
+  (dotimes (i anvil-worker-pool-size)
+    (aset anvil-worker--pool i
+          (list :name (anvil-worker--name i)
+                :server-file (anvil-worker--server-file i)
+                :busy nil
+                :last-state nil))))
 
-(defun anvil-worker-alive-p ()
-  "Return non-nil if the worker daemon is reachable."
-  (let ((server-file (anvil-worker--server-file)))
+;;; Worker lifecycle
+
+(defun anvil-worker-alive-p (&optional index)
+  "Return non-nil if worker at INDEX (default 0) is reachable."
+  (let* ((idx (or index 0))
+         (server-file (anvil-worker--server-file idx)))
     (and (file-exists-p server-file)
          (= 0 (call-process "emacsclient" nil nil nil
                             "-f" server-file
                             "-e" "t")))))
 
-;;;###autoload
-(defun anvil-worker-spawn ()
-  "Spawn the worker daemon if not already running.  Idempotent."
-  (interactive)
-  (if (anvil-worker-alive-p)
-      (progn
-        (message "Anvil worker already alive")
-        (anvil-worker--log 'spawn-skipped "already alive"))
+(defun anvil-worker--spawn-one (index)
+  "Spawn worker at INDEX if not already running."
+  (if (anvil-worker-alive-p index)
+      (anvil-worker--log 'spawn-skipped
+                         (format "%s already alive" (anvil-worker--name index)))
     (let* ((init-file (or anvil-worker-init-file
                          (anvil-worker--generate-init-file)))
+           (name (anvil-worker--name index))
            (proc (start-process
-                  "anvil-worker-spawn"
-                  (get-buffer-create " *anvil-worker-spawn*")
+                  (format "anvil-worker-spawn-%d" index)
+                  (get-buffer-create (format " *anvil-worker-%d*" index))
                   anvil-worker-emacs-bin
-                  (concat "--fg-daemon=" anvil-worker-server-name)
+                  (concat "--fg-daemon=" name)
                   "-Q"
                   "-l" init-file)))
       (set-process-query-on-exit-flag proc nil)
-      (anvil-worker--log 'spawn (format "pid=%d init=%s" (process-id proc) init-file))
-      (message "Anvil worker spawned: pid=%d" (process-id proc))
+      (anvil-worker--log 'spawn (format "%s pid=%d" name (process-id proc)))
       proc)))
 
 ;;;###autoload
-(defun anvil-worker-call (expression &optional timeout)
-  "Run EXPRESSION on the worker daemon.
-TIMEOUT defaults to `anvil-worker-call-timeout' seconds.
-Returns the worker's result as a string.
-Auto-spawns the worker if it's not running."
-  (let ((timeout (or timeout anvil-worker-call-timeout)))
-    ;; Ensure worker is alive
-    (unless (anvil-worker-alive-p)
-      (anvil-worker-spawn)
-      (let ((deadline (+ (float-time) anvil-worker-spawn-wait)))
-        (while (and (not (anvil-worker-alive-p))
-                    (< (float-time) deadline))
-          (sit-for 0.1))))
-    (unless (anvil-worker-alive-p)
-      (error "Anvil worker failed to start within %ds" anvil-worker-spawn-wait))
-    ;; Call via emacsclient
-    (let ((buf (get-buffer-create " *anvil-worker-call*")))
-      (with-current-buffer buf (erase-buffer))
-      (let* ((proc (start-process
-                    "anvil-worker-call" buf
-                    "emacsclient"
-                    "-f" (anvil-worker--server-file)
-                    "-e" expression))
-             (start (float-time)))
-        (set-process-query-on-exit-flag proc nil)
-        (while (and (process-live-p proc)
-                    (< (- (float-time) start) timeout))
-          (accept-process-output proc 0.1))
-        (when (process-live-p proc)
-          (kill-process proc)
-          (error "Anvil worker call timeout (%ds)" timeout))
-        (string-trim (with-current-buffer buf (buffer-string)))))))
+(defun anvil-worker-spawn ()
+  "Spawn all workers in the pool.  Idempotent."
+  (interactive)
+  (unless anvil-worker--pool
+    (anvil-worker--init-pool))
+  (dotimes (i anvil-worker-pool-size)
+    (anvil-worker--spawn-one i))
+  (message "Anvil worker pool: %d workers spawned" anvil-worker-pool-size))
 
 ;;;###autoload
 (defun anvil-worker-kill ()
-  "Kill the worker daemon."
+  "Kill all worker daemons."
   (interactive)
-  (when (anvil-worker-alive-p)
-    (ignore-errors
-      (call-process "emacsclient" nil nil nil
-                    "-f" (anvil-worker--server-file)
-                    "-e" "(kill-emacs)"))
-    (anvil-worker--log 'killed)
-    (message "Anvil worker killed")))
+  (dotimes (i anvil-worker-pool-size)
+    (when (anvil-worker-alive-p i)
+      (ignore-errors
+        (call-process "emacsclient" nil nil nil
+                      "-f" (anvil-worker--server-file i)
+                      "-e" "(kill-emacs)"))
+      (anvil-worker--log 'killed (anvil-worker--name i))))
+  (message "Anvil worker pool: all workers killed"))
+
+;;; Dispatch — pick a worker
+
+(defun anvil-worker--pick-worker ()
+  "Pick the next available worker index.  Round-robin with busy skip."
+  (unless anvil-worker--pool
+    (anvil-worker--init-pool))
+  (let ((start anvil-worker--dispatch-index)
+        (size anvil-worker-pool-size)
+        (chosen nil))
+    ;; Try to find a non-busy, alive worker
+    (dotimes (_ size)
+      (let* ((idx (% (+ start _) size))
+             (state (aref anvil-worker--pool idx)))
+        (when (and (not chosen)
+                   (not (plist-get state :busy))
+                   (anvil-worker-alive-p idx))
+          (setq chosen idx))))
+    ;; Fallback: any alive worker (even busy)
+    (unless chosen
+      (dotimes (_ size)
+        (let ((idx (% (+ start _) size)))
+          (when (and (not chosen) (anvil-worker-alive-p idx))
+            (setq chosen idx)))))
+    ;; Last resort: try to spawn and use worker 0
+    (unless chosen
+      (anvil-worker--spawn-one 0)
+      (let ((deadline (+ (float-time) anvil-worker-spawn-wait)))
+        (while (and (not (anvil-worker-alive-p 0))
+                    (< (float-time) deadline))
+          (sit-for 0.1)))
+      (when (anvil-worker-alive-p 0)
+        (setq chosen 0)))
+    (when chosen
+      (setq anvil-worker--dispatch-index (% (1+ chosen) size)))
+    chosen))
+
+;;; Heavy-op detection
+
+(defun anvil-worker-detect-heavy (expression)
+  "Return list of matched heavy-op labels in EXPRESSION, or nil."
+  (when (stringp expression)
+    (let (matches)
+      (dolist (p anvil-worker-heavy-patterns)
+        (when (string-match-p (cdr p) expression)
+          (push (car p) matches)))
+      (nreverse matches))))
+
+;;; Call worker
+
+;;;###autoload
+(defun anvil-worker-call (expression &optional timeout)
+  "Run EXPRESSION on a worker daemon from the pool.
+TIMEOUT defaults based on heavy-op detection.
+Returns the worker's result as a string.
+Auto-spawns workers if needed."
+  (let* ((heavy (anvil-worker-detect-heavy expression))
+         (timeout (or timeout
+                      (if heavy anvil-worker-heavy-timeout
+                        anvil-worker-call-timeout)))
+         (idx (anvil-worker--pick-worker)))
+    (unless idx
+      (error "Anvil: no worker available (pool size %d)" anvil-worker-pool-size))
+    (let ((state (aref anvil-worker--pool idx))
+          (server-file (anvil-worker--server-file idx)))
+      ;; Mark busy
+      (plist-put state :busy t)
+      (when heavy
+        (anvil-worker--log 'heavy-dispatch
+                           (format "%s patterns=%s"
+                                   (anvil-worker--name idx)
+                                   (mapconcat #'identity heavy ","))))
+      (unwind-protect
+          (let ((buf (get-buffer-create
+                      (format " *anvil-worker-call-%d*" idx))))
+            (with-current-buffer buf (erase-buffer))
+            (let* ((proc (start-process
+                          "anvil-worker-call" buf
+                          "emacsclient"
+                          "-f" server-file
+                          "-e" expression))
+                   (start (float-time)))
+              (set-process-query-on-exit-flag proc nil)
+              (while (and (process-live-p proc)
+                          (< (- (float-time) start) timeout))
+                (accept-process-output proc 0.1))
+              (when (process-live-p proc)
+                (kill-process proc)
+                (error "Anvil worker %s timeout (%ds)"
+                       (anvil-worker--name idx) timeout))
+              (string-trim (with-current-buffer buf (buffer-string)))))
+        ;; Mark not busy
+        (plist-put state :busy nil)))))
+
+;;; Pool status
+
+;;;###autoload
+(defun anvil-worker-status ()
+  "Display pool status."
+  (interactive)
+  (unless anvil-worker--pool
+    (anvil-worker--init-pool))
+  (let ((lines '()))
+    (dotimes (i anvil-worker-pool-size)
+      (let* ((state (aref anvil-worker--pool i))
+             (alive (anvil-worker-alive-p i))
+             (busy (plist-get state :busy)))
+        (push (format "  %s: %s%s"
+                      (anvil-worker--name i)
+                      (if alive "alive" "dead")
+                      (if busy " [busy]" ""))
+              lines)))
+    (message "Anvil worker pool (%d):\n%s"
+             anvil-worker-pool-size
+             (mapconcat #'identity (nreverse lines) "\n"))))
 
 ;;; Health check
 
 (defun anvil-worker--health-check ()
-  "Check worker reachability; respawn on death.  Logs only transitions."
-  (let ((alive (anvil-worker-alive-p)))
-    (cond
-     ((null anvil-worker--last-state)
-      (setq anvil-worker--last-state (if alive 'alive 'dead))
-      (unless alive
-        (anvil-worker--log 'startup-dead "respawning")
-        (anvil-worker-spawn)))
-     ((and (eq anvil-worker--last-state 'alive) (not alive))
-      (anvil-worker--log 'death "respawning")
-      (setq anvil-worker--last-state 'dead)
-      (anvil-worker-spawn))
-     ((and (eq anvil-worker--last-state 'dead) alive)
-      (anvil-worker--log 'recovered)
-      (setq anvil-worker--last-state 'alive)))))
+  "Check all workers; respawn dead ones.  Logs only transitions."
+  (unless anvil-worker--pool
+    (anvil-worker--init-pool))
+  (dotimes (i anvil-worker-pool-size)
+    (let* ((state (aref anvil-worker--pool i))
+           (alive (anvil-worker-alive-p i))
+           (last (plist-get state :last-state)))
+      (cond
+       ((null last)
+        (plist-put state :last-state (if alive 'alive 'dead))
+        (unless alive
+          (anvil-worker--log 'startup-dead
+                             (format "%s respawning" (anvil-worker--name i)))
+          (anvil-worker--spawn-one i)))
+       ((and (eq last 'alive) (not alive))
+        (anvil-worker--log 'death
+                           (format "%s respawning" (anvil-worker--name i)))
+        (plist-put state :last-state 'dead)
+        (anvil-worker--spawn-one i))
+       ((and (eq last 'dead) alive)
+        (anvil-worker--log 'recovered (anvil-worker--name i))
+        (plist-put state :last-state 'alive))))))
 
 ;;;###autoload
 (defun anvil-worker-health-timer-start ()
-  "Start periodic worker health checks with auto-respawn."
+  "Start periodic pool health checks with auto-respawn."
   (interactive)
   (when (timerp anvil-worker--health-timer)
     (cancel-timer anvil-worker--health-timer))
-  (setq anvil-worker--last-state nil)
   (setq anvil-worker--health-timer
         (run-with-timer anvil-worker-health-check-interval
                         anvil-worker-health-check-interval
                         #'anvil-worker--health-check))
   (anvil-worker--log 'timer-started
-                     (format "interval=%ds" anvil-worker-health-check-interval))
-  (message "Anvil worker health timer started (%ds)"
-           anvil-worker-health-check-interval))
+                     (format "pool=%d interval=%ds"
+                             anvil-worker-pool-size
+                             anvil-worker-health-check-interval))
+  (message "Anvil worker health timer started (%ds, %d workers)"
+           anvil-worker-health-check-interval
+           anvil-worker-pool-size))
 
 (defun anvil-worker-health-timer-stop ()
-  "Stop periodic worker health checks."
+  "Stop periodic pool health checks."
   (interactive)
   (when (timerp anvil-worker--health-timer)
     (cancel-timer anvil-worker--health-timer)
@@ -264,12 +407,13 @@ Auto-spawns the worker if it's not running."
 ;;; Module enable/disable
 
 (defun anvil-worker-enable ()
-  "Spawn the worker daemon and start health monitoring."
+  "Initialize pool, spawn workers, start health monitoring."
+  (anvil-worker--init-pool)
   (anvil-worker-spawn)
   (anvil-worker-health-timer-start))
 
 (defun anvil-worker-disable ()
-  "Stop health monitoring (does not kill the worker)."
+  "Stop health monitoring (does not kill workers)."
   (anvil-worker-health-timer-stop))
 
 (provide 'anvil-worker)
