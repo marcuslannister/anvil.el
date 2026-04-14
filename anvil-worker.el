@@ -153,34 +153,39 @@ Each entry: (:name STRING :server-file STRING :busy BOOLEAN :last-state SYMBOL)"
     (write-region line nil anvil-worker-lifecycle-log 'append 'no-message)))
 
 (defun anvil-worker--generate-init-file ()
-  "Generate a minimal init file for worker daemons."
-  (let ((init-file (expand-file-name "anvil-worker-init.el"
-                                     user-emacs-directory)))
-    (unless (file-exists-p init-file)
-      (let ((anvil-dir (file-name-directory
-                        (or (locate-library "anvil-server") ""))))
-        (with-temp-buffer
-          (insert ";;; anvil-worker-init.el --- Auto-generated -*- lexical-binding: t; -*-\n\n")
-          (insert (format "(add-to-list 'load-path %S)\n" anvil-dir))
-          (insert "(require 'anvil-server)\n")
-          (insert "(require 'anvil-server-commands)\n\n")
-          (insert "(defun anvil-worker--eval (expression)\n")
-          (insert "  \"Evaluate EXPRESSION on the worker daemon.\n\n")
-          (insert "MCP Parameters:\n")
-          (insert "  expression - Emacs Lisp expression as a string\"\n")
-          (insert "  (anvil-server-with-error-handling\n")
-          (insert "    (let ((result (eval (read expression) t)))\n")
-          (insert "      (format \\\"%S\\\" result))))\n\n")
-          ;; Register with a generic server-id; the actual name doesn't matter
-          ;; because the worker is reached via emacsclient, not MCP stdio
-          (insert "(anvil-server-register-tool #'anvil-worker--eval\n")
-          (insert "  :id \"eval\"\n")
-          (insert "  :description \"Evaluate Emacs Lisp on the isolated worker\"\n")
-          (insert "  :server-id \"worker\")\n\n")
-          (insert "(anvil-server-start)\n")
-          (insert "(message \"[anvil-worker] ready\")\n")
-          (let ((coding-system-for-write 'utf-8-unix))
-            (write-region (point-min) (point-max) init-file nil 'silent)))))
+  "Generate a minimal init file for worker daemons.
+Always regenerates.  A cached file can go stale when anvil itself
+moves on disk (the previous path gets baked into `load-path'), so
+we unconditionally rewrite from the current `locate-library'
+result.  Signals if `anvil-server' cannot be located."
+  (let* ((init-file (expand-file-name "anvil-worker-init.el"
+                                      user-emacs-directory))
+         (located (locate-library "anvil-server"))
+         (anvil-dir (and located (file-name-directory located))))
+    (unless anvil-dir
+      (error "anvil-worker: cannot locate anvil-server in load-path"))
+    (with-temp-buffer
+      (insert ";;; anvil-worker-init.el --- Auto-generated -*- lexical-binding: t; -*-\n\n")
+      (insert (format "(add-to-list 'load-path %S)\n" anvil-dir))
+      (insert "(require 'anvil-server)\n")
+      (insert "(require 'anvil-server-commands)\n\n")
+      (insert "(defun anvil-worker--eval (expression)\n")
+      (insert "  \"Evaluate EXPRESSION on the worker daemon.\n\n")
+      (insert "MCP Parameters:\n")
+      (insert "  expression - Emacs Lisp expression as a string\"\n")
+      (insert "  (anvil-server-with-error-handling\n")
+      (insert "    (let ((result (eval (read expression) t)))\n")
+      (insert "      (format \"%S\" result))))\n\n")
+      ;; Register with a generic server-id; the actual name doesn't matter
+      ;; because the worker is reached via emacsclient, not MCP stdio
+      (insert "(anvil-server-register-tool #'anvil-worker--eval\n")
+      (insert "  :id \"eval\"\n")
+      (insert "  :description \"Evaluate Emacs Lisp on the isolated worker\"\n")
+      (insert "  :server-id \"worker\")\n\n")
+      (insert "(anvil-server-start)\n")
+      (insert "(message \"[anvil-worker] ready\")\n")
+      (let ((coding-system-for-write 'utf-8-unix))
+        (write-region (point-min) (point-max) init-file nil 'silent)))
     init-file))
 
 (defun anvil-worker--init-pool ()
