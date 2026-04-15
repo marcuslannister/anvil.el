@@ -7,8 +7,8 @@
 Your AI's workbench. Turn Emacs into a tool server for any LLM agent.
 #+end_quote
 
-#+html: <a href="https://github.com/zawatton21/anvil.el/actions"><img src="https://img.shields.io/github/actions/workflow/status/zawatton21/anvil.el/ci.yml?branch=master&style=flat-square" alt="CI"></a>
-#+html: <a href="https://github.com/sponsors/zawatton21"><img src="https://img.shields.io/badge/Sponsor_%E2%9D%A4_Support_this_project-pink?style=for-the-badge" alt="Sponsor"></a>
+#+html: <a href="https://github.com/zawatton/anvil.el/actions"><img src="https://img.shields.io/github/actions/workflow/status/zawatton/anvil.el/ci.yml?branch=master&style=flat-square" alt="CI"></a>
+#+html: <a href="https://github.com/sponsors/zawatton"><img src="https://img.shields.io/badge/Sponsor_%E2%9D%A4_Support_this_project-pink?style=for-the-badge" alt="Sponsor"></a>
 
 * What is Anvil?
 
@@ -82,7 +82,7 @@ journal file power users actually maintain).
 
 Anvil isn't just theory, and it isn't org-mode-only. It was
 validated on a real large-scale TypeScript migration project —
-the [[https://github.com/zawatton21/newDTW.github.io][newDTW]] repository, which ports a decompiled HSP application
+the [[https://github.com/zawatton/newDTW.github.io][newDTW]] repository, which ports a decompiled HSP application
 to TypeScript:
 
 - *16,000+* lines of TypeScript across *1,400+* modules
@@ -125,6 +125,40 @@ file, or to a global state interface.
 | Read full file + Edit        | thousands  |
 | =anvil-file-insert-at-line=  | tens       |
 | Reduction                    | *~90%+*    |
+
+*** =anvil-json-object-add= — i18n & config dictionaries
+
+For workflows that append many key/value pairs to a JSON object
+(language dictionaries, feature flags, configuration maps), the
+generic =Edit= tool requires a long anchor string in every
+round trip.
+
+Measured: adding ~200 i18n keys in batches of 40.
+
+| Method                       | Tokens   | Calls |
+|------------------------------+----------+-------|
+| Generic =Edit= ×5            | ~30,000  | 5     |
+| =anvil-json-object-add= ×5   | ~8,000   | 5     |
+| Reduction                    | *~73%*   | 0     |
+
+Handles trailing commas, closing-brace placement, indent
+detection, and duplicate-key policy automatically.
+
+*** =anvil-file-ensure-import= — idempotent import insertion
+
+Adding =import= lines across many source files is one of the
+most repetitive edit patterns. =file-ensure-import= checks
+whether the line is already present and inserts after the last
+matching header line only if needed. Works with any
+=:after-regex= so it applies equally to Emacs =(require ...)=
+blocks.
+
+*** =anvil-file-batch-across= — coordinated multi-file edits
+
+For a refactor that touches N files in similar ways (docstring
+updates, renames, import additions), pair this with
+=file-batch='s per-file op lists to complete the whole
+refactor in one MCP call.
 
 *** Why TypeScript benefits especially
 
@@ -201,10 +235,10 @@ Then run =M-x anvil-describe-setup= for client configuration instructions.
 
 ** async-installer
 
-[[https://github.com/zawatton21/async-installer][async-installer]] — a small, non-blocking package manager for Emacs. Pure Elisp syntax — no macro DSL required.
+[[https://github.com/zawatton/async-installer][async-installer]] — a small, non-blocking package manager for Emacs. Pure Elisp syntax — no macro DSL required.
 
 #+begin_src emacs-lisp
-(async-installer-git-add "https://github.com/zawatton21/anvil.el.git"
+(async-installer-git-add "https://github.com/zawatton/anvil.el.git"
                             :branch "master"
                             :main "anvil.el")
 #+end_src
@@ -213,13 +247,13 @@ Then run =M-x anvil-describe-setup= for client configuration instructions.
 
 #+begin_src emacs-lisp
 (straight-use-package
- '(anvil :type git :host github :repo "zawatton21/anvil.el"))
+ '(anvil :type git :host github :repo "zawatton/anvil.el"))
 #+end_src
 
 ** elpaca
 
 #+begin_src emacs-lisp
-(elpaca (anvil :host github :repo "zawatton21/anvil.el"))
+(elpaca (anvil :host github :repo "zawatton/anvil.el"))
 #+end_src
 
 ** use-package (with straight or elpaca)
@@ -227,11 +261,11 @@ Then run =M-x anvil-describe-setup= for client configuration instructions.
 #+begin_src emacs-lisp
 ;; with straight
 (use-package anvil
-  :straight (anvil :type git :host github :repo "zawatton21/anvil.el"))
+  :straight (anvil :type git :host github :repo "zawatton/anvil.el"))
 
 ;; with elpaca
 (use-package anvil
-  :ensure (:host github :repo "zawatton21/anvil.el"))
+  :ensure (:host github :repo "zawatton/anvil.el"))
 #+end_src
 
 ** Manual
@@ -518,9 +552,9 @@ itself.
 * Contributing
 
 Issues, feature requests, and pull requests are welcome at
-[[https://github.com/zawatton21/anvil.el]].
+[[https://github.com/zawatton/anvil.el]].
 
-If you find Anvil useful, consider [[https://github.com/sponsors/zawatton21][sponsoring the project]].
+If you find Anvil useful, consider [[https://github.com/sponsors/zawatton][sponsoring the project]].
 
 * Related Packages
 
@@ -528,12 +562,12 @@ These packages are also developed by the same author:
 
 | Package | Description | Repo |
 |---------+-------------+------|
-| [[https://github.com/zawatton21/async-installer][async-installer]] | Non-blocking GitHub package installer with commit pinning | [[https://github.com/zawatton21/async-installer][GitHub]] |
-| [[https://github.com/zawatton21/eat-windows-pty][eat-windows-pty]] | ConPTY support for emacs-eat on native Windows | [[https://github.com/zawatton21/eat-windows-pty][GitHub]] |
-| [[https://github.com/zawatton21/org-draw][org-draw]] | Excalidraw and tldraw integration for org-mode | [[https://github.com/zawatton21/org-draw][GitHub]] |
-| [[https://github.com/zawatton21/catchall-box][catchall-box]] | UUID-based file management for org-mode | [[https://github.com/zawatton21/catchall-box][GitHub]] |
-| [[https://github.com/zawatton21/emacs-skkserv][emacs-skkserv]] | Pure Elisp skkserv for Japanese input (ddskk, Google IME, MeCab) | [[https://github.com/zawatton21/emacs-skkserv][GitHub]] |
-| [[https://github.com/zawatton21/my-locate-library][my-locate-library]] | Fast load-path index for accelerated require/load | [[https://github.com/zawatton21/my-locate-library][GitHub]] |
+| [[https://github.com/zawatton/async-installer][async-installer]] | Non-blocking GitHub package installer with commit pinning | [[https://github.com/zawatton/async-installer][GitHub]] |
+| [[https://github.com/zawatton/eat-windows-pty][eat-windows-pty]] | ConPTY support for emacs-eat on native Windows | [[https://github.com/zawatton/eat-windows-pty][GitHub]] |
+| [[https://github.com/zawatton/org-draw][org-draw]] | Excalidraw and tldraw integration for org-mode | [[https://github.com/zawatton/org-draw][GitHub]] |
+| [[https://github.com/zawatton/catchall-box][catchall-box]] | UUID-based file management for org-mode | [[https://github.com/zawatton/catchall-box][GitHub]] |
+| [[https://github.com/zawatton/emacs-skkserv][emacs-skkserv]] | Pure Elisp skkserv for Japanese input (ddskk, Google IME, MeCab) | [[https://github.com/zawatton/emacs-skkserv][GitHub]] |
+| [[https://github.com/zawatton/my-locate-library][my-locate-library]] | Fast load-path index for accelerated require/load | [[https://github.com/zawatton/my-locate-library][GitHub]] |
 
 * License
 

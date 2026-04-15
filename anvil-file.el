@@ -1,6 +1,6 @@
 ;;; anvil-file.el --- Safe file and org editing for anvil -*- lexical-binding: t; -*-
 
-;; Author: zawatton21
+;; Author: zawatton
 ;; Keywords: tools, mcp, claude
 
 ;;; Commentary:
@@ -37,6 +37,7 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'json)
 
 ;;;; --- internal -----------------------------------------------------------
 
@@ -1179,6 +1180,330 @@ MCP Parameters:
     (let ((ops (json-parse-string operations :object-type 'alist :array-type 'list)))
       (format "%S" (anvil-file-batch path ops)))))
 
+;;;; --- JSON object editing -------------------------------------------------
+;;
+;; Bulk-add key/value pairs to a top-level JSON object, preserving
+;; existing formatting.  Designed for i18n workflows where hundreds of
+;; translations need to be appended in a single MCP call.  Edit tool
+;; alternatives require a long anchor old_string for each batch, wasting
+;; tokens; this helper only needs the PAIRS payload.
+
+(defun anvil--json-escape-string (s)
+  "Return S escaped for use inside a JSON string literal.
+Does NOT add surrounding quotes."
+  (replace-regexp-in-string
+   "[\"\\\\\b\f\n\r\t]"
+   (lambda (m)
+     (pcase (aref m 0)
+       (?\" "\\\"")
+       (?\\ "\\\\")
+       (?\b "\\b")
+       (?\f "\\f")
+       (?\n "\\n")
+       (?\r "\\r")
+       (?\t "\\t")))
+   s t t))
+
+(defun anvil--json-format-kv (key value indent-cols)
+  "Return formatted \"KEY\": \"VALUE\" line with INDENT-COLS leading spaces.
+Both KEY and VALUE are escaped as JSON strings."
+  (format "%s\"%s\": \"%s\""
+          (make-string indent-cols ?\s)
+          (anvil--json-escape-string key)
+          (anvil--json-escape-string value)))
+
+(defun anvil--json-detect-indent (buffer-content default)
+  "Inspect BUFFER-CONTENT and return the indent width used for entries.
+Falls back to DEFAULT (usually 2) if no indented string entry is found."
+  (if (string-match "^\\( +\\)\"" buffer-content)
+      (length (match-string 1 buffer-content))
+    default))
+
+(defun anvil--json-normalize-pairs (pairs)
+  "Normalize PAIRS into list of (KEY . VALUE) cons cells.
+Accepts cons cells, two-element lists, or alists.  Both KEY and VALUE
+must be strings; raises otherwise."
+  (mapcar
+   (lambda (p)
+     (let ((k nil) (v nil))
+       (cond
+        ((and (consp p) (stringp (car p)) (stringp (cdr p)))
+         (setq k (car p) v (cdr p)))
+        ((and (consp p) (stringp (car p)) (consp (cdr p)) (null (cddr p))
+              (stringp (cadr p)))
+         (setq k (car p) v (cadr p)))
+        ((and (vectorp p) (= (length p) 2)
+              (stringp (aref p 0)) (stringp (aref p 1)))
+         (setq k (aref p 0) v (aref p 1)))
+        (t (error "anvil-json: invalid pair (need string key+value): %S" p)))
+       (cons k v)))
+   pairs))
+
+(defun anvil-json-object-add (path pairs &optional opts)
+  "Add PAIRS to the top-level JSON object at PATH.
+
+PAIRS is a list of (KEY . VALUE) cons cells or two-element lists.
+Both KEY and VALUE must be strings.  Non-string JSON types are not
+supported (would require typed encoding).
+
+OPTS is a plist:
+  :on-duplicate SYMBOL  `skip' (default) | `overwrite' | `error'.
+  :indent NUMBER        Indentation width.  If omitted, detected from
+                        the file's first entry line; falls back to 2.
+
+The file's existing formatting is preserved.  New entries are inserted
+just before the outermost closing `}'.  Comma handling: a missing
+trailing comma on the previous last entry is added automatically; new
+entries get trailing commas except the last one (to conform with strict
+JSON parsers).
+
+Returns plist (:added N :skipped M :overwritten K :file PATH)."
+  (let* ((abs (anvil--prepare-path path))
+         (on-dup (or (plist-get opts :on-duplicate) 'skip))
+         (explicit-indent (plist-get opts :indent))
+         (normalized (anvil--json-normalize-pairs pairs))
+         (added 0) (skipped 0) (overwritten 0)
+         (keys-to-insert '()))
+    (with-temp-buffer
+      (anvil--insert-file abs)
+      (let* ((content (buffer-string))
+             (indent (or explicit-indent
+                         (anvil--json-detect-indent content 2)))
+             (existing (ignore-errors
+                         (json-parse-string content
+                                            :object-type 'hash-table
+                                            :null-object nil
+                                            :false-object nil))))
+        (unless (hash-table-p existing)
+          (error "anvil-json: file is not a JSON object: %s" abs))
+        ;; Classify each pair
+        (dolist (p normalized)
+          (let ((k (car p)) (v (cdr p)))
+            (cond
+             ((gethash k existing)
+              (pcase on-dup
+                ('skip (cl-incf skipped))
+                ('error (error "anvil-json: duplicate key: %s" k))
+                ('overwrite
+                 ;; In-place replace: find the existing entry's line
+                 ;; and rewrite the value portion.  We match the key
+                 ;; literally (after escaping for regex) and capture
+                 ;; everything up through the colon+space prefix.
+                 (let* ((esc-key (regexp-quote
+                                  (anvil--json-escape-string k)))
+                        (pat (concat
+                              "^\\([[:space:]]*\"" esc-key
+                              "\"[[:space:]]*:[[:space:]]*\\)"
+                              "\\(\"\\(?:\\\\.\\|[^\"\\\\]\\)*\"\\|"
+                              "[-+0-9.eE]+\\|true\\|false\\|null\\)"))
+                        (new-value-literal
+                         (concat "\"" (anvil--json-escape-string v) "\"")))
+                   (goto-char (point-min))
+                   (if (re-search-forward pat nil t)
+                       (progn
+                         (replace-match (concat "\\1"
+                                                (replace-regexp-in-string
+                                                 "\\\\" "\\\\\\\\"
+                                                 new-value-literal))
+                                        t nil)
+                         (cl-incf overwritten))
+                     (error "anvil-json: overwrite failed for key %s" k))))))
+             (t
+              (push p keys-to-insert)))))
+        (setq keys-to-insert (nreverse keys-to-insert))
+        ;; Insert new pairs before closing }
+        (when keys-to-insert
+          (goto-char (point-max))
+          (unless (re-search-backward "}[[:space:]\n]*\\'" nil t)
+            (error "anvil-json: no closing '}' found"))
+          (let ((close-point (point)))
+            ;; Ensure previous entry has trailing comma.
+            (save-excursion
+              (skip-chars-backward " \t\n" (point-min))
+              (when (and (> (point) (point-min))
+                         (not (eq (char-before) ?{))
+                         (not (eq (char-before) ?\,)))
+                (insert ",")
+                (cl-incf close-point)))
+            (goto-char close-point)
+            ;; Insert the new lines.  Newline before so we're at column 0.
+            (unless (bolp) (insert "\n"))
+            (let* ((n (length keys-to-insert))
+                   (i 0))
+              (dolist (p keys-to-insert)
+                (insert (anvil--json-format-kv (car p) (cdr p) indent))
+                (when (< i (1- n))
+                  (insert ","))
+                (insert "\n")
+                (cl-incf i))))
+          (setq added (length keys-to-insert))))
+      (anvil--write-current-buffer-to abs))
+    (list :added added :skipped skipped :overwritten overwritten :file abs)))
+
+;;;; --- import line idempotent insert ---------------------------------------
+
+(defun anvil-file-ensure-import (path import-line &optional opts)
+  "Ensure IMPORT-LINE exists as a top-level line in PATH.
+
+Idempotent.  If the line already matches verbatim anywhere in the file,
+no change is made.
+
+OPTS plist:
+  :after-regex REGEXP  Insert after the last line matching REGEXP.
+                       Default: \"^import \" (covers TS/JS/Python-ish
+                       import blocks; use nil to always insert at top).
+  :position SYMBOL     `after-last-match' (default) | `before-first-match'
+                       | `top' (very first line) | `bottom'.
+
+Returns plist (:inserted BOOL :line N :already-present BOOL :file PATH)."
+  (let* ((abs (anvil--prepare-path path))
+         (after-regex (if (plist-member opts :after-regex)
+                          (plist-get opts :after-regex)
+                        "^import "))
+         (position (or (plist-get opts :position) 'after-last-match)))
+    (with-temp-buffer
+      (anvil--insert-file abs)
+      ;; Already present?  Match full line (leading/trailing whitespace
+      ;; tolerated via forced anchoring).
+      (goto-char (point-min))
+      (let ((target-line (string-trim-right import-line)))
+        (if (re-search-forward (concat "^"
+                                       (regexp-quote target-line)
+                                       "$")
+                               nil t)
+            (list :inserted nil :already-present t
+                  :line (line-number-at-pos) :file abs)
+          (let ((insert-line nil))
+            (pcase position
+              ('top (setq insert-line 1))
+              ('bottom (setq insert-line nil))  ; special: append
+              ('before-first-match
+               (when after-regex
+                 (goto-char (point-min))
+                 (when (re-search-forward after-regex nil t)
+                   (setq insert-line (line-number-at-pos
+                                      (line-beginning-position))))))
+              (_ ; after-last-match
+               (when after-regex
+                 (goto-char (point-max))
+                 (when (re-search-backward after-regex nil t)
+                   (setq insert-line (1+ (line-number-at-pos)))))))
+            (cond
+             ((eq position 'bottom)
+              (goto-char (point-max))
+              (unless (bolp) (insert "\n"))
+              (insert target-line "\n")
+              (let ((ln (1- (line-number-at-pos))))
+                (anvil--write-current-buffer-to abs)
+                (list :inserted t :already-present nil
+                      :line ln :file abs)))
+             (insert-line
+              (goto-char (point-min))
+              (forward-line (1- insert-line))
+              (insert target-line "\n")
+              (anvil--write-current-buffer-to abs)
+              (list :inserted t :already-present nil
+                    :line insert-line :file abs))
+             (t
+              ;; No matches: insert at top (line 1)
+              (goto-char (point-min))
+              (insert target-line "\n")
+              (anvil--write-current-buffer-to abs)
+              (list :inserted t :already-present nil
+                    :line 1 :file abs)))))))))
+
+;;;; --- batch across multiple files -----------------------------------------
+
+(defun anvil-file-batch-across (file-ops)
+  "Run `anvil-file-batch' across multiple files in one call.
+
+FILE-OPS is a list of alists each with:
+  `path'        Absolute path to the file.
+  `operations'  List of op alists (same format as `anvil-file-batch').
+
+All files are processed sequentially.  If one fails, the error is
+captured and processing continues for the rest; the caller sees a
+per-file status in the returned list.
+
+Returns plist (:files N :succeeded M :failed K :results ((PATH . PLIST) ...))."
+  (let ((succeeded 0) (failed 0) (results '()))
+    (dolist (fo file-ops)
+      (let ((path (or (alist-get 'path fo)
+                      (alist-get "path" fo nil nil #'equal)))
+            (ops (or (alist-get 'operations fo)
+                     (alist-get "operations" fo nil nil #'equal))))
+        (unless (and path ops)
+          (error "anvil-file-batch-across: missing path or operations in %S" fo))
+        (condition-case err
+            (let ((res (anvil-file-batch path ops)))
+              (cl-incf succeeded)
+              (push (cons path res) results))
+          (error
+           (cl-incf failed)
+           (push (cons path (list :error (error-message-string err)))
+                 results)))))
+    (list :files (length file-ops)
+          :succeeded succeeded
+          :failed failed
+          :results (nreverse results))))
+
+;;;; --- MCP tool wrappers (new helpers) -------------------------------------
+
+(defun anvil-file--tool-json-object-add (path pairs-json &optional on-duplicate indent)
+  "MCP wrapper for `anvil-json-object-add'.
+PAIRS-JSON is a JSON array of two-element arrays or objects.  Examples:
+  [[\"key1\",\"val1\"], [\"key2\",\"val2\"]]
+  [{\"key\":\"a\",\"value\":\"b\"}, ...]
+ON-DUPLICATE is \"skip\"|\"overwrite\"|\"error\" (default: skip).
+INDENT is a string that parses as a number (default: auto-detect)."
+  (anvil-server-with-error-handling
+   (let* ((parsed (json-parse-string pairs-json
+                                     :object-type 'alist
+                                     :array-type 'list))
+          (pairs (mapcar
+                  (lambda (p)
+                    (cond
+                     ((and (listp p) (= (length p) 2)
+                           (stringp (car p)) (stringp (cadr p)))
+                      (cons (car p) (cadr p)))
+                     ((listp p)  ; alist from JSON object
+                      (let ((k (or (alist-get 'key p)
+                                   (alist-get "key" p nil nil #'equal)))
+                            (v (or (alist-get 'value p)
+                                   (alist-get "value" p nil nil #'equal))))
+                        (unless (and k v)
+                          (error "pair needs {\"key\":...,\"value\":...}: %S" p))
+                        (cons k v)))
+                     (t (error "unsupported pair shape: %S" p))))
+                  parsed))
+          (opts (append
+                 (when on-duplicate
+                   (list :on-duplicate (intern on-duplicate)))
+                 (when (and indent (stringp indent) (not (string-empty-p indent)))
+                   (list :indent (string-to-number indent))))))
+     (format "%S" (anvil-json-object-add path pairs opts)))))
+
+(defun anvil-file--tool-ensure-import (path import-line &optional after-regex position)
+  "MCP wrapper for `anvil-file-ensure-import'.
+POSITION is a string: \"after-last-match\" (default) | \"before-first-match\"
+| \"top\" | \"bottom\"."
+  (anvil-server-with-error-handling
+   (let ((opts (append
+                (when after-regex (list :after-regex after-regex))
+                (when position (list :position (intern position))))))
+     (format "%S" (anvil-file-ensure-import path import-line opts)))))
+
+(defun anvil-file--tool-batch-across (file-ops-json)
+  "MCP wrapper for `anvil-file-batch-across'.
+FILE-OPS-JSON is a JSON array of objects:
+  [{\"path\":\"/a.el\",\"operations\":[{...},...]},
+   {\"path\":\"/b.el\",\"operations\":[{...},...]}]"
+  (anvil-server-with-error-handling
+   (let ((file-ops (json-parse-string file-ops-json
+                                      :object-type 'alist
+                                      :array-type 'list)))
+     (format "%S" (anvil-file-batch-across file-ops)))))
+
 ;;;; --- module enable/disable -----------------------------------------------
 
 (defun anvil-file-enable ()
@@ -1248,6 +1573,46 @@ The operations parameter is a JSON array string.  Supported ops:
 replace, replace-regexp, insert-at-line, delete-lines, append, prepend.
 All operations run sequentially on the same buffer and the file is written
 once atomically at the end.  Safe for files over 1.2MB."
+   :server-id anvil-file--server-id)
+
+  (anvil-server-register-tool
+   #'anvil-file--tool-json-object-add
+   :id "json-object-add"
+   :description
+   "Add key-value pairs to a top-level JSON object while preserving
+existing formatting.  Designed for i18n dictionaries and config files
+where hundreds of entries must be appended without re-emitting the
+whole file.  Pairs are supplied as a JSON array, e.g.
+\"[[\\\"a\\\",\\\"1\\\"],[\\\"b\\\",\\\"2\\\"]]\".  The function detects
+existing keys and handles duplicates via on-duplicate
+(skip/overwrite/error).  Indentation is auto-detected from the file.
+Trailing-comma and closing-brace handling is automatic.  Only string
+values are supported; for numeric/boolean values fall back to
+file-insert-at-line."
+   :server-id anvil-file--server-id)
+
+  (anvil-server-register-tool
+   #'anvil-file--tool-ensure-import
+   :id "file-ensure-import"
+   :description
+   "Idempotently ensure an import (or any header) line exists in a file.
+If the line already appears verbatim, returns already-present without
+modifying the file.  Otherwise inserts after the last line matching
+after-regex (default: \"^import \", matching TS/JS/Python imports).
+Position can be overridden: \"after-last-match\" (default),
+\"before-first-match\", \"top\", or \"bottom\"."
+   :server-id anvil-file--server-id)
+
+  (anvil-server-register-tool
+   #'anvil-file--tool-batch-across
+   :id "file-batch-across"
+   :description
+   "Apply anvil-file-batch to multiple files in a single MCP call.
+The argument is a JSON array where each element has a path and an
+operations array: [{\"path\":\"/a.el\",\"operations\":[...]},...].
+Failures in one file do not abort the rest; per-file results are
+returned.  Use this for bulk docstring updates, import additions, or
+coordinated multi-file refactors."
    :server-id anvil-file--server-id))
 
 (defun anvil-file-disable ()
@@ -1258,7 +1623,10 @@ once atomically at the end.  Safe for files over 1.2MB."
   (anvil-server-unregister-tool "file-delete-lines" anvil-file--server-id)
   (anvil-server-unregister-tool "file-read" anvil-file--server-id)
   (anvil-server-unregister-tool "file-append" anvil-file--server-id)
-  (anvil-server-unregister-tool "file-batch" anvil-file--server-id))
+  (anvil-server-unregister-tool "file-batch" anvil-file--server-id)
+  (anvil-server-unregister-tool "json-object-add" anvil-file--server-id)
+  (anvil-server-unregister-tool "file-ensure-import" anvil-file--server-id)
+  (anvil-server-unregister-tool "file-batch-across" anvil-file--server-id))
 
 (provide 'anvil-helpers)
 (provide 'anvil-file)
