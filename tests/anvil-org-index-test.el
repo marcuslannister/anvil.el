@@ -429,4 +429,101 @@ Uses a shell `touch' via `set-file-times' for portability."
       (ignore-errors (anvil-org-index-disable))
       (ignore-errors (delete-directory tmpdir t)))))
 
+;;;; Phase 4a — fast-path readers
+
+(defun anvil-org-index-test--seed (root)
+  "Write a small org file under ROOT and return its absolute path."
+  (let ((f (expand-file-name "fp.org" root)))
+    (anvil-org-index-test--write
+     f
+     "* Alpha
+:PROPERTIES:
+:ID: id-alpha
+:END:
+Alpha body
+** Beta
+:PROPERTIES:
+:ID: id-beta
+:END:
+Beta body
+** Beta
+Duplicate title, no ID
+* Gamma
+:PROPERTIES:
+:ID: id-gamma
+:END:
+Gamma body line
+")
+    f))
+
+(defmacro anvil-org-index-test--with-seeded (body-var &rest body)
+  "Seed a temp index into DB and bind BODY-VAR to the seeded org path, then run BODY."
+  (declare (indent 1))
+  `(let* ((tmpdir (make-temp-file "anvil-idx-fp-" t))
+          (db (expand-file-name "i.db" tmpdir))
+          (,body-var nil)
+          (anvil-org-index-db-path db)
+          (anvil-org-index-paths (list tmpdir))
+          (anvil-org-index--backend nil)
+          (anvil-org-index--db nil))
+     (unwind-protect
+         (progn
+           (setq ,body-var (anvil-org-index-test--seed tmpdir))
+           (anvil-org-index-enable)
+           (anvil-org-index-rebuild)
+           ,@body)
+       (ignore-errors (anvil-org-index-disable))
+       (ignore-errors (delete-directory tmpdir t)))))
+
+(ert-deftest anvil-org-index-test-read-by-id-returns-body ()
+  "read-by-id returns the body section including properties drawer."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-seeded _f
+    (let ((txt (anvil-org-index-read-by-id "id-beta")))
+      (should (string-match-p "^\\*\\* Beta" txt))
+      (should (string-match-p "Beta body" txt))
+      (should-not (string-match-p "Gamma" txt)))))
+
+(ert-deftest anvil-org-index-test-read-by-id-missing-errors ()
+  "read-by-id signals user-error on unknown ID."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-seeded _f
+    (should-error (anvil-org-index-read-by-id "no-such-id"))))
+
+(ert-deftest anvil-org-index-test-read-headline-top-level ()
+  "read-headline resolves a top-level title and returns its body."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-seeded f
+    (let ((txt (anvil-org-index-read-headline f "Alpha")))
+      (should (string-match-p "^\\* Alpha" txt))
+      (should (string-match-p "Alpha body" txt))
+      ;; Alpha's subtree includes both Beta children
+      (should (string-match-p "^\\*\\* Beta" txt)))))
+
+(ert-deftest anvil-org-index-test-read-headline-nested ()
+  "read-headline walks a nested slash-separated path."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-seeded f
+    ;; With the duplicate "Beta", the top-level Alpha/Beta path is
+    ;; ambiguous — the tool must signal rather than guess.
+    (should-error (anvil-org-index-read-headline f "Alpha/Beta"))))
+
+(ert-deftest anvil-org-index-test-read-outline-orders-and-tags ()
+  "read-outline returns a level/title list in document order."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-seeded f
+    (let* ((outline (anvil-org-index-read-outline f))
+           (levels  (mapcar (lambda (p) (plist-get p :level)) outline))
+           (titles  (mapcar (lambda (p) (plist-get p :title)) outline)))
+      (should (equal '(1 2 2 1) levels))
+      (should (equal '("Alpha" "Beta" "Beta" "Gamma") titles)))))
+
+(ert-deftest anvil-org-index-test-read-outline-missing-errors ()
+  "read-outline signals when the file is not indexed."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-seeded _f
+    (should-error
+     (anvil-org-index-read-outline
+      (expand-file-name "never-indexed.org" temporary-file-directory)))))
+
 ;;; anvil-org-index-test.el ends here

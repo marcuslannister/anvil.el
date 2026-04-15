@@ -687,6 +687,175 @@ the list of directories now under watch."
     (cancel-timer anvil-org-index--periodic-timer)
     (setq anvil-org-index--periodic-timer nil)))
 
+;;; Phase 4a — fast-path readers backed by the index
+
+(defun anvil-org-index--file-id (db path)
+  "Return the file row id for PATH (expanded), or nil."
+  (caar (anvil-org-index--select
+         db "SELECT id FROM file WHERE path = ?"
+         (list (expand-file-name path)))))
+
+(defun anvil-org-index--decode-title-segment (segment)
+  "Decode SEGMENT produced by splitting a slash-separated headline path.
+`anvil-org' tools require `/' characters that belong to headline
+titles to be encoded as %2F; this undoes that encoding so the
+decoded string matches the raw title stored in the index."
+  (replace-regexp-in-string "%2F" "/" segment t t))
+
+(defun anvil-org-index--read-file-region (path line-start line-end)
+  "Return UTF-8 text from PATH between LINE-START and LINE-END inclusive.
+Lines are 1-indexed.  When LINE-END is nil or non-positive, read
+to end of file."
+  (with-temp-buffer
+    (let ((coding-system-for-read 'utf-8-unix))
+      (insert-file-contents path))
+    (goto-char (point-min))
+    (forward-line (max 0 (1- line-start)))
+    (let ((beg (point)))
+      (cond
+       ((and line-end (> line-end 0))
+        (goto-char (point-min))
+        (forward-line line-end)
+        (buffer-substring-no-properties beg (point)))
+       (t (buffer-substring-no-properties beg (point-max)))))))
+
+(defun anvil-org-index--subtree-range (db headline-id)
+  "Return (path line-start line-end) covering HEADLINE-ID's entire subtree.
+The stored `line_end' on a headline points at the line before the
+very next heading of any level, so it cuts off nested children.
+For `org-read-headline'-style semantics we want the full subtree,
+which ends just before the next heading of equal-or-lower level
+\(i.e. a sibling or uncle), or the end of file.  Computed here via
+the index rather than by re-parsing the file."
+  (let ((row (car (anvil-org-index--select
+                   db
+                   "SELECT f.id, f.path, h.level, h.line_start
+                      FROM headline h JOIN file f ON f.id = h.file_id
+                      WHERE h.id = ?
+                      LIMIT 1"
+                   (list headline-id)))))
+    (when row
+      (let* ((file-id  (nth 0 row))
+             (path     (nth 1 row))
+             (level    (nth 2 row))
+             (start    (nth 3 row))
+             (next-row (car (anvil-org-index--select
+                             db
+                             "SELECT MIN(line_start) FROM headline
+                                WHERE file_id = ? AND line_start > ? AND level <= ?"
+                             (list file-id start level))))
+             (next-start (car next-row))
+             (end (if (and next-start (numberp next-start))
+                      (1- next-start)
+                    0)))
+        (list path start end)))))
+
+(defun anvil-org-index--lookup-id-subtree (db org-id)
+  "Return (path line-start line-end) for ORG-ID's subtree, or nil."
+  (let ((hid (caar (anvil-org-index--select
+                    db
+                    "SELECT id FROM headline WHERE org_id = ? LIMIT 1"
+                    (list org-id)))))
+    (and hid (anvil-org-index--subtree-range db hid))))
+
+(defun anvil-org-index--find-by-path (db file-id segments)
+  "Walk SEGMENTS under FILE-ID, return the matching headline id or nil.
+SEGMENTS is a list of already-decoded title strings.  Ambiguous
+matches (more than one headline at a given level sharing a title
+under the same parent) return nil so the caller can fall back to
+a full parse rather than pick the wrong entry."
+  (let ((parent nil)
+        (current nil)
+        (failed nil))
+    (catch 'done
+      (dolist (segment segments)
+        (let ((rows
+               (if parent
+                   (anvil-org-index--select
+                    db
+                    "SELECT id FROM headline
+                       WHERE file_id = ? AND parent_id = ? AND title = ?"
+                    (list file-id parent segment))
+                 (anvil-org-index--select
+                  db
+                  "SELECT id FROM headline
+                     WHERE file_id = ? AND parent_id IS NULL AND title = ?"
+                  (list file-id segment)))))
+          (cond
+           ((null rows)        (setq failed t) (throw 'done nil))
+           ((cdr rows)         (setq failed t) (throw 'done nil))
+           (t (setq current (caar rows)
+                    parent  current))))))
+    (unless failed current)))
+
+;;;###autoload
+(defun anvil-org-index-read-by-id (org-id)
+  "Return the text of the entire subtree whose :ID: property is ORG-ID.
+Uses the index to locate (file, line-range) in one SELECT, then
+reads only that line range of the file.  Signals `user-error' if
+ORG-ID is not in the index."
+  (unless anvil-org-index--db (anvil-org-index-enable))
+  (let ((loc (anvil-org-index--lookup-id-subtree
+              anvil-org-index--db org-id)))
+    (unless loc
+      (user-error "anvil-org-index: ID %s not found in index" org-id))
+    (apply #'anvil-org-index--read-file-region loc)))
+
+;;;###autoload
+(defun anvil-org-index-read-headline (file headline-path)
+  "Return the text of HEADLINE-PATH inside FILE via the index.
+HEADLINE-PATH is a slash-separated list of headline titles, with
+any literal `/' inside a title encoded as %2F (matching the
+`org-read-headline' MCP tool).  Signals `user-error' if the file
+is not indexed or the path is ambiguous."
+  (unless anvil-org-index--db (anvil-org-index-enable))
+  (let ((file-id (anvil-org-index--file-id anvil-org-index--db file)))
+    (unless file-id
+      (user-error "anvil-org-index: %s is not indexed" file))
+    (let* ((segments (mapcar #'anvil-org-index--decode-title-segment
+                             (split-string headline-path "/" t)))
+           (hid (anvil-org-index--find-by-path
+                 anvil-org-index--db file-id segments))
+           (range (and hid (anvil-org-index--subtree-range
+                            anvil-org-index--db hid))))
+      (unless range
+        (user-error
+         "anvil-org-index: headline %S not uniquely resolvable under %s"
+         headline-path file))
+      (apply #'anvil-org-index--read-file-region range))))
+
+;;;###autoload
+(defun anvil-org-index-read-outline (file)
+  "Return an outline list of FILE straight from the index.
+Each entry is a plist: (:level :title :todo :tags :line).  Order
+follows the on-disk position of the headlines.  Much cheaper than
+re-parsing with org-element for large files that rarely change."
+  (unless anvil-org-index--db (anvil-org-index-enable))
+  (let ((file-id (anvil-org-index--file-id anvil-org-index--db file)))
+    (unless file-id
+      (user-error "anvil-org-index: %s is not indexed" file))
+    (let ((rows
+           (anvil-org-index--select
+            anvil-org-index--db
+            "SELECT id, level, title, todo, line_start
+               FROM headline
+               WHERE file_id = ?
+               ORDER BY position"
+            (list file-id))))
+      (mapcar
+       (lambda (row)
+         (let* ((hid   (nth 0 row))
+                (tags  (anvil-org-index--select
+                        anvil-org-index--db
+                        "SELECT tag FROM tag WHERE headline_id = ?"
+                        (list hid))))
+           (list :level (nth 1 row)
+                 :title (nth 2 row)
+                 :todo  (nth 3 row)
+                 :tags  (mapcar #'car tags)
+                 :line  (nth 4 row))))
+       rows))))
+
 ;;;###autoload
 (defun anvil-org-index-status ()
   "Show a summary of the current index state."
