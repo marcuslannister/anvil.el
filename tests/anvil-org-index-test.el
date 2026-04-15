@@ -626,4 +626,141 @@ Gamma body line
       (should (equal "Alpha" (alist-get 'title alpha)))
       (should (= 0 (length (alist-get 'children alpha)))))))
 
+;;;; Phase 4c+: org-index-search
+
+(defun anvil-org-index-test--seed-search (root)
+  "Write a richer fixture for search tests and return its path."
+  (let ((f (expand-file-name "search.org" root)))
+    (anvil-org-index-test--write
+     f
+     "* TODO Build invoice :work:billing:
+SCHEDULED: <2026-04-18 Sat>
+DEADLINE: <2026-04-20 Mon>
+Body of invoice task.
+* DONE Ship Q4 report :work:report:
+SCHEDULED: <2026-03-30 Mon>
+Closed already.
+* NEXT Review contract :work:legal:
+DEADLINE: <2026-05-01 Fri>
+Lawyer review pending.
+* Personal errand :home:
+* TODO Fix broken sensor :work:hw:
+DEADLINE: <2026-04-10 Fri>
+")
+    f))
+
+(defmacro anvil-org-index-test--with-search-seed (body-var &rest body)
+  "Seed the search fixture and run BODY with BODY-VAR bound to its path."
+  (declare (indent 1))
+  `(let* ((tmpdir (make-temp-file "anvil-idx-sr-" t))
+          (db (expand-file-name "i.db" tmpdir))
+          (,body-var nil)
+          (anvil-org-index-db-path db)
+          (anvil-org-index-paths (list tmpdir))
+          (anvil-org-index--backend nil)
+          (anvil-org-index--db nil))
+     (unwind-protect
+         (progn
+           (setq ,body-var (anvil-org-index-test--seed-search tmpdir))
+           (anvil-org-index-enable)
+           (anvil-org-index-rebuild)
+           ,@body)
+       (ignore-errors (anvil-org-index-disable))
+       (ignore-errors (delete-directory tmpdir t)))))
+
+(ert-deftest anvil-org-index-test-search-title-like ()
+  "Title LIKE matches case-sensitive SQL semantics; auto-wraps %..%."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-search-seed _f
+    (let* ((res (anvil-org-index-search :title-like "invoice"))
+           (rows (plist-get res :rows)))
+      (should (= 1 (plist-get res :count)))
+      (should (string-match-p "invoice" (plist-get (car rows) :title))))))
+
+(ert-deftest anvil-org-index-test-search-todo-filter ()
+  "TODO filter supports a single keyword or comma-separated OR."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-search-seed _f
+    (let ((only-todo (plist-get (anvil-org-index-search :todo "TODO") :rows))
+          (todo-next (plist-get (anvil-org-index-search
+                                 :todo '("TODO" "NEXT")) :rows)))
+      (should (= 2 (length only-todo)))
+      (should (cl-every (lambda (r) (equal (plist-get r :todo) "TODO"))
+                        only-todo))
+      (should (= 3 (length todo-next)))
+      (should (cl-every (lambda (r)
+                          (member (plist-get r :todo) '("TODO" "NEXT")))
+                        todo-next)))))
+
+(ert-deftest anvil-org-index-test-search-tag-and ()
+  "Tag filter requires ALL tags to match (AND-of-EXISTS)."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-search-seed _f
+    (let ((work       (plist-get (anvil-org-index-search :tag "work") :rows))
+          (work+billing (plist-get (anvil-org-index-search
+                                    :tag '("work" "billing"))
+                                   :rows))
+          (nohit (plist-get (anvil-org-index-search
+                             :tag '("work" "nosuchtag"))
+                            :rows)))
+      (should (= 4 (length work)))
+      (should (= 1 (length work+billing)))
+      (should (equal "Build invoice"
+                     (plist-get (car work+billing) :title)))
+      (should (null nohit)))))
+
+(ert-deftest anvil-org-index-test-search-scheduled-range ()
+  "SCHEDULED is compared as the YYYY-MM-DD slice of the raw timestamp."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-search-seed _f
+    (let ((early (plist-get (anvil-org-index-search
+                             :scheduled-before "2026-03-31")
+                            :rows))
+          (april (plist-get (anvil-org-index-search
+                             :scheduled-after "2026-04-01")
+                            :rows)))
+      (should (= 1 (length early)))
+      (should (equal "Ship Q4 report"
+                     (plist-get (car early) :title)))
+      (should (= 1 (length april)))
+      (should (equal "Build invoice"
+                     (plist-get (car april) :title))))))
+
+(ert-deftest anvil-org-index-test-search-deadline-before ()
+  "DEADLINE bounds drop entries with no DEADLINE and ones past the bound."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-search-seed _f
+    (let ((res (plist-get (anvil-org-index-search
+                           :deadline-before "2026-04-30")
+                          :rows)))
+      (should (cl-every (lambda (r) (plist-get r :deadline)) res))
+      (should (= 2 (length res)))
+      (should (member "Build invoice"
+                      (mapcar (lambda (r) (plist-get r :title)) res)))
+      (should (member "Fix broken sensor"
+                      (mapcar (lambda (r) (plist-get r :title)) res))))))
+
+(ert-deftest anvil-org-index-test-search-limit-offset ()
+  "Limit + offset paginate; truncated flag surfaces extra rows."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-search-seed _f
+    (let* ((page1 (anvil-org-index-search :limit 2))
+           (page2 (anvil-org-index-search :limit 2 :offset 2)))
+      (should (= 2 (plist-get page1 :count)))
+      (should (eq t (plist-get page1 :truncated)))
+      (should (= 2 (plist-get page2 :count)))
+      (should-not (equal (mapcar (lambda (r) (plist-get r :title))
+                                 (plist-get page1 :rows))
+                         (mapcar (lambda (r) (plist-get r :title))
+                                 (plist-get page2 :rows)))))))
+
+(ert-deftest anvil-org-index-test-search-empty-result ()
+  "An impossible filter returns :count 0 :rows nil, not an error."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (anvil-org-index-test--with-search-seed _f
+    (let ((res (anvil-org-index-search :title-like "zzzzz-no-hit")))
+      (should (= 0 (plist-get res :count)))
+      (should (null (plist-get res :rows)))
+      (should-not (plist-get res :truncated)))))
+
 ;;; anvil-org-index-test.el ends here

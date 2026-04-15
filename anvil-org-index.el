@@ -32,6 +32,7 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'anvil-server)
 
 ;;; Customization
 
@@ -409,14 +410,38 @@ Return the new headline id."
     (setq anvil-org-index--db
           (anvil-org-index--open anvil-org-index-db-path))
     (anvil-org-index--apply-ddl anvil-org-index--db))
+  (anvil-org-index--register-tools)
   (message "anvil-org-index: enabled (backend=%s db=%s)"
            anvil-org-index--backend
            anvil-org-index-db-path))
+
+(defun anvil-org-index--register-tools ()
+  "Register the org-index MCP tools.  Idempotent."
+  (anvil-server-register-tool
+   #'anvil-org-index--tool-search
+   :id "org-index-search"
+   :server-id anvil-org-index--server-id
+   :description
+   "Search the org-index for matching headlines (title LIKE, tag
+AND-match, TODO IN, scheduled/deadline date bounds, file path
+LIKE) and return a printed plist of rows.  All parameters are
+optional; omit to disable that filter.  Much cheaper than
+`org-map-entries' scans — one indexed SQL statement, no org-mode
+activation.  Results clip at `anvil-org-index-search-hard-limit'
+(1000) and mark `:truncated t' when clipped."
+   :read-only t))
+
+(defun anvil-org-index--unregister-tools ()
+  "Unregister org-index MCP tools.  Safe when not registered."
+  (ignore-errors
+    (anvil-server-unregister-tool "org-index-search"
+                                   anvil-org-index--server-id)))
 
 ;;;###autoload
 (defun anvil-org-index-disable ()
   "Close DB.  Safe to call multiple times."
   (interactive)
+  (anvil-org-index--unregister-tools)
   (when anvil-org-index--db
     (anvil-org-index--close anvil-org-index--db)
     (setq anvil-org-index--db nil))
@@ -916,6 +941,197 @@ large files already in the index."
   (let* ((flat (anvil-org-index-read-outline file max-depth))
          (tree (anvil-org-index--outline-build-tree flat)))
     (json-encode `((headings . ,tree)))))
+
+;;; Phase 4c+: full-text search fast-path
+
+(defconst anvil-org-index--server-id "emacs-eval"
+  "Server ID for org-index MCP tools.
+Matches the stdio shim `--server-id=emacs-eval' so the search
+tool appears alongside the other anvil-* tools.")
+
+(defcustom anvil-org-index-search-default-limit 100
+  "Default `:limit' for `anvil-org-index-search' when the caller omits one."
+  :type 'integer
+  :group 'anvil-org-index)
+
+(defcustom anvil-org-index-search-hard-limit 1000
+  "Absolute cap on the number of rows returned by `anvil-org-index-search'.
+Protects the MCP channel from accidentally megabyte-sized
+replies; the caller may request a smaller limit but never larger."
+  :type 'integer
+  :group 'anvil-org-index)
+
+(defun anvil-org-index--search-like-wrap (s)
+  "Wrap S with SQL LIKE wildcards when it contains no % already."
+  (if (or (null s) (string-empty-p s)) nil
+    (if (string-match-p "%" s) s
+      (concat "%" s "%"))))
+
+(defun anvil-org-index--search-ts-substr (col op)
+  "Produce a SQL fragment comparing the YYYY-MM-DD slice of COL via OP."
+  (format "substr(%s, 2, 10) %s ?" col op))
+
+(defun anvil-org-index--search-normalise-list (v)
+  "Coerce V into a non-empty list of strings, or nil.
+Accepts a string (singleton), a list, or a comma-separated string."
+  (cond
+   ((null v) nil)
+   ((and (stringp v) (string-empty-p (string-trim v))) nil)
+   ((stringp v)
+    (if (string-match-p "," v)
+        (mapcar #'string-trim
+                (split-string v "," t "[ \t\n\r]+"))
+      (list v)))
+   ((listp v) (seq-filter (lambda (x) (and x (not (string-empty-p x)))) v))
+   (t nil)))
+
+;;;###autoload
+(cl-defun anvil-org-index-search
+    (&key title-like file-like todo tag
+          scheduled-before scheduled-after
+          deadline-before  deadline-after
+          limit offset)
+  "Search the headline index and return matching rows as a plist.
+
+Keyword arguments (all optional, combined with AND):
+  :title-like        SQL LIKE pattern on `headline.title'; bare
+                     strings are auto-wrapped with `%...%'.
+  :file-like         SQL LIKE pattern on `file.path'.
+  :todo              string or list/CSV; matches any of the given
+                     TODO keywords (IN clause).
+  :tag               string or list/CSV; *every* tag listed must be
+                     attached to the headline (AND of EXISTS).
+  :scheduled-before  ISO date \"YYYY-MM-DD\"; keeps headlines whose
+                     SCHEDULED date is <= this value.
+  :scheduled-after   same but >=.
+  :deadline-before / :deadline-after  — as above but for DEADLINE.
+  :limit             integer, default `anvil-org-index-search-default-limit',
+                     capped by `anvil-org-index-search-hard-limit'.
+  :offset            integer, default 0.
+
+Returns:
+  (:count N :truncated BOOL :rows (PLIST ...))
+Each row plist carries `:file', `:line', `:level', `:title', `:todo',
+`:priority', `:tags', `:scheduled', `:deadline', `:org-id'.
+
+Much cheaper than repeated `org-map-entries' scans because the
+whole query runs as a single indexed SQL statement."
+  (unless anvil-org-index--db (anvil-org-index-enable))
+  (let* ((todos (anvil-org-index--search-normalise-list todo))
+         (tags  (anvil-org-index--search-normalise-list tag))
+         (lim   (min (or limit anvil-org-index-search-default-limit)
+                     anvil-org-index-search-hard-limit))
+         (off   (or offset 0))
+         (where '())
+         (args  '()))
+    (when-let* ((p (anvil-org-index--search-like-wrap title-like)))
+      (push "h.title LIKE ?" where) (push p args))
+    (when-let* ((p (anvil-org-index--search-like-wrap file-like)))
+      (push "f.path LIKE ?" where) (push p args))
+    (when todos
+      (push (format "h.todo IN (%s)"
+                    (mapconcat (lambda (_) "?") todos ","))
+            where)
+      (setq args (append (reverse todos) args)))
+    (dolist (tg tags)
+      (push "EXISTS (SELECT 1 FROM tag t WHERE t.headline_id = h.id AND t.tag = ?)"
+            where)
+      (push tg args))
+    (when scheduled-before
+      (push (anvil-org-index--search-ts-substr "h.scheduled" "<=") where)
+      (push scheduled-before args))
+    (when scheduled-after
+      (push (anvil-org-index--search-ts-substr "h.scheduled" ">=") where)
+      (push scheduled-after args))
+    (when deadline-before
+      (push (anvil-org-index--search-ts-substr "h.deadline" "<=") where)
+      (push deadline-before args))
+    (when deadline-after
+      (push (anvil-org-index--search-ts-substr "h.deadline" ">=") where)
+      (push deadline-after args))
+    (let* ((where-sql (if where
+                          (concat "WHERE " (mapconcat #'identity
+                                                      (nreverse where)
+                                                      " AND "))
+                        ""))
+           (sql (format
+                 "SELECT f.path, h.line_start, h.level, h.title,
+                         h.todo, h.priority, h.scheduled, h.deadline,
+                         h.org_id,
+                         (SELECT GROUP_CONCAT(t.tag, ',')
+                            FROM tag t WHERE t.headline_id = h.id)
+                    FROM headline h
+                    JOIN file f ON h.file_id = f.id
+                    %s
+                ORDER BY f.path, h.position
+                   LIMIT ? OFFSET ?"
+                 where-sql))
+           (params (append (nreverse args) (list (1+ lim) off)))
+           (rows (anvil-org-index--select anvil-org-index--db sql params))
+           (truncated (> (length rows) lim))
+           (clipped (if truncated (cl-subseq rows 0 lim) rows)))
+      (list :count     (length clipped)
+            :truncated truncated
+            :rows
+            (mapcar
+             (lambda (r)
+               (list :file      (nth 0 r)
+                     :line      (nth 1 r)
+                     :level     (nth 2 r)
+                     :title     (nth 3 r)
+                     :todo      (nth 4 r)
+                     :priority  (nth 5 r)
+                     :scheduled (nth 6 r)
+                     :deadline  (nth 7 r)
+                     :org-id    (nth 8 r)
+                     :tags      (let ((concat (nth 9 r)))
+                                  (and concat (split-string concat "," t)))))
+             clipped)))))
+
+(defun anvil-org-index--tool-search
+    (&optional title-like file-like todo tag
+               scheduled-before scheduled-after
+               deadline-before  deadline-after
+               limit offset)
+  "MCP wrapper for `anvil-org-index-search'.
+
+All parameters are optional strings; omit or pass empty to skip.
+
+MCP Parameters:
+  title-like       - SQL LIKE pattern on headline title (auto-wrap
+                     with %..% when no % present).
+  file-like        - SQL LIKE pattern on absolute file path.
+  todo             - TODO keyword or comma-separated list (OR).
+  tag              - Tag or comma-separated list (AND).
+  scheduled-before - ISO \"YYYY-MM-DD\" — SCHEDULED <= date.
+  scheduled-after  - ISO \"YYYY-MM-DD\" — SCHEDULED >= date.
+  deadline-before  - ISO \"YYYY-MM-DD\" — DEADLINE  <= date.
+  deadline-after   - ISO \"YYYY-MM-DD\" — DEADLINE  >= date.
+  limit            - integer string, default 100, hard-capped at 1000.
+  offset           - integer string, default 0."
+  (anvil-server-with-error-handling
+   (let* ((int-or-nil
+           (lambda (s)
+             (and s (stringp s)
+                  (not (string-empty-p (string-trim s)))
+                  (string-to-number s))))
+          (none-empty
+           (lambda (s)
+             (and s (stringp s)
+                  (not (string-empty-p (string-trim s)))
+                  s))))
+     (format "%S"
+             (anvil-org-index-search
+              :title-like       (funcall none-empty title-like)
+              :file-like        (funcall none-empty file-like)
+              :todo             (funcall none-empty todo)
+              :tag              (funcall none-empty tag)
+              :scheduled-before (funcall none-empty scheduled-before)
+              :scheduled-after  (funcall none-empty scheduled-after)
+              :deadline-before  (funcall none-empty deadline-before)
+              :deadline-after   (funcall none-empty deadline-after)
+              :limit            (funcall int-or-nil limit)
+              :offset           (funcall int-or-nil offset))))))
 
 ;;;###autoload
 (defun anvil-org-index-status ()
