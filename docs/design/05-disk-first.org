@@ -3,7 +3,10 @@
 #+property: status DRAFT
 
 * STATUS
-~DRAFT~ — レビュー前。コンパクトな変更だが、AI による silent data corruption を防ぐ柱。
+~Phase 1 SHIPPED~ (2026-04-16) — helper (~anvil-disk-buffer-divergence~,
+~anvil-file-safe-write~, ~anvil-file-warn-if-diverged~,
+~anvil-file-require-in-sync~) + 13 ERT tests を ~anvil-disk.el~ に投入。
+MCP tool 側の契約見直し (Phase 2) と ~buffer-*~ 系新規 (Phase 3) は未着手。
 
 * Goal
 
