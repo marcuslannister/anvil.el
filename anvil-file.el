@@ -155,9 +155,12 @@ Returns nil if no matches found (does not error)."
   "In PATH, replace occurrences of PATTERN (regexp) with REPLACEMENT.
 If MAX-COUNT is non-nil, stop after that many replacements.
 REPLACEMENT may use \\1 \\2 etc. for capture groups.
-Returns (:replaced N :file PATH). Errors if 0 replacements were made."
-  (let ((abs (anvil--prepare-path path))
-        (count 0))
+Returns (:replaced N :file PATH :warnings LIST).  Errors if 0
+replacements were made.  :warnings surfaces pre-write divergence
+with any visited buffer (see `anvil-file-warn-if-diverged')."
+  (let* ((abs (anvil--prepare-path path))
+         (warnings (anvil-file-warn-if-diverged abs))
+         (count 0))
     (with-temp-buffer
       (anvil--insert-file abs)
       (goto-char (point-min))
@@ -168,7 +171,7 @@ Returns (:replaced N :file PATH). Errors if 0 replacements were made."
       (when (zerop count)
         (error "my-cc: pattern not found in %s: %s" abs pattern))
       (anvil--write-current-buffer-to abs))
-    (list :replaced count :file abs)))
+    (list :replaced count :file abs :warnings warnings)))
 
 (defun anvil-file-replace-string (path old-string new-string &optional max-count)
   "In PATH, replace literal OLD-STRING with NEW-STRING.
@@ -200,26 +203,29 @@ refused (disk-first contract)."
 (defun anvil-file-insert-at-line (path line content)
   "Insert CONTENT into PATH at LINE (1-indexed). LINE 1 = before first line.
 A trailing newline is added to CONTENT if not present.
-Returns (:line LINE :inserted-bytes N :file PATH)."
-  (let ((abs (anvil--prepare-path path))
-        (text (if (string-suffix-p "\n" content)
-                  content
-                (concat content "\n"))))
+Returns (:line LINE :inserted-bytes N :file PATH :warnings LIST)."
+  (let* ((abs (anvil--prepare-path path))
+         (warnings (anvil-file-warn-if-diverged abs))
+         (text (if (string-suffix-p "\n" content)
+                   content
+                 (concat content "\n"))))
     (with-temp-buffer
       (anvil--insert-file abs)
       (goto-char (point-min))
       (forward-line (1- line))
       (insert text)
       (anvil--write-current-buffer-to abs))
-    (list :line line :inserted-bytes (length text) :file abs)))
+    (list :line line :inserted-bytes (length text)
+          :file abs :warnings warnings)))
 
 (defun anvil-file-delete-lines (path start-line end-line)
   "Delete lines START-LINE through END-LINE inclusive (1-indexed) from PATH.
-Returns (:deleted N :file PATH)."
+Returns (:deleted N :file PATH :warnings LIST)."
   (when (> start-line end-line)
     (error "my-cc: start-line %d > end-line %d" start-line end-line))
-  (let ((abs (anvil--prepare-path path))
-        (deleted (1+ (- end-line start-line))))
+  (let* ((abs (anvil--prepare-path path))
+         (warnings (anvil-file-warn-if-diverged abs))
+         (deleted (1+ (- end-line start-line))))
     (with-temp-buffer
       (anvil--insert-file abs)
       (goto-char (point-min))
@@ -228,14 +234,15 @@ Returns (:deleted N :file PATH)."
         (forward-line deleted)
         (delete-region beg (point)))
       (anvil--write-current-buffer-to abs))
-    (list :deleted deleted :file abs)))
+    (list :deleted deleted :file abs :warnings warnings)))
 
 (defun anvil-file-append (path content)
   "Append CONTENT to end of PATH.
 A leading newline is added if file does not end with one.
-Returns (:appended-bytes N :file PATH)."
-  (let ((abs (anvil--prepare-path path))
-        bytes)
+Returns (:appended-bytes N :file PATH :warnings LIST)."
+  (let* ((abs (anvil--prepare-path path))
+         (warnings (anvil-file-warn-if-diverged abs))
+         bytes)
     (with-temp-buffer
       (anvil--insert-file abs)
       (goto-char (point-max))
@@ -246,22 +253,23 @@ Returns (:appended-bytes N :file PATH)."
         (insert content)
         (setq bytes (- (point) before)))
       (anvil--write-current-buffer-to abs))
-    (list :appended-bytes bytes :file abs)))
+    (list :appended-bytes bytes :file abs :warnings warnings)))
 
 (defun anvil-file-prepend (path content)
   "Prepend CONTENT to beginning of PATH.
 A trailing newline is added to CONTENT if not present.
-Returns (:prepended-bytes N :file PATH)."
-  (let ((abs (anvil--prepare-path path))
-        (text (if (string-suffix-p "\n" content)
-                  content
-                (concat content "\n"))))
+Returns (:prepended-bytes N :file PATH :warnings LIST)."
+  (let* ((abs (anvil--prepare-path path))
+         (warnings (anvil-file-warn-if-diverged abs))
+         (text (if (string-suffix-p "\n" content)
+                   content
+                 (concat content "\n"))))
     (with-temp-buffer
       (anvil--insert-file abs)
       (goto-char (point-min))
       (insert text)
       (anvil--write-current-buffer-to abs))
-    (list :prepended-bytes (length text) :file abs)))
+    (list :prepended-bytes (length text) :file abs :warnings warnings)))
 
 (defun anvil-file-create (path content &optional overwrite)
   "Create new file at PATH with CONTENT.
@@ -1108,9 +1116,11 @@ MCP Parameters:
   "Execute a list of OPERATIONS on file at PATH in a single pass.
 OPERATIONS is a list of alists, each with an `op' key and operation-specific
 keys.  All operations run on the same buffer; the file is written once at end.
-Returns (:ok t :operations N :file PATH) on success."
-  (let ((abs (anvil--prepare-path path))
-        (op-count 0))
+Returns (:ok t :operations N :file PATH :warnings LIST) on success.
+:warnings surfaces pre-write divergence with any visited buffer."
+  (let* ((abs (anvil--prepare-path path))
+         (warnings (anvil-file-warn-if-diverged abs))
+         (op-count 0))
     (with-temp-buffer
       (anvil--insert-file abs)
       (dolist (op operations)
@@ -1169,7 +1179,7 @@ Returns (:ok t :operations N :file PATH) on success."
              (error "batch: unknown op: %s" type))))
         (cl-incf op-count))
       (anvil--write-current-buffer-to abs))
-    (list :ok t :operations op-count :file abs)))
+    (list :ok t :operations op-count :file abs :warnings warnings)))
 
 (defun anvil-file--tool-batch (path operations)
   "Execute multiple file operations on PATH in a single call.
@@ -1370,8 +1380,9 @@ OPTS plist:
   :position SYMBOL     `after-last-match' (default) | `before-first-match'
                        | `top' (very first line) | `bottom'.
 
-Returns plist (:inserted BOOL :line N :already-present BOOL :file PATH)."
+Returns plist (:inserted BOOL :line N :already-present BOOL :file PATH :warnings LIST)."
   (let* ((abs (anvil--prepare-path path))
+         (warnings (anvil-file-warn-if-diverged abs))
          (after-regex (if (plist-member opts :after-regex)
                           (plist-get opts :after-regex)
                         "^import "))
@@ -1387,7 +1398,8 @@ Returns plist (:inserted BOOL :line N :already-present BOOL :file PATH)."
                                        "$")
                                nil t)
             (list :inserted nil :already-present t
-                  :line (line-number-at-pos) :file abs)
+                  :line (line-number-at-pos) :file abs
+                  :warnings warnings)
           (let ((insert-line nil))
             (pcase position
               ('top (setq insert-line 1))
@@ -1411,21 +1423,21 @@ Returns plist (:inserted BOOL :line N :already-present BOOL :file PATH)."
               (let ((ln (1- (line-number-at-pos))))
                 (anvil--write-current-buffer-to abs)
                 (list :inserted t :already-present nil
-                      :line ln :file abs)))
+                      :line ln :file abs :warnings warnings)))
              (insert-line
               (goto-char (point-min))
               (forward-line (1- insert-line))
               (insert target-line "\n")
               (anvil--write-current-buffer-to abs)
               (list :inserted t :already-present nil
-                    :line insert-line :file abs))
+                    :line insert-line :file abs :warnings warnings))
              (t
               ;; No matches: insert at top (line 1)
               (goto-char (point-min))
               (insert target-line "\n")
               (anvil--write-current-buffer-to abs)
               (list :inserted t :already-present nil
-                    :line 1 :file abs)))))))))
+                    :line 1 :file abs :warnings warnings)))))))))
 
 ;;;; --- batch across multiple files -----------------------------------------
 

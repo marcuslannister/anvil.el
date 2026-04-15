@@ -285,4 +285,117 @@
                               (anvil-file-test--read path)))))
          (when (buffer-live-p buf) (kill-buffer buf)))))))
 
+;;;; --- Phase 2 full: :warnings embedded in all mutating tools --------------
+
+(defmacro anvil-file-test--expect-warning (form)
+  "Assert FORM's plist result includes a `buffer-newer' :warnings entry."
+  `(let ((ws (plist-get ,form :warnings)))
+     (should (= 1 (length ws)))
+     (should (string-match-p "buffer-newer" (car ws)))))
+
+(ert-deftest anvil-file-test-phase2-replace-regexp-warnings ()
+  (anvil-file-test--with-tmp
+   "aaa bbb ccc\n"
+   (lambda (path)
+     (let ((buf (find-file-noselect path)))
+       (unwind-protect
+           (progn
+             (with-current-buffer buf (insert "UNSAVED"))
+             (anvil-file-test--expect-warning
+              (anvil-file-replace-regexp path "b+" "BBB")))
+         (when (buffer-live-p buf) (kill-buffer buf)))))))
+
+(ert-deftest anvil-file-test-phase2-insert-at-line-warnings ()
+  (anvil-file-test--with-tmp
+   "one\ntwo\nthree\n"
+   (lambda (path)
+     (let ((buf (find-file-noselect path)))
+       (unwind-protect
+           (progn
+             (with-current-buffer buf (insert "UNSAVED"))
+             (anvil-file-test--expect-warning
+              (anvil-file-insert-at-line path 2 "inserted")))
+         (when (buffer-live-p buf) (kill-buffer buf)))))))
+
+(ert-deftest anvil-file-test-phase2-delete-lines-warnings ()
+  (anvil-file-test--with-tmp
+   "one\ntwo\nthree\nfour\n"
+   (lambda (path)
+     (let ((buf (find-file-noselect path)))
+       (unwind-protect
+           (progn
+             (with-current-buffer buf (insert "UNSAVED"))
+             (anvil-file-test--expect-warning
+              (anvil-file-delete-lines path 2 3)))
+         (when (buffer-live-p buf) (kill-buffer buf)))))))
+
+(ert-deftest anvil-file-test-phase2-append-warnings ()
+  (anvil-file-test--with-tmp
+   "start\n"
+   (lambda (path)
+     (let ((buf (find-file-noselect path)))
+       (unwind-protect
+           (progn
+             (with-current-buffer buf (insert "UNSAVED"))
+             (anvil-file-test--expect-warning
+              (anvil-file-append path "tail\n")))
+         (when (buffer-live-p buf) (kill-buffer buf)))))))
+
+(ert-deftest anvil-file-test-phase2-prepend-warnings ()
+  (anvil-file-test--with-tmp
+   "body\n"
+   (lambda (path)
+     (let ((buf (find-file-noselect path)))
+       (unwind-protect
+           (progn
+             (with-current-buffer buf (insert "UNSAVED"))
+             (anvil-file-test--expect-warning
+              (anvil-file-prepend path "head\n")))
+         (when (buffer-live-p buf) (kill-buffer buf)))))))
+
+(ert-deftest anvil-file-test-phase2-batch-warnings ()
+  (anvil-file-test--with-tmp
+   "foo bar\n"
+   (lambda (path)
+     (let ((buf (find-file-noselect path)))
+       (unwind-protect
+           (progn
+             (with-current-buffer buf (insert "UNSAVED"))
+             (anvil-file-test--expect-warning
+              (anvil-file-batch
+               path
+               '(((op . "replace") (old . "foo") (new . "FOO"))))))
+         (when (buffer-live-p buf) (kill-buffer buf)))))))
+
+(ert-deftest anvil-file-test-phase2-ensure-import-warnings-insert-path ()
+  "ensure-import's insertion branch carries a divergence :warning."
+  (anvil-file-test--with-tmp
+   "import a\nimport b\n\nbody()\n"
+   (lambda (path)
+     (let ((buf (find-file-noselect path)))
+       (unwind-protect
+           (progn
+             (with-current-buffer buf (insert "UNSAVED"))
+             (anvil-file-test--expect-warning
+              (anvil-file-ensure-import path "import c")))
+         (when (buffer-live-p buf) (kill-buffer buf)))))))
+
+(ert-deftest anvil-file-test-phase2-ensure-import-warnings-already-present ()
+  "ensure-import's already-present branch still surfaces :warnings.
+Uses a fixture whose target line is already on disk so no write fires."
+  (anvil-file-test--with-tmp
+   "import a\nimport c\nbody()\n"
+   (lambda (path)
+     (let ((buf (find-file-noselect path)))
+       (unwind-protect
+           (progn
+             (with-current-buffer buf (insert "UNSAVED"))
+             (let ((res (anvil-file-ensure-import path "import c")))
+               (should (eq t (plist-get res :already-present)))
+               (should (= 1 (length (plist-get res :warnings))))
+               (should (string-match-p
+                        "buffer-newer\\|both-modified"
+                        (car (plist-get res :warnings))))))
+         (when (buffer-live-p buf) (kill-buffer buf)))))))
+
 ;;; anvil-file-test.el ends here
