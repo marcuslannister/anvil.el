@@ -294,4 +294,139 @@ Uses a shell `touch' via `set-file-times' for portability."
       (ignore-errors (anvil-org-index-disable))
       (ignore-errors (delete-directory tmpdir t)))))
 
+;;;; Phase 3 — filesystem watcher
+
+(ert-deftest anvil-org-index-test-collect-dirs-includes-only-org-bearing ()
+  "collect-dirs returns directories that hold .org files and skips others."
+  (let* ((root (make-temp-file "anvil-idx-watch-" t))
+         (with-org   (expand-file-name "a" root))
+         (with-org-2 (expand-file-name "a/b" root))
+         (empty      (expand-file-name "empty" root))
+         (anvil-org-index-paths (list root)))
+    (unwind-protect
+        (progn
+          (make-directory with-org-2 t)
+          (make-directory empty t)
+          (anvil-org-index-test--write
+           (expand-file-name "top.org" with-org) "* x\n")
+          (anvil-org-index-test--write
+           (expand-file-name "nested.org" with-org-2) "* y\n")
+          (let* ((dirs (mapcar #'file-name-as-directory
+                               (anvil-org-index--collect-dirs)))
+                 (want (list (file-name-as-directory with-org)
+                             (file-name-as-directory with-org-2))))
+            (should (cl-every (lambda (d) (member d dirs)) want))
+            (should-not
+             (member (file-name-as-directory empty) dirs))))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest anvil-org-index-test-schedule-refresh-coalesces ()
+  "Two scheduled refreshes for the same path leave one active timer."
+  (let ((anvil-org-index--refresh-timer-map (make-hash-table :test 'equal))
+        (anvil-org-index-watch-debounce-seconds 60.0)
+        (path "/tmp/nonexistent-test-path.org"))
+    (unwind-protect
+        (progn
+          (anvil-org-index--schedule-refresh path)
+          (let ((first (gethash path anvil-org-index--refresh-timer-map)))
+            (should (timerp first))
+            (anvil-org-index--schedule-refresh path)
+            (let ((second (gethash path
+                                   anvil-org-index--refresh-timer-map)))
+              (should (timerp second))
+              (should-not (eq first second)))))
+      (maphash (lambda (_k tm) (when (timerp tm) (cancel-timer tm)))
+               anvil-org-index--refresh-timer-map))))
+
+(ert-deftest anvil-org-index-test-on-file-event-triggers-schedule ()
+  "A synthesized .org file-notify event pushes a timer into the map."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (let* ((tmpdir (make-temp-file "anvil-idx-evt-" t))
+         (f (expand-file-name "watched.org" tmpdir))
+         (db (expand-file-name "i.db" tmpdir))
+         (anvil-org-index-db-path db)
+         (anvil-org-index-paths (list tmpdir))
+         (anvil-org-index-watch-debounce-seconds 60.0)
+         (anvil-org-index--backend nil)
+         (anvil-org-index--db nil)
+         (anvil-org-index--refresh-timer-map
+          (make-hash-table :test 'equal)))
+    (unwind-protect
+        (progn
+          (anvil-org-index-test--write f "* one\n")
+          (anvil-org-index-enable)
+          (anvil-org-index-rebuild)
+          (anvil-org-index--on-file-event (list 'dummy 'changed f))
+          (should (gethash (expand-file-name f)
+                           anvil-org-index--refresh-timer-map)))
+      (maphash (lambda (_k tm) (when (timerp tm) (cancel-timer tm)))
+               anvil-org-index--refresh-timer-map)
+      (ignore-errors (anvil-org-index-disable))
+      (ignore-errors (delete-directory tmpdir t)))))
+
+(ert-deftest anvil-org-index-test-on-file-event-ignores-non-org ()
+  "Events for non-.org files do not schedule a refresh."
+  (let ((anvil-org-index--refresh-timer-map (make-hash-table :test 'equal)))
+    (anvil-org-index--on-file-event
+     (list 'dummy 'changed "/tmp/readme.md"))
+    (should (zerop (hash-table-count
+                    anvil-org-index--refresh-timer-map)))))
+
+(ert-deftest anvil-org-index-test-perform-refresh-reindexes ()
+  "perform-refresh picks up on-disk changes without waiting on the timer."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (let* ((tmpdir (make-temp-file "anvil-idx-perf-" t))
+         (f (expand-file-name "a.org" tmpdir))
+         (db (expand-file-name "i.db" tmpdir))
+         (anvil-org-index-db-path db)
+         (anvil-org-index-paths (list tmpdir))
+         (anvil-org-index--backend nil)
+         (anvil-org-index--db nil)
+         (anvil-org-index--refresh-timer-map
+          (make-hash-table :test 'equal)))
+    (unwind-protect
+        (progn
+          (anvil-org-index-test--write f "* one\n")
+          (anvil-org-index-enable)
+          (anvil-org-index-rebuild)
+          (anvil-org-index-test--write f "* one\n* two\n")
+          (anvil-org-index-test--touch-future f 5)
+          (anvil-org-index--perform-refresh f)
+          (should (= 2 (caar (anvil-org-index--select
+                              anvil-org-index--db
+                              "SELECT COUNT(*) FROM headline"))))
+          (should (zerop (hash-table-count
+                          anvil-org-index--refresh-timer-map))))
+      (ignore-errors (anvil-org-index-disable))
+      (ignore-errors (delete-directory tmpdir t)))))
+
+(ert-deftest anvil-org-index-test-watch-and-unwatch-lifecycle ()
+  "watch creates descriptors; unwatch clears them and the timer map."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (skip-unless (require 'filenotify nil t))
+  (let* ((tmpdir (make-temp-file "anvil-idx-watch-lc-" t))
+         (db (expand-file-name "i.db" tmpdir))
+         (anvil-org-index-db-path db)
+         (anvil-org-index-paths (list tmpdir))
+         (anvil-org-index-periodic-scan-seconds 0)
+         (anvil-org-index--backend nil)
+         (anvil-org-index--db nil)
+         (anvil-org-index--watch-descriptors nil)
+         (anvil-org-index--refresh-timer-map
+          (make-hash-table :test 'equal)))
+    (unwind-protect
+        (progn
+          (anvil-org-index-test--write
+           (expand-file-name "one.org" tmpdir) "* one\n")
+          (let ((dirs (anvil-org-index-watch)))
+            (should (>= (length dirs) 1))
+            (should (>= (length anvil-org-index--watch-descriptors) 1)))
+          (anvil-org-index-unwatch)
+          (should-not anvil-org-index--watch-descriptors)
+          (should (zerop (hash-table-count
+                          anvil-org-index--refresh-timer-map))))
+      (ignore-errors (anvil-org-index-unwatch))
+      (ignore-errors (anvil-org-index-disable))
+      (ignore-errors (delete-directory tmpdir t)))))
+
 ;;; anvil-org-index-test.el ends here

@@ -539,6 +539,154 @@ have changed.  Returns a summary plist."
       (anvil-org-index--refresh-one file)
     (anvil-org-index--refresh-all)))
 
+;;; Phase 3 — filesystem watcher
+
+(defcustom anvil-org-index-watch-debounce-seconds 2.0
+  "Delay in seconds before acting on a file-change event.
+Consecutive events for the same path within this window are
+coalesced to a single refresh call."
+  :type 'number
+  :group 'anvil-org-index)
+
+(defcustom anvil-org-index-periodic-scan-seconds 3600
+  "Interval in seconds for the periodic full-index mtime sweep.
+0 disables the periodic scan.  Acts as a safety net in case the
+underlying filesystem-notification backend drops events (w32-notify
+in particular is known to miss events under heavy load)."
+  :type 'integer
+  :group 'anvil-org-index)
+
+(defvar anvil-org-index--watch-descriptors nil
+  "Alist of (DIR . DESCRIPTOR) for active filesystem watches.")
+
+(defvar anvil-org-index--refresh-timer-map
+  (make-hash-table :test 'equal)
+  "Map from file path to its pending debounce timer.")
+
+(defvar anvil-org-index--periodic-timer nil
+  "Timer for the periodic full-index scan, or nil if inactive.")
+
+(defun anvil-org-index--collect-dirs (&optional paths)
+  "Return directories under PATHS that contain at least one .org file.
+PATHS defaults to `anvil-org-index-paths'.  Excluded paths
+honour `anvil-org-index-exclude-patterns'.  Used to seed the
+filesystem watcher — watching every org-bearing directory
+catches file creation, modification, renaming and deletion even
+when the filenotify backend is non-recursive (the common case on
+Linux/inotify)."
+  (let ((roots (or paths anvil-org-index-paths))
+        (dirs nil))
+    (dolist (root roots)
+      (let ((abs (expand-file-name root)))
+        (when (file-directory-p abs)
+          (let ((stack (list abs)))
+            (while stack
+              (let ((dir (pop stack)))
+                (unless (anvil-org-index--excluded-p dir)
+                  (let ((has-org nil))
+                    (dolist (entry (directory-files dir t "\\`[^.]" t))
+                      (cond
+                       ((file-directory-p entry)
+                        (unless (anvil-org-index--excluded-p entry)
+                          (push entry stack)))
+                       ((string-match-p "\\.org\\'" entry)
+                        (setq has-org t))))
+                    (when has-org
+                      (push (file-name-as-directory dir) dirs))))))))))
+    (nreverse dirs)))
+
+(defun anvil-org-index--perform-refresh (path)
+  "Run the debounced refresh for PATH and clear its pending timer.
+Exposed as a separate function so tests can exercise it directly
+without waiting on real `run-with-timer' delays."
+  (remhash path anvil-org-index--refresh-timer-map)
+  (condition-case err
+      (anvil-org-index-refresh-if-stale path)
+    (error
+     (message "anvil-org-index: refresh failed for %s: %S" path err))))
+
+(defun anvil-org-index--schedule-refresh (path)
+  "Schedule a debounced refresh for PATH.
+A second event arriving within
+`anvil-org-index-watch-debounce-seconds' cancels the prior timer
+and restarts the window, so bursty editors (save-with-backup,
+VCS operations) still cost only one refresh."
+  (let ((existing (gethash path anvil-org-index--refresh-timer-map)))
+    (when (timerp existing)
+      (cancel-timer existing)))
+  (puthash path
+           (run-with-timer
+            anvil-org-index-watch-debounce-seconds nil
+            #'anvil-org-index--perform-refresh path)
+           anvil-org-index--refresh-timer-map))
+
+(defun anvil-org-index--on-file-event (event)
+  "Dispatch a filesystem EVENT to the refresh scheduler.
+EVENT format: (DESCRIPTOR ACTION FILE &optional FILE1).  Only
+actions that plausibly affect .org files are acted on; the
+backend-specific `attribute-changed' is included because some
+Windows tools touch mtime without raising a normal change event."
+  (let ((action (nth 1 event))
+        (file   (nth 2 event)))
+    (when (and (stringp file)
+               (memq action '(created changed deleted renamed
+                                      attribute-changed))
+               (string-match-p "\\.org\\'" file))
+      (anvil-org-index--schedule-refresh (expand-file-name file)))))
+
+;;;###autoload
+(defun anvil-org-index-watch (&optional paths)
+  "Start watching PATHS for .org file changes; auto-refresh the index.
+PATHS defaults to `anvil-org-index-paths'.  Idempotent — a
+second call tears down and re-establishes all watches.  Installs
+the periodic safety-net scan when
+`anvil-org-index-periodic-scan-seconds' is positive.  Returns
+the list of directories now under watch."
+  (interactive)
+  (unless anvil-org-index--db (anvil-org-index-enable))
+  (require 'filenotify)
+  (anvil-org-index-unwatch)
+  (let ((dirs (anvil-org-index--collect-dirs paths)))
+    (dolist (dir dirs)
+      (condition-case err
+          (let ((desc (file-notify-add-watch
+                       dir '(change attribute-change)
+                       #'anvil-org-index--on-file-event)))
+            (push (cons dir desc) anvil-org-index--watch-descriptors))
+        (error
+         (message "anvil-org-index: cannot watch %s: %S" dir err))))
+    (when (and (> anvil-org-index-periodic-scan-seconds 0)
+               (not (timerp anvil-org-index--periodic-timer)))
+      (setq anvil-org-index--periodic-timer
+            (run-with-timer
+             anvil-org-index-periodic-scan-seconds
+             anvil-org-index-periodic-scan-seconds
+             (lambda ()
+               (condition-case err
+                   (anvil-org-index-refresh-if-stale)
+                 (error
+                  (message "anvil-org-index periodic scan failed: %S"
+                           err)))))))
+    (message "anvil-org-index: watching %d director%s"
+             (length dirs)
+             (if (= 1 (length dirs)) "y" "ies"))
+    dirs))
+
+;;;###autoload
+(defun anvil-org-index-unwatch ()
+  "Tear down all filesystem watches and pending debounce timers."
+  (interactive)
+  (dolist (cell anvil-org-index--watch-descriptors)
+    (ignore-errors (file-notify-rm-watch (cdr cell))))
+  (setq anvil-org-index--watch-descriptors nil)
+  (maphash (lambda (_k timer)
+             (when (timerp timer) (cancel-timer timer)))
+           anvil-org-index--refresh-timer-map)
+  (clrhash anvil-org-index--refresh-timer-map)
+  (when (timerp anvil-org-index--periodic-timer)
+    (cancel-timer anvil-org-index--periodic-timer)
+    (setq anvil-org-index--periodic-timer nil)))
+
 ;;;###autoload
 (defun anvil-org-index-status ()
   "Show a summary of the current index state."
