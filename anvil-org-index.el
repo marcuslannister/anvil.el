@@ -443,6 +443,102 @@ single transaction.  Returns a summary plist."
             :headlines total
             :elapsed-sec elapsed))))
 
+;;; Phase 2 — incremental refresh
+
+(defun anvil-org-index--indexed-mtime (db path)
+  "Return mtime recorded in the index for PATH, or nil if not indexed."
+  (caar (anvil-org-index--select
+         db "SELECT mtime FROM file WHERE path = ?" (list path))))
+
+(defun anvil-org-index--current-mtime (path)
+  "Return filesystem mtime of PATH as integer seconds, or nil if missing."
+  (let ((attrs (file-attributes path)))
+    (when attrs
+      (floor (float-time (file-attribute-modification-time attrs))))))
+
+(defun anvil-org-index--refresh-one (path)
+  "Refresh a single PATH against the index.
+Re-ingests if stale, deletes if the file no longer exists, skips
+if mtimes match.  Returns (:path P :outcome SYM :elapsed-sec N)."
+  (let* ((path      (expand-file-name path))
+         (start     (float-time))
+         (disk-mt   (anvil-org-index--current-mtime path))
+         (idx-mt    (anvil-org-index--indexed-mtime anvil-org-index--db path))
+         (outcome   'unchanged))
+    (cond
+     ((not disk-mt)
+      (when idx-mt
+        (anvil-org-index--execute
+         anvil-org-index--db "DELETE FROM file WHERE path = ?" (list path))
+        (setq outcome 'removed)))
+     ((or (null idx-mt) (/= disk-mt idx-mt))
+      (anvil-org-index--with-transaction anvil-org-index--db
+        (anvil-org-index--ingest-file anvil-org-index--db path))
+      (setq outcome (if idx-mt 'reindexed 'added))))
+    (list :path path
+          :outcome outcome
+          :elapsed-sec (- (float-time) start))))
+
+(defun anvil-org-index--refresh-all (&optional paths)
+  "Refresh every file under PATHS (defaults to `anvil-org-index-paths').
+Adds new files, re-ingests stale ones, and deletes rows for files
+that have been removed from disk.  Runs inside a single transaction.
+Returns a summary plist."
+  (let* ((db          anvil-org-index--db)
+         (start       (float-time))
+         (disk-files  (anvil-org-index--collect-files paths))
+         (disk-set    (let ((h (make-hash-table :test 'equal)))
+                        (dolist (f disk-files) (puthash f t h))
+                        h))
+         (idx-rows    (anvil-org-index--select
+                       db "SELECT path, mtime FROM file"))
+         (idx-map     (let ((h (make-hash-table :test 'equal)))
+                        (dolist (row idx-rows)
+                          (puthash (car row) (cadr row) h))
+                        h))
+         (added 0) (reindexed 0) (removed 0) (unchanged 0))
+    (anvil-org-index--with-transaction db
+      (dolist (f disk-files)
+        (let ((disk-mt (anvil-org-index--current-mtime f))
+              (idx-mt  (gethash f idx-map)))
+          (cond
+           ((null idx-mt)
+            (anvil-org-index--ingest-file db f)
+            (cl-incf added))
+           ((/= disk-mt idx-mt)
+            (anvil-org-index--ingest-file db f)
+            (cl-incf reindexed))
+           (t (cl-incf unchanged)))))
+      (dolist (row idx-rows)
+        (let ((p (car row)))
+          (unless (gethash p disk-set)
+            (anvil-org-index--execute
+             db "DELETE FROM file WHERE path = ?" (list p))
+            (cl-incf removed)))))
+    (let ((elapsed (- (float-time) start)))
+      (message "anvil-org-index: refresh +%d ~%d -%d =%d in %.2fs"
+               added reindexed removed unchanged elapsed)
+      (list :scanned (length disk-files)
+            :added added
+            :reindexed reindexed
+            :removed removed
+            :unchanged unchanged
+            :elapsed-sec elapsed))))
+
+;;;###autoload
+(defun anvil-org-index-refresh-if-stale (&optional file)
+  "Refresh FILE (or all configured paths) based on mtime comparison.
+With FILE, re-ingest only if its mtime differs from the index, or
+delete its rows if the file no longer exists on disk.  Without
+FILE, refresh every file under `anvil-org-index-paths'.
+Much cheaper than `anvil-org-index-rebuild' when only a few files
+have changed.  Returns a summary plist."
+  (interactive)
+  (unless anvil-org-index--db (anvil-org-index-enable))
+  (if file
+      (anvil-org-index--refresh-one file)
+    (anvil-org-index--refresh-all)))
+
 ;;;###autoload
 (defun anvil-org-index-status ()
   "Show a summary of the current index state."

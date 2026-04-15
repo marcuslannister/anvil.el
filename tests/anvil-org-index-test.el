@@ -172,4 +172,126 @@ SCHEDULED: <2026-04-15 Wed>
       (ignore-errors (anvil-org-index-disable))
       (ignore-errors (delete-directory tmpdir t)))))
 
+;;;; Phase 2 — incremental refresh
+
+(defun anvil-org-index-test--write (path content)
+  "Write CONTENT to PATH as UTF-8."
+  (let ((coding-system-for-write 'utf-8-unix))
+    (write-region content nil path nil 'silent)))
+
+(defun anvil-org-index-test--touch-future (path seconds)
+  "Set PATH mtime to SECONDS in the future of its current mtime.
+Uses a shell `touch' via `set-file-times' for portability."
+  (let* ((attrs (file-attributes path))
+         (now   (float-time (file-attribute-modification-time attrs)))
+         (new   (seconds-to-time (+ now seconds))))
+    (set-file-times path new new)))
+
+(ert-deftest anvil-org-index-test-refresh-unchanged-is-noop ()
+  "refresh-if-stale on an unchanged file reports outcome=unchanged."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (let* ((tmpdir (make-temp-file "anvil-idx-" t))
+         (f (expand-file-name "a.org" tmpdir))
+         (db (expand-file-name "i.db" tmpdir))
+         (anvil-org-index-db-path db)
+         (anvil-org-index-paths (list tmpdir))
+         (anvil-org-index--backend nil)
+         (anvil-org-index--db nil))
+    (unwind-protect
+        (progn
+          (anvil-org-index-test--write f "* One\n")
+          (anvil-org-index-enable)
+          (anvil-org-index-rebuild)
+          (let ((res (anvil-org-index-refresh-if-stale f)))
+            (should (eq 'unchanged (plist-get res :outcome)))))
+      (ignore-errors (anvil-org-index-disable))
+      (ignore-errors (delete-directory tmpdir t)))))
+
+(ert-deftest anvil-org-index-test-refresh-detects-modification ()
+  "Touching a file to a newer mtime triggers reindex."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (let* ((tmpdir (make-temp-file "anvil-idx-" t))
+         (f (expand-file-name "a.org" tmpdir))
+         (db (expand-file-name "i.db" tmpdir))
+         (anvil-org-index-db-path db)
+         (anvil-org-index-paths (list tmpdir))
+         (anvil-org-index--backend nil)
+         (anvil-org-index--db nil))
+    (unwind-protect
+        (progn
+          (anvil-org-index-test--write f "* One\n")
+          (anvil-org-index-enable)
+          (anvil-org-index-rebuild)
+          (should (= 1 (caar (anvil-org-index--select
+                              anvil-org-index--db
+                              "SELECT COUNT(*) FROM headline"))))
+          (anvil-org-index-test--write f "* One\n* Two\n")
+          (anvil-org-index-test--touch-future f 5)
+          (let ((res (anvil-org-index-refresh-if-stale f)))
+            (should (eq 'reindexed (plist-get res :outcome))))
+          (should (= 2 (caar (anvil-org-index--select
+                              anvil-org-index--db
+                              "SELECT COUNT(*) FROM headline")))))
+      (ignore-errors (anvil-org-index-disable))
+      (ignore-errors (delete-directory tmpdir t)))))
+
+(ert-deftest anvil-org-index-test-refresh-removes-deleted-file ()
+  "Deleting a file from disk then refreshing drops its rows."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (let* ((tmpdir (make-temp-file "anvil-idx-" t))
+         (f (expand-file-name "a.org" tmpdir))
+         (db (expand-file-name "i.db" tmpdir))
+         (anvil-org-index-db-path db)
+         (anvil-org-index-paths (list tmpdir))
+         (anvil-org-index--backend nil)
+         (anvil-org-index--db nil))
+    (unwind-protect
+        (progn
+          (anvil-org-index-test--write f "* One\n")
+          (anvil-org-index-enable)
+          (anvil-org-index-rebuild)
+          (delete-file f)
+          (let ((res (anvil-org-index-refresh-if-stale)))
+            (should (= 0 (plist-get res :scanned)))
+            (should (= 1 (plist-get res :removed))))
+          (should (= 0 (caar (anvil-org-index--select
+                              anvil-org-index--db
+                              "SELECT COUNT(*) FROM file")))))
+      (ignore-errors (anvil-org-index-disable))
+      (ignore-errors (delete-directory tmpdir t)))))
+
+(ert-deftest anvil-org-index-test-refresh-all-mixed-changes ()
+  "refresh-all handles added / reindexed / removed / unchanged together."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (let* ((tmpdir (make-temp-file "anvil-idx-" t))
+         (a (expand-file-name "a.org" tmpdir))  ; unchanged
+         (b (expand-file-name "b.org" tmpdir))  ; will be modified
+         (c (expand-file-name "c.org" tmpdir))  ; will be deleted
+         (d (expand-file-name "d.org" tmpdir))  ; will be added
+         (db (expand-file-name "i.db" tmpdir))
+         (anvil-org-index-db-path db)
+         (anvil-org-index-paths (list tmpdir))
+         (anvil-org-index--backend nil)
+         (anvil-org-index--db nil))
+    (unwind-protect
+        (progn
+          (anvil-org-index-test--write a "* A\n")
+          (anvil-org-index-test--write b "* B\n")
+          (anvil-org-index-test--write c "* C\n")
+          (anvil-org-index-enable)
+          (anvil-org-index-rebuild)
+          ;; mutate
+          (anvil-org-index-test--write b "* B\n* B2\n")
+          (anvil-org-index-test--touch-future b 5)
+          (delete-file c)
+          (anvil-org-index-test--write d "* D\n")
+          (let ((res (anvil-org-index-refresh-if-stale)))
+            (should (= 3 (plist-get res :scanned)))  ; a b d on disk
+            (should (= 1 (plist-get res :added)))
+            (should (= 1 (plist-get res :reindexed)))
+            (should (= 1 (plist-get res :removed)))
+            (should (= 1 (plist-get res :unchanged)))))
+      (ignore-errors (anvil-org-index-disable))
+      (ignore-errors (delete-directory tmpdir t)))))
+
 ;;; anvil-org-index-test.el ends here
