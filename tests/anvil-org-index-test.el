@@ -871,3 +871,95 @@ Body delta (no drawer).
            (rows (plist-get res :rows)))
       (should (= 1 (plist-get res :count)))
       (should (equal "Bravo task" (plist-get (car rows) :title))))))
+
+;;;; Async refresh tests (subprocess offload)
+
+(defmacro anvil-org-index-test--with-stubbed-spawn (captured-args &rest body)
+  "Run BODY with `start-process' stubbed; writes its args into CAPTURED-ARGS.
+Also stubs `set-process-sentinel', `set-process-query-on-exit-flag',
+`process-id', and `process-live-p' so BODY never touches real processes."
+  (declare (indent 1))
+  `(let ((,captured-args nil)
+         (anvil-org-index--async-refresh-proc nil))
+     (cl-letf (((symbol-function 'start-process)
+                (lambda (name _buffer &rest args)
+                  (setq ,captured-args (cons name args))
+                  ;; fake a process object — any non-nil value is fine since
+                  ;; the helpers below are also stubbed.
+                  'fake-proc))
+               ((symbol-function 'set-process-sentinel)
+                (lambda (&rest _) nil))
+               ((symbol-function 'set-process-query-on-exit-flag)
+                (lambda (&rest _) nil))
+               ((symbol-function 'process-id)
+                (lambda (_) 12345))
+               ((symbol-function 'process-live-p)
+                (lambda (p) (eq p 'fake-proc))))
+       ,@body)))
+
+(ert-deftest anvil-org-index-test-async-refresh-errors-without-paths ()
+  "`anvil-org-index-refresh-async' signals when paths are empty."
+  (let ((anvil-org-index-paths nil))
+    (should-error (anvil-org-index-refresh-async)
+                  :type 'user-error)))
+
+(ert-deftest anvil-org-index-test-async-refresh-spawns-batch-emacs ()
+  "Spawn args carry --batch -Q -L lib-dir --eval with the refresh form."
+  (anvil-org-index-test--with-stubbed-spawn captured
+    (let ((anvil-org-index-paths '("/tmp/example"))
+          (anvil-org-index-db-path "/tmp/example.db")
+          (anvil-org-index-async-emacs-bin "emacs-test"))
+      (let ((ret (anvil-org-index-refresh-async)))
+        (should (string-match-p "async refresh started" ret))
+        (should (eq 'fake-proc anvil-org-index--async-refresh-proc))
+        (should (member "--batch"            captured))
+        (should (member "-Q"                 captured))
+        (should (member "-L"                 captured))
+        (should (member "--eval"             captured))
+        (should (equal "emacs-test"          (nth 1 captured)))
+        ;; The --eval form mentions both the refresh call and the paths,
+        ;; and the paths list MUST be quoted (bare `(a b)' would be
+        ;; evaluated as a function call by the subprocess setq).
+        (let ((eval-arg (car (last captured))))
+          (should (string-match-p "anvil-org-index-refresh-if-stale"
+                                  eval-arg))
+          (should (string-match-p "/tmp/example" eval-arg))
+          (should (string-match-p "/tmp/example.db" eval-arg))
+          (should (string-match-p "'(\"/tmp/example\")" eval-arg)))))))
+
+(ert-deftest anvil-org-index-test-async-refresh-skips-when-busy ()
+  "Second call with a live proc returns a busy marker and doesn't respawn."
+  (anvil-org-index-test--with-stubbed-spawn captured
+    (let ((anvil-org-index-paths '("/tmp/example"))
+          (anvil-org-index-db-path "/tmp/example.db"))
+      ;; First call spawns.
+      (should (string-match-p "async refresh started"
+                              (anvil-org-index-refresh-async)))
+      (let ((first-args captured))
+        (setq captured nil)
+        ;; Second call: proc is still live (stub returns t), skip path.
+        (let ((ret (anvil-org-index-refresh-async)))
+          (should (string-match-p "already running" ret))
+          (should (null captured))
+          (should first-args))))))
+
+(ert-deftest anvil-org-index-test-async-refresh-sentinel-logs-ok ()
+  "Sentinel writes an OK line when the subprocess exits 0."
+  (let* ((tmp-log (make-temp-file "anvil-org-index-refresh-" nil ".log"))
+         (anvil-org-index-async-refresh-log tmp-log)
+         (sentinel (anvil-org-index--async-refresh-sentinel
+                    "refresh-000001" (current-time)))
+         (fake-proc (start-process "fake-sentinel" nil "emacs" "--version")))
+    (unwind-protect
+        (progn
+          ;; Wait for the trivial --version subprocess to exit.
+          (while (process-live-p fake-proc)
+            (accept-process-output fake-proc 0.1))
+          (funcall sentinel fake-proc "finished\n")
+          (with-temp-buffer
+            (insert-file-contents tmp-log)
+            (let ((body (buffer-string)))
+              (should (string-match-p "\\[refresh-000001\\]" body))
+              (should (string-match-p "exit=0 elapsed=" body))
+              (should (string-match-p "\\bOK\\b" body)))))
+      (ignore-errors (delete-file tmp-log)))))

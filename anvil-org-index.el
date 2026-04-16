@@ -694,12 +694,98 @@ DELAY seconds so the human never sees a multi-second freeze."
                    rest chunk-size delay))))
 
 ;;;###autoload
+;;; Phase A' — async refresh via subprocess (offload from main daemon)
+
+(defcustom anvil-org-index-async-emacs-bin
+  (or (executable-find "emacs") "emacs")
+  "Emacs binary used when spawning the async-refresh subprocess."
+  :type 'file
+  :group 'anvil-org-index)
+
+(defcustom anvil-org-index-async-refresh-log
+  (expand-file-name "anvil-org-index-refresh.log" user-emacs-directory)
+  "Log file appended with one line per async refresh completion."
+  :type 'file
+  :group 'anvil-org-index)
+
+(defvar anvil-org-index--async-refresh-proc nil
+  "Currently-running async refresh process, or nil.")
+
+(defun anvil-org-index--async-refresh-sentinel (job-id start-time)
+  "Return a sentinel lambda that logs completion for JOB-ID."
+  (lambda (p _event)
+    (when (memq (process-status p) '(exit signal))
+      (let* ((status (process-exit-status p))
+             (elapsed (float-time
+                       (time-subtract (current-time) start-time)))
+             (line (format "%s [%s] exit=%d elapsed=%.2fs %s\n"
+                           (format-time-string "%Y-%m-%d %H:%M:%S")
+                           job-id status elapsed
+                           (if (zerop status) "OK" "FAIL"))))
+        (let ((coding-system-for-write 'utf-8-unix))
+          (write-region line nil anvil-org-index-async-refresh-log
+                        'append 'no-message))
+        (when (and (zerop status) (buffer-live-p (process-buffer p)))
+          (kill-buffer (process-buffer p)))))))
+
+(defun anvil-org-index--async-refresh-spawn ()
+  "Spawn the refresh subprocess.  Internal helper."
+  (unless anvil-org-index-paths
+    (user-error "anvil-org-index-paths is empty — nothing to refresh"))
+  (let* ((lib-path (or (locate-library "anvil-org-index")
+                       (user-error "anvil-org-index library not found on load-path")))
+         (lib-dir (file-name-directory lib-path))
+         ;; Quote the literals so the subprocess `setq' receives data,
+         ;; not a function call.  `anvil-org-index-paths' is a list; a
+         ;; bare `(a b)' form in the --eval string would be evaluated.
+         (paths-literal (prin1-to-string anvil-org-index-paths))
+         (db-literal (prin1-to-string anvil-org-index-db-path))
+         (job-id (format "refresh-%s" (format-time-string "%H%M%S")))
+         (start-time (current-time))
+         (eval-form
+          (format
+           "(progn (require 'anvil-org-index) (setq anvil-org-index-paths '%s anvil-org-index-db-path %s) (anvil-org-index-refresh-if-stale))"
+           paths-literal db-literal))
+         (proc
+          (start-process
+           job-id
+           (get-buffer-create (format " *%s*" job-id))
+           anvil-org-index-async-emacs-bin
+           "--batch" "-Q"
+           "-L" lib-dir
+           "--eval" eval-form)))
+    (set-process-query-on-exit-flag proc nil)
+    (set-process-sentinel
+     proc
+     (anvil-org-index--async-refresh-sentinel job-id start-time))
+    (setq anvil-org-index--async-refresh-proc proc)
+    (format "anvil-org-index: async refresh started: %s pid=%d"
+            job-id (process-id proc))))
+
+;;;###autoload
+(defun anvil-org-index-refresh-async ()
+  "Run `anvil-org-index-refresh-if-stale' in a subprocess (fire-and-forget).
+Completion is logged to `anvil-org-index-async-refresh-log'.
+When a previous refresh is still running this call is a no-op and
+returns a \"busy\" marker so concurrent timer ticks don't pile up."
+  (interactive)
+  (cond
+   ((and anvil-org-index--async-refresh-proc
+         (process-live-p anvil-org-index--async-refresh-proc))
+    (let ((msg (format
+                "anvil-org-index: async refresh already running (pid=%d)"
+                (process-id anvil-org-index--async-refresh-proc))))
+      (message "%s" msg)
+      msg))
+   (t
+    (anvil-org-index--async-refresh-spawn))))
+
 (defun anvil-org-index-periodic-scan-start (&optional interval)
-  "Start just the periodic mtime scan (no filesystem watches).
+  "Start the periodic mtime scan (no filesystem watches).
 INTERVAL overrides `anvil-org-index-periodic-scan-seconds'.
-This is the recommended startup mode on Windows where
-`file-notify-add-watch' takes ~1s per directory and causes a
-25+ second freeze during daemon startup.  Idempotent."
+Each tick runs `anvil-org-index-refresh-async' — a `emacs --batch'
+subprocess does the mtime sweep so the main daemon never blocks on
+stat traffic even with thousands of org files.  Idempotent."
   (interactive)
   (unless anvil-org-index--db (anvil-org-index-enable))
   (let ((secs (or interval anvil-org-index-periodic-scan-seconds)))
@@ -710,11 +796,11 @@ This is the recommended startup mode on Windows where
              secs secs
              (lambda ()
                (condition-case err
-                   (anvil-org-index-refresh-if-stale)
+                   (anvil-org-index-refresh-async)
                  (error
                   (message "anvil-org-index periodic scan failed: %S"
                            err))))))
-      (message "anvil-org-index: periodic scan every %ds (no filenotify)"
+      (message "anvil-org-index: periodic scan every %ds (async subprocess)"
                secs))))
 
 ;;;###autoload
