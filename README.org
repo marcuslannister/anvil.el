@@ -175,6 +175,67 @@ One ~(anvil-enable)~ and your Emacs becomes an AI-accessible workbench
 with 50+ tools: file editing, org-mode operations, git inspection,
 Elisp evaluation, and more — all through a safe, sandboxed interface.
 
+* For Non-Emacs Users — Adopting Anvil for Token Reduction
+
+"I don't use Emacs, but I want to cut down Claude Code / Cursor's
+token consumption" — this section is for readers who landed here with
+that motivation.
+
+** You never have to open the Emacs UI
+
+Anvil runs in the background as an MCP server. You don't have to
+change the editor you already use (VSCode / Cursor / Neovim /
+Claude Code itself / anything else).
+
+#+begin_example
+  AI client ──MCP──▶ Anvil (Emacs daemon, headless) ──▶ file ops
+  (VSCode / Cursor /                                    (only diffs cross)
+   Claude Code, …)
+#+end_example
+
+Emacs runs as a single background daemon. You don't have to open an
+Emacs window or write =init.el=.
+
+** Where it pays off — typical savings patterns
+
+| Scenario                                                | Reduction | What's happening                      |
+|---------------------------------------------------------+-----------+----------------------------------------|
+| Inserting/deleting one line in a large file             | *~90%+*   | No full-file Read+Write                |
+| 3+ edits to the same file                               | *~70%*    | One round trip + atomic write          |
+| Adding N key/value pairs to a JSON / config dictionary  | *~73%*    | i18n, feature flags, etc.              |
+| Bulk-adding translations to TS/JS ={ ja: "..." }= data  | *~78%*    | Mapping JSON sent once                 |
+| Extracting repeating structured records from huge files | *~50%*    | Legacy migration, ETL                  |
+| Bulk docstring change across N files                    | *~60-80%* | All files in a single call             |
+
+Numbers are measured (case studies in [[*Efficiency — why Anvil saves AI tokens][the Efficiency section]]).
+Workload-dependent, but a typical refactoring session saves
+*15,000-25,000 tokens* consistently.
+
+** Minimal setup (no prior Emacs experience required)
+
+1. *Install Emacs* — only the daemon needs to run; no day-to-day config required
+   - Linux: =sudo apt install emacs= / =sudo dnf install emacs=
+   - macOS: =brew install --cask emacs=
+   - Windows: via [[https://www.msys2.org/][MSYS2]] or the [[https://www.gnu.org/software/emacs/download.html][gnu.org binary]]
+2. *Install anvil* — see [[*Installation][Installation]] (=async-installer= is the quickest path)
+3. *Start the daemon and bring up the MCP server* — see [[*Quick Start][Quick Start]]
+4. *Connect from your AI client* — see [[*Client setup — connecting your AI to Anvil][Client setup]] (snippets for Claude Code / Claude Desktop)
+5. *Add Anvil-preferring guidance to CLAUDE.md (or equivalent)* — see [[*Recommended snippet (Claude Code =CLAUDE.md=)][Recommended snippet]] (optional but high-impact)
+
+Your day-to-day VSCode / Cursor / Neovim / Claude Code stays exactly
+the same. You can capture the AI-token reduction without picking up
+any meaningful amount of Emacs Lisp.
+
+** What it costs — being honest
+
+- *15-30 minutes of first-time setup* — install Emacs, clone anvil, wire up MCP
+- *An Emacs daemon stays resident* — roughly 50-200 MB at idle
+- *One more dependency to maintain* — Emacs updates and OS migrations include it
+
+In exchange you get the savings in the table above. If you spend
+30+ minutes per agent session and have a few sessions a month, the
+one-time setup cost pays itself back almost immediately.
+
 * Feature Highlights
 
 Anvil exposes about 50 MCP tools, letting an AI call Emacs's capabilities directly.
@@ -331,6 +392,49 @@ updates, renames, import additions), pair this with
 =file-batch='s per-file op lists to complete the whole
 refactor in one MCP call.
 
+*** =anvil-code-extract-pattern= — structured data extraction from huge files (read-only)
+
+For legacy data extraction and ETL, the usual flow is "read the
+whole file then assemble with regex." This tool replaces that
+with a single MCP call. =:block-start= matches each block opener,
+=:block-end= picks the closing strategy (=brace-balance= skips
+braces inside strings), =:fields= regexps capture per-field
+values; the result comes back as a list of plain-data records.
+The file body itself is never sent back to the agent.
+
+Measured: extracted 347 item definitions from =func492.ts= in
+newDTW (3,407 lines of legacy if-blocks).
+
+| Method                              | Tokens         |
+|-------------------------------------+----------------|
+| Whole-file Read + extractor script  | ~8,000 + α     |
+| =anvil-code-extract-pattern= ×1     | ~3,000-5,000   |
+| Reduction                           | *~50%*         |
+
+Useful anywhere repeating structured text appears: legacy
+migrations, data migrations, i18n inventories.
+
+*** =anvil-code-add-field-by-map= — bulk field add to TS/JS object literals
+
+For i18n-style work — "add =add-key: \"...\"= to every
+={lookup-key: \"...\"}= in the same file" — this collapses the
+whole loop into a single call that takes only a mapping JSON.
+Default is dry-run (=:apply= defaults to nil), so the typical
+flow is: preview first, then re-call with =:apply t= to write —
+two-step safety with no extra plumbing.
+
+Measured: 8 data files in newDTW (25-100 entries each), adding
+=en= translations.
+
+| Method                                            | Tokens   |
+|---------------------------------------------------+----------|
+| Per-file Read + full-rewrite Write                | ~16,000  |
+| =anvil-code-add-field-by-map= (mapping only)      | ~3,200   |
+| Reduction                                         | *~78%*   |
+
+Existing add-key handling is governed by =:on-existing= (default
+=error= for fail-loud), preventing silent overwrites.
+
 *** Why TypeScript benefits especially
 
 | TypeScript characteristic                       | Why Anvil helps                                  |
@@ -339,9 +443,12 @@ refactor in one MCP call.
 | Massive type-definition files                   | Localized ops avoid full-file reads              |
 | Frequent import additions                       | =file-insert-at-line= handles routine insertion  |
 | Global state interfaces                         | Field additions follow patterns, easy to script  |
+| Legacy if-block / switch extraction             | =code-extract-pattern= removes the full-file read |
+| Bulk i18n translations on object literals       | =code-add-field-by-map= folds it into one mapping |
 
 Per refactoring session in newDTW, the cumulative saving was
-*several thousand to ~10,000 tokens* — context the agent then
+*15,000 to 25,000 tokens* (after =code-extract-pattern= and
+=code-add-field-by-map= landed) — context the agent then
 spent on actual reasoning instead of file-shuttling.
 
 ** When to reach for Anvil
@@ -752,6 +859,21 @@ file / subprocess / heavy-op / worker-pool layers, so a single MCP
 server covers an entire workflow rather than just org. If you're
 already happy with org-mcp on its own, anvil isn't a replacement —
 it's the same idea wearing a bigger coat.
+
+** …I've never touched Emacs before. Is that OK?
+
+Yes. Anvil is an MCP server that runs as a background daemon — you
+never have to open an Emacs window. Keep using whatever editor you
+already use (VSCode / Cursor / Neovim / Claude Code itself).
+
+What you actually need:
+
+- Install Emacs once and confirm =emacs --version= works
+- Run it as =--fg-daemon= (a launcher script ships with the repo)
+- Add a single block to your AI client's MCP config
+
+A full walkthrough lives in [[*For Non-Emacs Users — Adopting Anvil for Token Reduction][For Non-Emacs Users]]. No Emacs Lisp
+knowledge required to capture the AI-token savings.
 
 * Architecture
 
