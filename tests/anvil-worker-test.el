@@ -390,4 +390,102 @@ Disable health timer + spawning so no real subprocesses start."
       (should (eq :batch
                   (anvil-worker--classify "(byte-compile-file \"x.el\")"))))))
 
+;;;; --- latency metrics (Doc 01 Phase 4a) ----------------------------------
+
+(defmacro anvil-worker-test--with-fresh-latency (&rest body)
+  "Run BODY against an empty per-lane latency bucket plist."
+  (declare (indent 0))
+  `(let ((anvil-worker--metrics-latency nil))
+     (anvil-worker--latency-init)
+     ,@body))
+
+(ert-deftest anvil-worker-test-latency-init-shape ()
+  "Init creates an empty bucket per lane with all running sums at zero."
+  (anvil-worker-test--with-fresh-latency
+    (dolist (lane '(:read :write :batch))
+      (let ((b (plist-get anvil-worker--metrics-latency lane)))
+        (should (= 0 (plist-get b :samples)))
+        (should (= 0.0 (plist-get b :spawn-ms-sum)))
+        (should (= 0.0 (plist-get b :wait-ms-sum)))
+        (should (= 0.0 (plist-get b :total-ms-sum)))
+        (should (null (plist-get b :totals)))))))
+
+(ert-deftest anvil-worker-test-latency-record-accumulates ()
+  "`--latency-record' bumps the count and sums per lane."
+  (anvil-worker-test--with-fresh-latency
+    (anvil-worker--latency-record :read 10.0 90.0)
+    (anvil-worker--latency-record :read 20.0 80.0)
+    (let ((b (plist-get anvil-worker--metrics-latency :read)))
+      (should (= 2 (plist-get b :samples)))
+      (should (= 30.0 (plist-get b :spawn-ms-sum)))
+      (should (= 170.0 (plist-get b :wait-ms-sum)))
+      (should (= 200.0 (plist-get b :total-ms-sum)))
+      (should (equal '(100.0 100.0) (plist-get b :totals))))))
+
+(ert-deftest anvil-worker-test-latency-isolates-lanes ()
+  "A read sample never leaks into the write bucket."
+  (anvil-worker-test--with-fresh-latency
+    (anvil-worker--latency-record :read  5.0 25.0)
+    (anvil-worker--latency-record :write 7.0 33.0)
+    (should (= 1 (plist-get (plist-get anvil-worker--metrics-latency :read)
+                            :samples)))
+    (should (= 1 (plist-get (plist-get anvil-worker--metrics-latency :write)
+                            :samples)))
+    (should (= 0 (plist-get (plist-get anvil-worker--metrics-latency :batch)
+                            :samples)))))
+
+(ert-deftest anvil-worker-test-latency-ring-buffer-cap ()
+  "Sample ring drops oldest entries past `anvil-worker-latency-sample-cap'."
+  (anvil-worker-test--with-fresh-latency
+    (let ((anvil-worker-latency-sample-cap 3))
+      (dotimes (i 5)
+        (anvil-worker--latency-record :read 1.0 (float i)))
+      (let* ((b (plist-get anvil-worker--metrics-latency :read))
+             (totals (plist-get b :totals)))
+        (should (= 5 (plist-get b :samples)))
+        (should (= 3 (length totals)))
+        ;; Most recent first; oldest two (1+0, 1+1) dropped.
+        (should (equal (list 5.0 4.0 3.0) totals))))))
+
+(ert-deftest anvil-worker-test-latency-cap-zero-keeps-sums-only ()
+  "Cap=0 stops sample retention but lets running sums keep counting."
+  (anvil-worker-test--with-fresh-latency
+    (let ((anvil-worker-latency-sample-cap 0))
+      (anvil-worker--latency-record :write 1.0 9.0)
+      (anvil-worker--latency-record :write 2.0 8.0)
+      (let ((b (plist-get anvil-worker--metrics-latency :write)))
+        (should (= 2  (plist-get b :samples)))
+        (should (= 20.0 (plist-get b :total-ms-sum)))
+        (should (null (plist-get b :totals)))))))
+
+(ert-deftest anvil-worker-test-percentile-empty-returns-nil ()
+  (should (null (anvil-worker--percentile nil 50)))
+  (should (null (anvil-worker--percentile nil 99))))
+
+(ert-deftest anvil-worker-test-percentile-single-element ()
+  (should (= 42 (anvil-worker--percentile '(42) 50)))
+  (should (= 42 (anvil-worker--percentile '(42) 99))))
+
+(ert-deftest anvil-worker-test-percentile-bounds ()
+  "p0 returns the min, p100 returns the max."
+  (let ((s '(10 20 30 40 50 60 70 80 90 100)))
+    (should (= 10  (anvil-worker--percentile s 0)))
+    (should (= 100 (anvil-worker--percentile s 100)))))
+
+(ert-deftest anvil-worker-test-percentile-mid ()
+  "p50 lands somewhere in the middle of a sorted sample."
+  (let* ((s '(1 2 3 4 5 6 7 8 9 10))
+         (p50 (anvil-worker--percentile s 50)))
+    (should (and (>= p50 4) (<= p50 6)))))
+
+(ert-deftest anvil-worker-test-latency-reset-clears-everything ()
+  "`anvil-worker-latency-metrics-reset' returns to an empty state."
+  (anvil-worker-test--with-fresh-latency
+    (anvil-worker--latency-record :read 5.0 5.0)
+    (anvil-worker-latency-metrics-reset)
+    (should (= 0 (plist-get (plist-get anvil-worker--metrics-latency :read)
+                            :samples)))
+    (should (null (plist-get (plist-get anvil-worker--metrics-latency :read)
+                             :totals)))))
+
 ;;; anvil-worker-test.el ends here

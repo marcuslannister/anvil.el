@@ -1,12 +1,14 @@
 #+title: Worker Pool v2 — Read/Write Routing, File Affinity, Batch Sub-Pool
 #+date: 2026-04-15
-#+property: status PHASE-3-SHIPPED
+#+property: status PHASE-4A-SHIPPED
 
 * STATUS
-~Phase 1+2+3 SHIPPED 2026-04-16~ — lane split + ~:kind~ keyword + regex
-classifier + batch lane 既定 1 + spawn 後 deferred warmup
-(~run-at-time~ + ~emacsclient -n~ で fire-and-forget) + 37 worker ERT。
-connection reuse (Phase 4) / metrics UI (Phase 5) は未着手。
+~Phase 1+2+3+4a SHIPPED 2026-04-16~ — lane split + ~:kind~ + classifier +
+batch warmup + ~anvil-worker--metrics-latency~ per-lane plist
+(~:samples :spawn-ms-sum :wait-ms-sum :total-ms-sum :totals~) と
+~latency-metrics-show~ (n / mean / p50 / p99) + 47 worker ERT。
+4b: 案 B (worker 側 persistent listener) は 4a baseline 取得後に判断。
+metrics UI (Phase 5) は未着手。
 
 * Goal
 

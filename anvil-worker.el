@@ -257,6 +257,111 @@ Reset with `anvil-worker-classify-metrics-reset'.")
         (plist-put anvil-worker--metrics-classify key
                    (1+ (or (plist-get anvil-worker--metrics-classify key) 0)))))
 
+;;; Latency metrics (Doc 01 Phase 4a — measurement infrastructure)
+
+(defcustom anvil-worker-latency-sample-cap 1000
+  "Per-lane ring-buffer capacity for total-ms samples (used by percentiles).
+Older samples are dropped once the cap is reached.  Set to 0 to
+disable sample retention while keeping the running sums."
+  :type 'integer
+  :group 'anvil-worker)
+
+(defun anvil-worker--latency-empty-bucket ()
+  "Fresh per-lane latency bucket."
+  (list :samples 0
+        :spawn-ms-sum 0.0
+        :wait-ms-sum  0.0
+        :total-ms-sum 0.0
+        :totals nil))
+
+(defvar anvil-worker--metrics-latency nil
+  "Plist `(:read BUCKET :write BUCKET :batch BUCKET)' of latency stats.
+Each bucket carries:
+  :samples       — completed call count
+  :spawn-ms-sum  — sum of (start-process → ready) latency in ms
+  :wait-ms-sum   — sum of (ready → completed) latency in ms
+  :total-ms-sum  — sum of full call duration in ms
+  :totals        — recent total-ms samples (ring, length ≤ cap)
+Initialised lazily by `anvil-worker--latency-record'.")
+
+(defun anvil-worker--latency-init ()
+  "Allocate (or reset) `anvil-worker--metrics-latency' to empty buckets."
+  (setq anvil-worker--metrics-latency
+        (list :read  (anvil-worker--latency-empty-bucket)
+              :write (anvil-worker--latency-empty-bucket)
+              :batch (anvil-worker--latency-empty-bucket))))
+
+(defun anvil-worker--latency-record (lane spawn-ms wait-ms)
+  "Record one (SPAWN-MS, WAIT-MS) sample for LANE.
+Updates running sums and pushes total-ms onto the per-lane ring."
+  (unless anvil-worker--metrics-latency
+    (anvil-worker--latency-init))
+  (let* ((bucket (plist-get anvil-worker--metrics-latency lane))
+         (total-ms (+ spawn-ms wait-ms))
+         (totals (cons total-ms (plist-get bucket :totals)))
+         (cap    anvil-worker-latency-sample-cap)
+         (totals (if (and (> cap 0) (> (length totals) cap))
+                     (cl-subseq totals 0 cap)
+                   (and (> cap 0) totals))))
+    (plist-put bucket :samples
+               (1+ (plist-get bucket :samples)))
+    (plist-put bucket :spawn-ms-sum
+               (+ spawn-ms (plist-get bucket :spawn-ms-sum)))
+    (plist-put bucket :wait-ms-sum
+               (+ wait-ms  (plist-get bucket :wait-ms-sum)))
+    (plist-put bucket :total-ms-sum
+               (+ total-ms (plist-get bucket :total-ms-sum)))
+    (plist-put bucket :totals totals)
+    nil))
+
+(defun anvil-worker--percentile (samples pct)
+  "Return the PCT (0-100) percentile of SAMPLES (numbers), or nil if empty."
+  (when samples
+    (let* ((sorted (sort (copy-sequence samples) #'<))
+           (n (length sorted))
+           (idx (max 0 (min (1- n)
+                            (floor (* (/ pct 100.0) (1- n)))))))
+      (nth idx sorted))))
+
+;;;###autoload
+(defun anvil-worker-latency-metrics-reset ()
+  "Reset per-lane latency stats to empty buckets."
+  (interactive)
+  (anvil-worker--latency-init))
+
+;;;###autoload
+(defun anvil-worker-latency-metrics-show ()
+  "Echo per-lane latency stats (n / mean / p50 / p99 in ms)."
+  (interactive)
+  (if (or (null anvil-worker--metrics-latency)
+          (cl-every (lambda (lane)
+                      (zerop (plist-get
+                              (plist-get anvil-worker--metrics-latency lane)
+                              :samples)))
+                    anvil-worker--lanes))
+      (message "Anvil worker latency: no samples yet")
+    (let (lines)
+      (dolist (lane anvil-worker--lanes)
+        (let* ((b (plist-get anvil-worker--metrics-latency lane))
+               (n (plist-get b :samples)))
+          (push (if (zerop n)
+                    (format "  %-5s: no samples"
+                            (anvil-worker--lane-name lane))
+                  (format
+                   "  %-5s: n=%d mean=%.1fms (spawn=%.1f wait=%.1f) p50=%dms p99=%dms"
+                   (anvil-worker--lane-name lane)
+                   n
+                   (/ (plist-get b :total-ms-sum) n)
+                   (/ (plist-get b :spawn-ms-sum) n)
+                   (/ (plist-get b :wait-ms-sum) n)
+                   (or (anvil-worker--percentile
+                        (plist-get b :totals) 50) 0)
+                   (or (anvil-worker--percentile
+                        (plist-get b :totals) 99) 0)))
+                lines)))
+      (message "Anvil worker latency:\n%s"
+               (mapconcat #'identity (nreverse lines) "\n")))))
+
 (defun anvil-worker--match-any (expression patterns)
   "Return non-nil if EXPRESSION matches any regex in PATTERNS."
   (and (stringp expression)
@@ -713,21 +818,28 @@ the requested lane is reachable within `anvil-worker-spawn-wait'."
          'classified
          (format "%s → lane=%s" name (anvil-worker--lane-name lane))))
       (unwind-protect
-          (let ((buf (get-buffer-create (format " *anvil-worker-call-%s*" name))))
+          (let ((buf (get-buffer-create (format " *anvil-worker-call-%s*" name)))
+                (t0 (float-time))
+                t1 t-end)
             (with-current-buffer buf (erase-buffer))
             (let* ((proc (start-process
                           "anvil-worker-call" buf
                           "emacsclient"
                           "-f" server-file
-                          "-e" expression))
-                   (start (float-time)))
+                          "-e" expression)))
+              (setq t1 (float-time))
               (set-process-query-on-exit-flag proc nil)
               (while (and (process-live-p proc)
-                          (< (- (float-time) start) timeout))
+                          (< (- (float-time) t1) timeout))
                 (accept-process-output proc 0.1))
+              (setq t-end (float-time))
               (when (process-live-p proc)
                 (kill-process proc)
                 (error "Anvil worker %s timeout (%ds)" name timeout))
+              (anvil-worker--latency-record
+               lane
+               (* 1000.0 (- t1 t0))
+               (* 1000.0 (- t-end t1)))
               (string-trim (with-current-buffer buf (buffer-string)))))
         (plist-put worker :busy nil)))))
 
