@@ -786,7 +786,34 @@ MCP Parameters:
          (push sym acc))))
     acc))
 
-(defun anvil-elisp--ert-run (file &optional selector)
+(defun anvil-elisp--ert-fresh-feature (file)
+  "Infer the feature symbol to unload before FILE is reloaded.
+Convention: a test file named `FOO-test.el' tests the feature
+`FOO'.  Strips the trailing `-test' from the file's basename and
+returns an interned symbol.  Returns nil when the pattern does
+not match (caller should then pass an explicit feature name)."
+  (let ((base (file-name-base file)))
+    (when (string-match "\\`\\(.+\\)-test\\'" base)
+      (intern (match-string 1 base)))))
+
+(defun anvil-elisp--ert-invalidate-cache (feature test-file)
+  "Unload FEATURE (if loaded) and delete stale .elc files.
+Removes both the companion source .elc (derived from FEATURE's
+source location) and TEST-FILE's own .elc so the next `load'
+picks up the freshest bytes."
+  (when (and feature (featurep feature))
+    (unload-feature feature t))
+  (let ((test-elc (concat (file-name-sans-extension test-file) ".elc")))
+    (when (file-exists-p test-elc)
+      (ignore-errors (delete-file test-elc))))
+  (when feature
+    (let* ((src (locate-library (symbol-name feature)))
+           (src-elc (and src
+                         (concat (file-name-sans-extension src) ".elc"))))
+      (when (and src-elc (file-exists-p src-elc))
+        (ignore-errors (delete-file src-elc))))))
+
+(defun anvil-elisp--ert-run (file &optional selector fresh)
   "Run ERT tests from FILE and return a compact result plist.
 
 MCP Parameters:
@@ -797,6 +824,14 @@ MCP Parameters:
   selector - Optional ERT selector as an Elisp-readable string
              (e.g. \"t\" for all, \"\\\"my-test-name\\\"\" for one,
              or \"(tag :integration)\" for tagged).  Defaults to t.
+  fresh    - Optional cache invalidation hint.  When the string is
+             truthy (\"t\", \"true\", \"1\") or names a feature
+             symbol, unload that feature and delete its companion
+             `.elc' plus the test file's own `.elc' before loading.
+             Empty / \"nil\" / \"false\" / \"0\" skip invalidation.
+             \"t\" auto-infers the feature from FILE's basename
+             (strips a trailing `-test' — so
+             `tests/anvil-worker-test.el' reloads `anvil-worker').
 
 Returns a printed plist:
   (:passed N :failed M :skipped S :elapsed-sec T :failures F)
@@ -815,6 +850,23 @@ isolation matters."
                 ((stringp selector)
                  (condition-case nil (read selector) (error t)))
                 (t t)))
+         (_invalidate
+          (when fresh
+            (let* ((truthy (cond
+                            ((symbolp fresh) fresh)
+                            ((stringp fresh)
+                             (let ((s (string-trim (downcase fresh))))
+                               (cond
+                                ((member s '("" "nil" "false" "0")) nil)
+                                ((member s '("t" "true" "1")) t)
+                                (t (intern fresh)))))
+                            (t fresh)))
+                   (feat (cond
+                          ((null truthy) nil)
+                          ((eq truthy t) (anvil-elisp--ert-fresh-feature path))
+                          ((symbolp truthy) truthy))))
+              (when truthy
+                (anvil-elisp--ert-invalidate-cache feat path)))))
          (start (float-time))
          (passed 0) (failed 0) (skipped 0)
          (failures nil)

@@ -78,7 +78,9 @@ These are not loaded by default.  Available modules:
 - `sqlite'    — Read-only SQLite query tool (requires Emacs 29+)
 - `elisp'     — Elisp development tools: ERT runner, byte-compile, describe
 - `org-index' — Persistent SQLite index of org files (requires Emacs 29+)
-- `buffer'    — Explicit buffer-* MCP tools (read/save/list-modified)"
+- `buffer'    — Explicit buffer-* MCP tools (read/save/list-modified)
+- `dev'       — Developer helpers: `anvil-self-sync-check' for dev/installed
+                git HEAD mismatch detection"
   :type '(repeat symbol)
   :group 'anvil)
 

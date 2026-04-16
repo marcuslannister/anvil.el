@@ -61,6 +61,51 @@
             (should (stringp (plist-get (car fails) :condition)))))
       (ignore-errors (delete-file tmp)))))
 
+(ert-deftest anvil-tools-test-ert-fresh-feature-strips-test-suffix ()
+  "Helper infers a feature symbol by stripping the trailing `-test'."
+  (should (eq 'anvil-worker
+              (anvil-elisp--ert-fresh-feature
+               "/tmp/tests/anvil-worker-test.el")))
+  (should (eq 'anvil-org-index
+              (anvil-elisp--ert-fresh-feature
+               "c:/x/tests/anvil-org-index-test.el"))))
+
+(ert-deftest anvil-tools-test-ert-fresh-feature-rejects-non-test-file ()
+  "No `-test' suffix means the inference is a no-op (returns nil)."
+  (should (null (anvil-elisp--ert-fresh-feature "/tmp/anvil-worker.el"))))
+
+(ert-deftest anvil-tools-test-ert-run-fresh-truthy-string-invokes-cache-invalidation ()
+  "Passing `\"t\"' as :fresh triggers the cache invalidation helper."
+  (let* ((tmp (make-temp-file "anvil-ert-fresh-" nil "-test.el"))
+         (seen nil))
+    (unwind-protect
+        (progn
+          (anvil-new-tools-test--write
+           tmp "(require 'ert)\n(ert-deftest anvil-tools-fresh-a () t)\n")
+          (cl-letf (((symbol-function 'anvil-elisp--ert-invalidate-cache)
+                     (lambda (feat path) (push (list feat path) seen))))
+            (anvil-elisp--ert-run tmp nil "t"))
+          (should (= 1 (length seen)))
+          ;; Because the temp file basename ends with `-test', the helper
+          ;; should have inferred the companion feature (an interned
+          ;; symbol of the stripped basename) — not nil.
+          (should (symbolp (car (car seen)))))
+      (ignore-errors (delete-file tmp)))))
+
+(ert-deftest anvil-tools-test-ert-run-fresh-nil-string-skips-invalidation ()
+  "Falsy string (\"nil\" / empty) leaves cache alone."
+  (let* ((tmp (make-temp-file "anvil-ert-fresh-" nil "-test.el"))
+         (called 0))
+    (unwind-protect
+        (progn
+          (anvil-new-tools-test--write
+           tmp "(require 'ert)\n(ert-deftest anvil-tools-fresh-b () t)\n")
+          (cl-letf (((symbol-function 'anvil-elisp--ert-invalidate-cache)
+                     (lambda (&rest _) (cl-incf called))))
+            (anvil-elisp--ert-run tmp nil ""))
+          (should (= 0 called)))
+      (ignore-errors (delete-file tmp)))))
+
 ;;;; --- elisp-byte-compile-file ---------------------------------------------
 
 (ert-deftest anvil-tools-test-byte-compile-clean ()
