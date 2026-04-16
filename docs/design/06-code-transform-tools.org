@@ -5,7 +5,14 @@
 
 * STATUS
 
-- Tool 1 (~code-extract-pattern~): ~DRAFT~ — 未着手
+- Tool 1 (~code-extract-pattern~): ~SHIPPED~ (2026-04-16)
+  - 実装: ~anvil-file.el~ の ~anvil-code-extract-pattern~ + MCP tool
+    ~code-extract-pattern~ (~:read-only t~)。テスト: ~tests/anvil-file-test.el~
+    の ~anvil-code-extract-test-*~ (10 件 pass)。
+  - MVP 修正点 (検討時のレビュー反映):
+    - ~:block-end~ に ~'brace-balance~ MVP 同梱 (string 内の ~{}~ skip 済)
+    - per-field ~:required~ + ~:on-missing-required~ で field 単位制御
+    - ~:id~ は ~:block-start~ の group 1 から自動取得 (なければ nil)
 - Tool 2 (~ts-add-field-by-map~ → ~code-add-field-by-map~): ~SHIPPED~ (2026-04-16)
   - 実装: ~anvil-file.el~ の ~anvil-code-add-field-by-map~ + MCP tool
     ~code-add-field-by-map~。テスト: ~tests/anvil-file-test.el~ の

@@ -635,4 +635,215 @@ Uses a fixture whose target line is already on disk so no write fires."
                                     "\""))
               (anvil-file-test--read path))))))
 
+;;;; --- code-extract-pattern -----------------------------------------------
+
+(ert-deftest anvil-code-extract-test-next-block-start-default ()
+  "Default :block-end 'next-block-start splits at successive starts."
+  (anvil-file-test--with-tmp-ts
+   (concat "ITEM 1\n"
+           "  name = \"Apple\"\n"
+           "  price = 100\n"
+           "ITEM 2\n"
+           "  name = \"Banana\"\n"
+           "  price = 200\n")
+   (lambda (path)
+     (let* ((res (anvil-code-extract-pattern
+                  path
+                  '(:block-start "^ITEM \\([0-9]+\\)"
+                    :fields ((:name "name"
+                              :regexp "name = \"\\([^\"]*\\)\"")
+                             (:name "price"
+                              :regexp "price = \\([0-9]+\\)")))))
+            (matches (plist-get res :matches)))
+       (should (= 2 (plist-get res :total)))
+       (should (= 2 (plist-get res :returned)))
+       (should (equal "1" (plist-get (nth 0 matches) :id)))
+       (should (equal "Apple"
+                      (alist-get "name" (plist-get (nth 0 matches) :fields)
+                                 nil nil #'equal)))
+       (should (equal "100"
+                      (alist-get "price" (plist-get (nth 0 matches) :fields)
+                                 nil nil #'equal)))
+       (should (equal "Banana"
+                      (alist-get "name" (plist-get (nth 1 matches) :fields)
+                                 nil nil #'equal)))))))
+
+(ert-deftest anvil-code-extract-test-brace-balance ()
+  "brace-balance finds matching `}' through nested `{...}'."
+  (anvil-file-test--with-tmp-ts
+   (concat "if (id == 100) {\n"
+           "  name = \"Outer\";\n"
+           "  inner = { foo: 1 };\n"
+           "  price = 17000;\n"
+           "}\n"
+           "if (id == 200) {\n"
+           "  name = \"Second\";\n"
+           "  price = 25000;\n"
+           "}\n")
+   (lambda (path)
+     (let* ((res (anvil-code-extract-pattern
+                  path
+                  '(:block-start "if (id == \\([0-9]+\\))"
+                    :block-end brace-balance
+                    :fields ((:name "name"
+                              :regexp "name = \"\\([^\"]*\\)\"")
+                             (:name "price"
+                              :regexp "price = \\([0-9]+\\)")))))
+            (matches (plist-get res :matches)))
+       (should (= 2 (plist-get res :returned)))
+       (should (equal "100" (plist-get (nth 0 matches) :id)))
+       (should (equal "Outer"
+                      (alist-get "name" (plist-get (nth 0 matches) :fields)
+                                 nil nil #'equal)))
+       (should (equal "17000"
+                      (alist-get "price" (plist-get (nth 0 matches) :fields)
+                                 nil nil #'equal)))
+       (should (equal "200" (plist-get (nth 1 matches) :id)))
+       (should (equal "25000"
+                      (alist-get "price" (plist-get (nth 1 matches) :fields)
+                                 nil nil #'equal)))))))
+
+(ert-deftest anvil-code-extract-test-brace-balance-skips-string-braces ()
+  "brace-balance ignores `{' / `}' that appear inside double-quoted strings."
+  (anvil-file-test--with-tmp-ts
+   (concat "if (id == 1) {\n"
+           "  template = \"hello {world} bye\";\n"
+           "  count = 5;\n"
+           "}\n")
+   (lambda (path)
+     (let* ((res (anvil-code-extract-pattern
+                  path
+                  '(:block-start "if (id == \\([0-9]+\\))"
+                    :block-end brace-balance
+                    :fields ((:name "count"
+                              :regexp "count = \\([0-9]+\\)")))))
+            (matches (plist-get res :matches)))
+       (should (= 1 (plist-get res :returned)))
+       (should (equal "5"
+                      (alist-get "count" (plist-get (nth 0 matches) :fields)
+                                 nil nil #'equal)))))))
+
+(ert-deftest anvil-code-extract-test-regexp-block-end ()
+  "A string :block-end is treated as a regexp ending the block."
+  (anvil-file-test--with-tmp-ts
+   (concat "BEGIN A\n"
+           "  v = 1\n"
+           "END\n"
+           "BEGIN B\n"
+           "  v = 2\n"
+           "END\n")
+   (lambda (path)
+     (let* ((res (anvil-code-extract-pattern
+                  path
+                  '(:block-start "^BEGIN \\([A-Z]\\)"
+                    :block-end "^END$"
+                    :fields ((:name "v" :regexp "v = \\([0-9]+\\)")))))
+            (matches (plist-get res :matches)))
+       (should (= 2 (plist-get res :returned)))
+       (should (equal "A" (plist-get (nth 0 matches) :id)))
+       (should (equal "1"
+                      (alist-get "v" (plist-get (nth 0 matches) :fields)
+                                 nil nil #'equal)))
+       (should (equal "B" (plist-get (nth 1 matches) :id)))
+       (should (equal "2"
+                      (alist-get "v" (plist-get (nth 1 matches) :fields)
+                                 nil nil #'equal)))))))
+
+(ert-deftest anvil-code-extract-test-required-skip ()
+  "Missing :required field with default 'skip-block drops the block."
+  (anvil-file-test--with-tmp-ts
+   (concat "ITEM 1\n"
+           "  name = \"A\"\n"
+           "  price = 10\n"
+           "ITEM 2\n"
+           "  name = \"B\"\n"
+           ;; price intentionally missing
+           "ITEM 3\n"
+           "  name = \"C\"\n"
+           "  price = 30\n")
+   (lambda (path)
+     (let* ((res (anvil-code-extract-pattern
+                  path
+                  '(:block-start "^ITEM \\([0-9]+\\)"
+                    :fields ((:name "name"
+                              :regexp "name = \"\\([^\"]*\\)\"")
+                             (:name "price"
+                              :regexp "price = \\([0-9]+\\)"
+                              :required t))))))
+       (should (= 3 (plist-get res :total)))
+       (should (= 2 (plist-get res :returned)))
+       (should (= 1 (plist-get res :skipped)))
+       (let ((ids (mapcar (lambda (m) (plist-get m :id))
+                          (plist-get res :matches))))
+         (should (equal '("1" "3") ids)))))))
+
+(ert-deftest anvil-code-extract-test-required-error ()
+  "Missing :required field with :on-missing-required 'error aborts."
+  (anvil-file-test--with-tmp-ts
+   (concat "ITEM 1\n"
+           "  name = \"A\"\n")
+   (lambda (path)
+     (should-error
+      (anvil-code-extract-pattern
+       path
+       '(:block-start "^ITEM \\([0-9]+\\)"
+         :on-missing-required error
+         :fields ((:name "price"
+                   :regexp "price = \\([0-9]+\\)"
+                   :required t))))))))
+
+(ert-deftest anvil-code-extract-test-max-blocks ()
+  ":max-blocks caps the number of returned records."
+  (anvil-file-test--with-tmp-ts
+   (concat "ITEM 1\n  v = 1\n"
+           "ITEM 2\n  v = 2\n"
+           "ITEM 3\n  v = 3\n"
+           "ITEM 4\n  v = 4\n")
+   (lambda (path)
+     (let ((res (anvil-code-extract-pattern
+                 path
+                 '(:block-start "^ITEM \\([0-9]+\\)"
+                   :max-blocks 2
+                   :fields ((:name "v" :regexp "v = \\([0-9]+\\)"))))))
+       (should (= 4 (plist-get res :total)))
+       (should (= 2 (plist-get res :returned)))))))
+
+(ert-deftest anvil-code-extract-test-id-nil-when-no-group ()
+  "When :block-start has no capture group, :id is nil."
+  (anvil-file-test--with-tmp-ts
+   "MARK\n  v = 9\n"
+   (lambda (path)
+     (let* ((res (anvil-code-extract-pattern
+                  path
+                  '(:block-start "^MARK"
+                    :fields ((:name "v" :regexp "v = \\([0-9]+\\)")))))
+            (m (car (plist-get res :matches))))
+       (should (eq nil (plist-get m :id)))
+       (should (equal "9"
+                      (alist-get "v" (plist-get m :fields)
+                                 nil nil #'equal)))))))
+
+(ert-deftest anvil-code-extract-test-no-matches ()
+  "No block-start matches returns empty :matches without error."
+  (anvil-file-test--with-tmp-ts
+   "nothing here\n"
+   (lambda (path)
+     (let ((res (anvil-code-extract-pattern
+                 path
+                 '(:block-start "^NEVER"
+                   :fields ((:name "v" :regexp "v = \\([0-9]+\\)"))))))
+       (should (= 0 (plist-get res :total)))
+       (should (= 0 (plist-get res :returned)))
+       (should (eq nil (plist-get res :matches)))))))
+
+(ert-deftest anvil-code-extract-test-validation-required-spec ()
+  "Missing :block-start or :fields raises."
+  (anvil-file-test--with-tmp-ts
+   "any\n"
+   (lambda (path)
+     (should-error
+      (anvil-code-extract-pattern path '(:fields ((:name "x" :regexp "x")))))
+     (should-error
+      (anvil-code-extract-pattern path '(:block-start "^A"))))))
+
 ;;; anvil-file-test.el ends here

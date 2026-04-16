@@ -1439,6 +1439,209 @@ Returns plist (:inserted BOOL :line N :already-present BOOL :file PATH :warnings
               (list :inserted t :already-present nil
                     :line 1 :file abs :warnings warnings)))))))))
 
+;;;; --- code transformation tools ----------------------------------------
+;; Tool 1: anvil-code-extract-pattern  — read structured records from text
+;; Tool 2: anvil-code-add-field-by-map — bulk-add a field to TS/JS objects
+
+;;;; --- code-extract-pattern ------------------------------------------------
+
+(defun anvil-code--brace-balance-end (start limit)
+  "From START scan forward to find a matching `{...}' block.
+Walk to the first `{' (not past LIMIT); return position just after the
+matching `}', or nil if unbalanced.  Skips characters inside double-quoted
+strings (`\\\\' and `\\\"' escapes honored).  LIMIT may be nil for no cap."
+  (save-excursion
+    (goto-char start)
+    (when (re-search-forward "{" limit t)
+      ;; Point now sits past the opening `{'.  Depth = 1.
+      (let ((depth 1)
+            (cap (or limit (point-max))))
+        (catch 'found
+          (while (and (> depth 0) (< (point) cap))
+            (let ((c (char-after)))
+              (cond
+               ((eq c ?\")
+                (forward-char 1)
+                (while (and (< (point) cap)
+                            (not (eq (char-after) ?\")))
+                  (if (eq (char-after) ?\\)
+                      (forward-char 2)
+                    (forward-char 1)))
+                (when (and (< (point) cap) (eq (char-after) ?\"))
+                  (forward-char 1)))
+               ((eq c ?{)
+                (cl-incf depth)
+                (forward-char 1))
+               ((eq c ?})
+                (cl-decf depth)
+                (forward-char 1)
+                (when (= depth 0)
+                  (throw 'found (point))))
+               (t (forward-char 1)))))
+          nil)))))
+
+(defun anvil-code--find-block-end (block-end match-end next-start)
+  "Compute the end position for a block.
+
+BLOCK-END is one of:
+  `next-block-start' (default) — return NEXT-START or `point-max'
+  `brace-balance' — find matching `{...}' starting at MATCH-END,
+                    bounded by NEXT-START (when set) or whole buffer
+  REGEXP STRING   — search forward from MATCH-END; return the start
+                    position of the first match, or NEXT-START / EOB
+
+Returns a buffer position, or nil if no end could be determined."
+  (cond
+   ((or (null block-end) (eq block-end 'next-block-start))
+    (or next-start (point-max)))
+   ((eq block-end 'brace-balance)
+    (anvil-code--brace-balance-end match-end next-start))
+   ((stringp block-end)
+    (save-excursion
+      (goto-char match-end)
+      (if (re-search-forward block-end (or next-start nil) t)
+          (match-beginning 0)
+        (or next-start (point-max)))))
+   (t (error "anvil-code: invalid :block-end %S" block-end))))
+
+(defun anvil-code--validate-fields (fields)
+  "Validate FIELDS is a non-empty list of well-formed field plists."
+  (unless (and (listp fields) fields)
+    (error "anvil-code: :fields must be a non-empty list"))
+  (dolist (f fields)
+    (unless (listp f)
+      (error "anvil-code: each field must be a plist (got %S)" f))
+    (let ((name (plist-get f :name))
+          (re   (plist-get f :regexp)))
+      (unless (stringp name)
+        (error "anvil-code: field missing :name string: %S" f))
+      (unless (stringp re)
+        (error "anvil-code: field missing :regexp string: %S" f)))))
+
+(defun anvil-code-extract-pattern (path spec)
+  "Extract structured records from PATH by matching repeating patterns.
+
+For each match of `:block-start' at PATH, determine the block's body via
+`:block-end', then run each `:fields' regexp inside that body and capture
+group 1 as the field's value.  Returns the list of records as plain data
+without modifying the file.
+
+PATH is the absolute path to the file.
+
+SPEC is a plist:
+  :block-start    REGEXP — Required.  Marks the start of each block.
+                  If group 1 is present, its capture becomes the block's :id.
+  :block-end      One of:
+                    `next-block-start' (default) — block ends right before
+                      the next `:block-start' match (or EOF).
+                    `brace-balance' — track `{}' depth from `:block-start';
+                      end at the matching closing `}'.  Strings are skipped.
+                    REGEXP string — block ends at the start of the first
+                      regexp match after `:block-start'.
+  :fields         List of field plists.  Each plist:
+                    :name STRING   — output key (required)
+                    :regexp REGEXP — must capture value in group 1 (required)
+                    :required BOOL — when t, missing field skips the block
+                                     (or errors, per :on-missing-required)
+  :max-blocks     NUMBER — stop after returning this many records (optional)
+  :on-missing-required SYMBOL — `skip-block' (default) | `error'
+
+Returns plist:
+  :matches LIST   — list of plists, each:
+                    :id STRING      — capture group 1 of :block-start, or nil
+                    :start-line N   — line of the block-start match
+                    :end-line N     — line at the block-end position
+                    :fields ((NAME . VALUE) ...)  — captured fields, in order
+  :total NUMBER     — total :block-start matches detected
+  :returned NUMBER  — number of records in :matches
+  :skipped NUMBER   — blocks dropped because a :required field was missing
+  :file PATH
+  :warnings LIST"
+  (let* ((abs (anvil--prepare-path path))
+         (warnings (anvil-file-warn-if-diverged abs))
+         (block-start (or (plist-get spec :block-start)
+                          (error "anvil-code: :block-start is required")))
+         (block-end (or (plist-get spec :block-end) 'next-block-start))
+         (fields (plist-get spec :fields))
+         (max-blocks (plist-get spec :max-blocks))
+         (on-missing-required (or (plist-get spec :on-missing-required)
+                                  'skip-block))
+         (matches nil)
+         (total 0)
+         (skipped 0))
+    (anvil-code--validate-fields fields)
+    (unless (memq on-missing-required '(skip-block error))
+      (error "anvil-code: :on-missing-required must be skip-block|error \
+(got %S)" on-missing-required))
+    (with-temp-buffer
+      (anvil--insert-file abs)
+      ;; Pass 1: locate all block-start matches.
+      (let ((positions nil))
+        (save-excursion
+          (goto-char (point-min))
+          (while (re-search-forward block-start nil t)
+            (push (list :start (match-beginning 0)
+                        :match-end (match-end 0)
+                        :id (and (match-beginning 1)
+                                 (match-string-no-properties 1)))
+                  positions)))
+        (setq positions (nreverse positions))
+        (setq total (length positions))
+        ;; Pass 2: process each block.
+        (let ((idx 0)
+              (rest positions))
+          (catch 'done
+            (while rest
+              (let* ((cur (car rest))
+                     (next (cadr rest))
+                     (start (plist-get cur :start))
+                     (m-end (plist-get cur :match-end))
+                     (id (plist-get cur :id))
+                     (next-start (and next (plist-get next :start)))
+                     (end (anvil-code--find-block-end
+                           block-end m-end next-start)))
+                (when end
+                  (let ((body (buffer-substring-no-properties m-end end))
+                        (field-acc nil)
+                        (missing-required nil))
+                    (dolist (f fields)
+                      (let* ((name (plist-get f :name))
+                             (re (plist-get f :regexp))
+                             (required (plist-get f :required))
+                             (matched (string-match re body))
+                             (value (and matched (match-string 1 body))))
+                        (cond
+                         (value
+                          (push (cons name value) field-acc))
+                         (required
+                          (push name missing-required)))))
+                    (cond
+                     (missing-required
+                      (pcase on-missing-required
+                        ('skip-block (cl-incf skipped))
+                        ('error
+                         (error "anvil-code-extract: required field(s) \
+missing %S in block at line %d (file %s)"
+                                (nreverse missing-required)
+                                (line-number-at-pos start) abs))))
+                     (t
+                      (push (list :id id
+                                  :start-line (line-number-at-pos start)
+                                  :end-line (line-number-at-pos end)
+                                  :fields (nreverse field-acc))
+                            matches)
+                      (cl-incf idx)
+                      (when (and max-blocks (>= idx max-blocks))
+                        (throw 'done nil)))))))
+              (setq rest (cdr rest)))))))
+    (let ((reversed (nreverse matches)))
+      (list :matches reversed
+            :total total
+            :returned (length reversed)
+            :skipped skipped
+            :file abs
+            :warnings warnings))))
+
 ;;;; --- code-add-field-by-map (TS/JS object literal bulk add) --------------
 
 (defun anvil-file--map-normalize (map)
@@ -1843,6 +2046,77 @@ MCP Parameters:
                                       :array-type 'list)))
      (format "%S" (anvil-file-batch-across file-ops)))))
 
+(defun anvil-file--tool-code-extract-pattern (path spec-json)
+  "Extract repeating structured records from PATH driven by SPEC-JSON.
+
+SPEC-JSON is a JSON object describing the extraction.  Keys mirror the
+elisp `anvil-code-extract-pattern' SPEC plist (kebab-case in elisp,
+snake_case or kebab-case accepted in JSON):
+
+  {
+    \"block-start\":  \"if \\\\(.*\\\\) \\\\{\",
+    \"block-end\":    \"brace-balance\",
+    \"fields\": [
+      {\"name\": \"name\",  \"regexp\": \"name *= *\\\"(.*)\\\"\"},
+      {\"name\": \"price\", \"regexp\": \"price *= *(\\\\d+)\", \"required\": true}
+    ],
+    \"max-blocks\": 100,
+    \"on-missing-required\": \"skip-block\"
+  }
+
+The `block-end' value is one of `\"next-block-start\"' (default),
+`\"brace-balance\"', or any other string treated as a regexp.
+
+This tool is read-only — the file is never modified.
+
+MCP Parameters:
+  path - Absolute path to the file to scan
+  spec-json - JSON object specifying block-start, block-end, fields, etc."
+  (anvil-server-with-error-handling
+   (let* ((parsed (json-parse-string spec-json
+                                     :object-type 'alist
+                                     :array-type 'list))
+          (get (lambda (key)
+                 (or (alist-get (intern key) parsed)
+                     (alist-get key parsed nil nil #'equal))))
+          (block-start (funcall get "block-start"))
+          (block-end-raw (funcall get "block-end"))
+          (block-end (cond
+                      ((null block-end-raw) 'next-block-start)
+                      ((member block-end-raw
+                               '("next-block-start" "brace-balance"))
+                       (intern block-end-raw))
+                      ((stringp block-end-raw) block-end-raw)
+                      (t (error
+                          "anvil-code: invalid block-end %S"
+                          block-end-raw))))
+          (fields-raw (funcall get "fields"))
+          (fields
+           (mapcar
+            (lambda (f)
+              (let ((name (or (alist-get 'name f)
+                              (alist-get "name" f nil nil #'equal)))
+                    (re   (or (alist-get 'regexp f)
+                              (alist-get "regexp" f nil nil #'equal)))
+                    (req  (or (alist-get 'required f)
+                              (alist-get "required" f nil nil #'equal))))
+                (append (list :name name :regexp re)
+                        (when (and req (not (eq req :null)))
+                          (list :required t)))))
+            fields-raw))
+          (max-blocks (funcall get "max-blocks"))
+          (on-missing-raw (funcall get "on-missing-required"))
+          (spec (append
+                 (list :block-start block-start
+                       :block-end block-end
+                       :fields fields)
+                 (when (numberp max-blocks)
+                   (list :max-blocks max-blocks))
+                 (when (and on-missing-raw (stringp on-missing-raw)
+                            (not (string-empty-p on-missing-raw)))
+                   (list :on-missing-required (intern on-missing-raw))))))
+     (format "%S" (anvil-code-extract-pattern path spec)))))
+
 (defun anvil-file--tool-code-add-field-by-map
     (path lookup-key add-key map-json
           &optional on-existing on-missing scope-regex apply)
@@ -2098,6 +2372,21 @@ in large files before deciding what to Read."
    :server-id anvil-file--server-id)
 
   (anvil-server-register-tool
+   #'anvil-file--tool-code-extract-pattern
+   :id "code-extract-pattern"
+   :description
+   "Extract repeating structured records from a file using regexp patterns.
+For each match of `block-start' the tool finds the block's body via
+`block-end' (`next-block-start', `brace-balance', or a regexp), then
+runs each `fields' regexp inside the body and captures group 1 as the
+field's value.  Read-only — the file is never modified.  Returns plist
+with :matches (each :id :start-line :end-line :fields) :total :returned
+:skipped.  Targets legacy code migration / data extraction where reading
+the entire file would be wasteful.  Brace-balance skips strings."
+   :read-only t
+   :server-id anvil-file--server-id)
+
+  (anvil-server-register-tool
    #'anvil-file--tool-code-add-field-by-map
    :id "code-add-field-by-map"
    :description
@@ -2125,7 +2414,8 @@ restricts edits to substrings matching the pattern.  Returns plist with
   (anvil-server-unregister-tool "json-object-add" anvil-file--server-id)
   (anvil-server-unregister-tool "file-ensure-import" anvil-file--server-id)
   (anvil-server-unregister-tool "file-batch-across" anvil-file--server-id)
-  (anvil-server-unregister-tool "code-add-field-by-map" anvil-file--server-id))
+  (anvil-server-unregister-tool "code-add-field-by-map" anvil-file--server-id)
+  (anvil-server-unregister-tool "code-extract-pattern" anvil-file--server-id))
 
 (provide 'anvil-helpers)
 (provide 'anvil-file)
