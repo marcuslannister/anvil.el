@@ -169,6 +169,52 @@ be inherited so the target file's `(require)'s resolve."
       (ignore-errors (delete-file tmp))
       (ignore-errors (delete-file (concat (file-name-sans-extension tmp) ".elc"))))))
 
+(ert-deftest anvil-tools-test-org-index-rebuild-offload-e2e ()
+  "`org-index-rebuild' dispatches through offload, writes the DB,
+and returns a serialized summary plist to the MCP client.
+
+Scopes the test to a tmp directory with a handful of synthetic
+org files so the rebuild completes well within the timeout; the
+checkpoint protocol itself is covered by the anvil-org-index
+unit tests.  What this test validates is the full wiring:
+`:offload t :offload-inherit-load-path t :resumable t' plus the
+subprocess's direct DB open path."
+  (skip-unless (and (fboundp 'sqlite-available-p) (sqlite-available-p)))
+  (require 'anvil-org-index)
+  (require 'anvil-offload)
+  (let* ((tmpdir (make-temp-file "anvil-idx-e2e-" t))
+         (dbfile (expand-file-name "e2e.db" tmpdir))
+         (anvil-org-index-db-path dbfile)
+         (anvil-org-index-paths (list tmpdir))
+         (anvil-org-index-rebuild-checkpoint-every 2)
+         (anvil-org-index--backend nil)
+         (anvil-org-index--db nil))
+    (unwind-protect
+        (progn
+          (dotimes (i 3)
+            (anvil-new-tools-test--write
+             (expand-file-name (format "e%d.org" i) tmpdir)
+             (format "* Heading %d\n** Child %d\n" i i)))
+          (anvil-org-index-enable)
+          (let* ((params `((name . "org-index-rebuild")
+                           (arguments . ((paths . ,tmpdir)))))
+                 (resp (anvil-server--handle-tools-call
+                        "t-idx-rebuild" params
+                        (make-anvil-server-metrics) "emacs-eval"))
+                 (decoded (json-read-from-string resp))
+                 (result (alist-get 'result decoded))
+                 (is-error (alist-get 'isError result))
+                 (text (alist-get 'text
+                                  (aref (alist-get 'content result) 0)))
+                 (plist (anvil-new-tools-test--read-plist text)))
+            (should (eq :json-false is-error))
+            (should (= 3 (plist-get plist :files)))
+            (should (= 6 (plist-get plist :headlines)))
+            (should (numberp (plist-get plist :elapsed-sec)))))
+      (ignore-errors (anvil-org-index-disable))
+      (ignore-errors (anvil-offload-stop-repl))
+      (ignore-errors (delete-directory tmpdir t)))))
+
 ;;;; --- file-outline ---------------------------------------------------------
 
 (ert-deftest anvil-tools-test-outline-elisp ()

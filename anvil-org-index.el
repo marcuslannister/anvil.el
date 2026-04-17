@@ -34,6 +34,13 @@
 (require 'subr-x)
 (require 'anvil-server)
 
+;; Checkpoint is provided by anvil-offload but is a no-op in the main
+;; daemon, so we do not hard-require the module — just declare it to
+;; keep byte-compile quiet.  Inside the offload REPL the subprocess's
+;; own definition takes over and actually emits the message.
+(declare-function anvil-preempt-checkpoint "anvil-offload"
+                  (value &optional cursor))
+
 ;;; Customization
 
 (defgroup anvil-org-index nil
@@ -45,6 +52,17 @@
   (expand-file-name "anvil-org-index.db" user-emacs-directory)
   "Path to the SQLite database file."
   :type 'file
+  :group 'anvil-org-index)
+
+(defcustom anvil-org-index-rebuild-checkpoint-every 25
+  "Commit-and-checkpoint granularity for `anvil-org-index-rebuild'.
+After every N files the outer transaction is committed and — if
+running inside `anvil-offload' — `anvil-preempt-checkpoint' emits
+the progress to the main daemon.  Lower N reduces lost work on
+preempt at the cost of more SQLite commits; higher N is cheaper
+but the cursor lags behind.  A value of 0 falls back to the
+Phase 1 single-transaction behaviour (no checkpointing)."
+  :type 'integer
   :group 'anvil-org-index)
 
 (defcustom anvil-org-index-paths nil
@@ -429,12 +447,32 @@ optional; omit to disable that filter.  Much cheaper than
 `org-map-entries' scans — one indexed SQL statement, no org-mode
 activation.  Results clip at `anvil-org-index-search-hard-limit'
 (1000) and mark `:truncated t' when clipped."
-   :read-only t))
+   :read-only t)
+  (anvil-server-register-tool
+   #'anvil-org-index--tool-rebuild
+   :id "org-index-rebuild"
+   :server-id anvil-org-index--server-id
+   :description
+   "Rebuild the entire org-index from disk.  Runs in an offload
+subprocess so the main daemon stays responsive.  Commits in
+chunks of `anvil-org-index-rebuild-checkpoint-every' files and
+emits `anvil-preempt-checkpoint' at each chunk boundary.  On
+budget exceed (`:offload-timeout', default 300s) returns a
+partial plist whose :cursor is (:files-processed N :last-path
+P); already-committed chunks persist in the DB so a follow-up
+call can re-run safely (idempotent per file)."
+   :offload t
+   :offload-inherit-load-path t
+   :resumable t
+   :offload-timeout 300))
 
 (defun anvil-org-index--unregister-tools ()
   "Unregister org-index MCP tools.  Safe when not registered."
   (ignore-errors
     (anvil-server-unregister-tool "org-index-search"
+                                   anvil-org-index--server-id))
+  (ignore-errors
+    (anvil-server-unregister-tool "org-index-rebuild"
                                    anvil-org-index--server-id)))
 
 ;;;###autoload
@@ -450,22 +488,49 @@ activation.  Results clip at `anvil-org-index-search-hard-limit'
 ;;;###autoload
 (defun anvil-org-index-rebuild (&optional paths)
   "Rebuild the index over PATHS (defaults to `anvil-org-index-paths').
-Existing rows for the touched files are replaced.  Runs inside a
-single transaction.  Returns a summary plist."
+Existing rows for the touched files are replaced.  Files are
+committed in chunks of `anvil-org-index-rebuild-checkpoint-every';
+when running inside `anvil-offload', each chunk boundary also
+calls `anvil-preempt-checkpoint' so a preempted rebuild (via a
+`:resumable t' tool) returns a cursor pointing at the last
+committed file.  Returns a summary plist."
   (interactive)
   (unless anvil-org-index--db (anvil-org-index-enable))
-  (let* ((files (anvil-org-index--collect-files paths))
-         (start (float-time))
-         (total 0))
-    (anvil-org-index--with-transaction anvil-org-index--db
-      (dolist (f files)
-        (let ((info (anvil-org-index--ingest-file anvil-org-index--db f)))
-          (cl-incf total (plist-get info :headline-count)))))
+  (let* ((db          anvil-org-index--db)
+         (files       (anvil-org-index--collect-files paths))
+         (files-total (length files))
+         (start       (float-time))
+         (chunk       anvil-org-index-rebuild-checkpoint-every)
+         (total       0)
+         (files-done  0))
+    (anvil-org-index--execute db "BEGIN")
+    (condition-case err
+        (progn
+          (dolist (f files)
+            (let ((info (anvil-org-index--ingest-file db f)))
+              (cl-incf total (plist-get info :headline-count))
+              (cl-incf files-done))
+            (when (and (> chunk 0)
+                       (zerop (mod files-done chunk))
+                       (< files-done files-total))
+              (anvil-org-index--execute db "COMMIT")
+              (when (fboundp 'anvil-preempt-checkpoint)
+                (anvil-preempt-checkpoint
+                 (list :files-done       files-done
+                       :files-total      files-total
+                       :headlines-so-far total)
+                 (list :files-processed files-done
+                       :last-path       f)))
+              (anvil-org-index--execute db "BEGIN")))
+          (anvil-org-index--execute db "COMMIT"))
+      (error
+       (ignore-errors (anvil-org-index--execute db "ROLLBACK"))
+       (signal (car err) (cdr err))))
     (let ((elapsed (- (float-time) start)))
       (message "anvil-org-index: rebuild %d file(s), %d headline(s) in %.2fs"
-               (length files) total elapsed)
-      (list :files (length files)
-            :headlines total
+               files-total total elapsed)
+      (list :files       files-total
+            :headlines   total
             :elapsed-sec elapsed))))
 
 ;;; Phase 2 — incremental refresh
@@ -1293,6 +1358,34 @@ MCP Parameters:
               :deadline-after   (funcall none-empty deadline-after)
               :limit            (funcall int-or-nil limit)
               :offset           (funcall int-or-nil offset))))))
+
+(defun anvil-org-index--tool-rebuild (&optional paths)
+  "MCP offload handler — rebuild the entire org-index.
+
+Runs in an offload subprocess (`:offload t :resumable t').  Opens
+the DB directly, bypassing the full `anvil-org-index-enable' so
+the subprocess does not re-register MCP tools in its own dying
+process.  Returns the rebuild summary plist serialized via
+`format \"%S\"'.
+
+MCP Parameters:
+  paths - Optional comma-separated list of directory paths to
+          rebuild.  Empty or omitted means every directory in
+          the configured `anvil-org-index-paths'."
+  (anvil-server-with-error-handling
+   (unless anvil-org-index--backend
+     (setq anvil-org-index--backend (anvil-org-index--detect-backend)))
+   (unless anvil-org-index--db
+     (let ((dir (file-name-directory anvil-org-index-db-path)))
+       (unless (file-directory-p dir) (make-directory dir t))
+       (setq anvil-org-index--db
+             (anvil-org-index--open anvil-org-index-db-path))
+       (anvil-org-index--apply-ddl anvil-org-index--db)))
+   (let ((path-list
+          (and paths (stringp paths)
+               (not (string-empty-p (string-trim paths)))
+               (mapcar #'string-trim (split-string paths ",")))))
+     (format "%S" (anvil-org-index-rebuild path-list)))))
 
 ;;;###autoload
 (defun anvil-org-index-status ()

@@ -73,7 +73,7 @@
     (resumable-folds-in-checkpoint)、total 247/249 (2 件は pre-existing Windows
     batch supersession flake)
 - Phase 4: ~DRAFT~ — レビュー前。
-- Phase 5 (heavy tool retrofit): ~SHIPPED~ 2nd wave (2026-04-17)
+- Phase 5 (heavy tool retrofit): ~SHIPPED~ 3rd wave (2026-04-17)
   - 1st wave: ~file-outline~ / ~code-extract-pattern~ retrofit + auto-derive
     (~:offload t~ 単体で動く)
   - 2nd wave: ~elisp-byte-compile-file~ retrofit
@@ -81,8 +81,18 @@
     ~load-path~ を snapshot して subprocess に渡す。byte-compile の
     target file の ~(require)~ が解決可能になる。pure 寄り tool は
     この flag を付けずに使う想定 (pool slot を汚さないため)
-  - tests: inherit-load-path がサイズ増加 / byte-compile 経由 MCP E2E 追加。
-    全 244/244 green
+  - 3rd wave: ~org-index-rebuild~ retrofit — Phase 3b checkpoint protocol
+    を最初に利用する production tool。新 defcustom
+    ~anvil-org-index-rebuild-checkpoint-every~ (既定 25) で N 件毎に
+    commit + `anvil-preempt-checkpoint` 発火。preempt された rebuild は
+    partial plist の ~:cursor~ に `(:files-processed N :last-path P)` を
+    載せて返し、already-committed chunk は DB に persist するので
+    follow-up call で idempotent に再開可能。tool handler は
+    ~anvil-org-index-enable~ を呼ばずに直接 DB open することで subprocess
+    内での MCP tool 再登録を回避
+  - tests: inherit-load-path がサイズ増加 / byte-compile 経由 MCP E2E /
+    rebuild chunk毎 checkpoint / checkpoint-every=0 で no-op /
+    rebuild offload E2E 全 250/252 green (2 件は pre-existing flake)
 
 * Goal
 

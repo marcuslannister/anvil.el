@@ -173,6 +173,77 @@ SCHEDULED: <2026-04-15 Wed>
       (ignore-errors (anvil-org-index-disable))
       (ignore-errors (delete-directory tmpdir t)))))
 
+(ert-deftest anvil-org-index-test-rebuild-emits-checkpoints-every-chunk ()
+  "Rebuild calls `anvil-preempt-checkpoint' once per chunk boundary.
+With 5 files and chunk=2, checkpoints fire after files 2 and 4.
+File 5 closes the final transaction outside the loop, so no
+trailing checkpoint — we only emit when the loop is still
+running and a future dispatch could be preempted."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (require 'anvil-offload)
+  (let* ((tmpdir (make-temp-file "anvil-idx-ckpt-" t))
+         (dbfile (expand-file-name "ckpt.db" tmpdir))
+         (anvil-org-index-db-path dbfile)
+         (anvil-org-index-paths (list tmpdir))
+         (anvil-org-index-rebuild-checkpoint-every 2)
+         (anvil-org-index--backend nil)
+         (anvil-org-index--db nil)
+         (captured nil))
+    (unwind-protect
+        (progn
+          (dotimes (i 5)
+            (anvil-org-index-test--write
+             (expand-file-name (format "f%d.org" i) tmpdir)
+             (format "* Heading %d\n" i)))
+          (anvil-org-index-enable)
+          (cl-letf (((symbol-function 'anvil-preempt-checkpoint)
+                     (lambda (value &optional cursor)
+                       (push (cons value cursor) captured)
+                       value)))
+            (anvil-org-index-rebuild))
+          (let ((events (nreverse captured)))
+            (should (= 2 (length events)))
+            (let ((value-0  (car (nth 0 events)))
+                  (cursor-0 (cdr (nth 0 events)))
+                  (value-1  (car (nth 1 events)))
+                  (cursor-1 (cdr (nth 1 events))))
+              (should (= 2 (plist-get value-0  :files-done)))
+              (should (= 5 (plist-get value-0  :files-total)))
+              (should (= 2 (plist-get cursor-0 :files-processed)))
+              (should (stringp (plist-get cursor-0 :last-path)))
+              (should (= 4 (plist-get value-1  :files-done)))
+              (should (= 4 (plist-get cursor-1 :files-processed)))
+              (should (stringp (plist-get cursor-1 :last-path))))))
+      (ignore-errors (anvil-org-index-disable))
+      (ignore-errors (delete-directory tmpdir t)))))
+
+(ert-deftest anvil-org-index-test-rebuild-checkpoint-every-zero-disables ()
+  "`anvil-org-index-rebuild-checkpoint-every' = 0 falls back to
+the Phase 1 single-transaction behaviour — no checkpoint calls."
+  (skip-unless (anvil-org-index-test--have-sqlite))
+  (require 'anvil-offload)
+  (let* ((tmpdir (make-temp-file "anvil-idx-ck0-" t))
+         (dbfile (expand-file-name "ck0.db" tmpdir))
+         (anvil-org-index-db-path dbfile)
+         (anvil-org-index-paths (list tmpdir))
+         (anvil-org-index-rebuild-checkpoint-every 0)
+         (anvil-org-index--backend nil)
+         (anvil-org-index--db nil)
+         (calls 0))
+    (unwind-protect
+        (progn
+          (dotimes (i 4)
+            (anvil-org-index-test--write
+             (expand-file-name (format "f%d.org" i) tmpdir)
+             (format "* H %d\n" i)))
+          (anvil-org-index-enable)
+          (cl-letf (((symbol-function 'anvil-preempt-checkpoint)
+                     (lambda (&rest _) (cl-incf calls))))
+            (anvil-org-index-rebuild))
+          (should (zerop calls)))
+      (ignore-errors (anvil-org-index-disable))
+      (ignore-errors (delete-directory tmpdir t)))))
+
 ;;;; Phase 2 — incremental refresh
 
 (defun anvil-org-index-test--write (path content)
