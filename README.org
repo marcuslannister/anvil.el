@@ -733,6 +733,33 @@ Phase 2 adds:
 
 Requires Emacs 29+ (via =anvil-state=).
 
+** Git helpers
+
+The =git= module is part of the default =anvil-modules= list.  It
+exposes read-only git inspection tools under the shared
+=emacs-eval= server id:
+
+- =git-repo-root= — top-level directory for a path, nil outside
+  a repo.
+- =git-head-sha= — full or abbreviated HEAD commit.
+- =git-branch-current= — current branch name, nil for detached.
+- =git-log= — recent commits as =(hash, date, author, subject)=
+  objects, capped at =anvil-git-log-default-count=.
+- =git-diff-names= — paths changed between FROM and TO.
+- =git-diff-stats= — structured =(files, insertions, deletions)=
+  counts.
+- =git-status= — branch / upstream / ahead / behind + buckets of
+  staged / modified / untracked / unmerged paths.
+- =git-worktree-list= — attached worktrees with =(path, head,
+  branch, bare, detached)=.
+
+The Elisp API adds =anvil-git-worktree-add= and
+=anvil-git-worktree-remove= (write operations, deliberately not
+exposed via MCP — =anvil-orchestrator= uses them to isolate
+parallel tasks).  Every call runs =git --no-pager -c
+core.quotepath=false ...= so Japanese paths round-trip cleanly
+and pager-configured repos don't leak terminal escapes.
+
 * Client setup — connecting your AI to Anvil
 
 After Anvil is running inside Emacs, you need to register it as

@@ -45,6 +45,7 @@
 (require 'tabulated-list)
 (require 'anvil-server)
 (require 'anvil-state)
+(require 'anvil-git)
 
 ;;;; --- configuration ------------------------------------------------------
 
@@ -607,17 +608,12 @@ Tasks that were `running' at shutdown are marked failed with a
 ;;;; --- worktree isolation -------------------------------------------------
 
 (defun anvil-orchestrator--repo-root (cwd)
-  "Return the git top-level directory for CWD, or nil if not inside one."
+  "Return the git top-level directory for CWD, or nil.
+Thin wrapper over `anvil-git-repo-root' that additionally guards
+against non-strings / non-directories so caller sites can branch
+on the return value without pre-validating CWD."
   (when (and (stringp cwd) (file-directory-p cwd))
-    (let ((default-directory (file-name-as-directory cwd)))
-      (condition-case _err
-          (with-temp-buffer
-            (let ((rc (call-process "git" nil (current-buffer) nil
-                                    "rev-parse" "--show-toplevel")))
-              (when (and (integerp rc) (zerop rc))
-                (let ((s (string-trim (buffer-string))))
-                  (and (not (string-empty-p s)) s)))))
-        (error nil)))))
+    (ignore-errors (anvil-git-repo-root cwd))))
 
 (defun anvil-orchestrator--worktree-name-for (task)
   "Return a sanitised worktree name for TASK (safe for git / CLI)."
@@ -643,19 +639,12 @@ Tasks that were `running' at shutdown are marked failed with a
   (ignore repo-root))
 
 (defun anvil-orchestrator--create-anvil-worktree (task repo-root)
-  "Create an `anvil-git worktree add' for TASK and return its absolute path.
-Signals an error if `git worktree add' exits non-zero."
-  (let* ((target (anvil-orchestrator--anvil-side-worktree-path task repo-root))
-         (parent (file-name-directory target)))
-    (unless (file-directory-p parent) (make-directory parent t))
-    (let ((default-directory (file-name-as-directory repo-root)))
-      (with-temp-buffer
-        (let ((rc (call-process "git" nil (current-buffer) nil
-                                "worktree" "add" target "HEAD")))
-          (unless (and (integerp rc) (zerop rc))
-            (error "anvil-orchestrator: git worktree add failed: %s"
-                   (buffer-string))))))
-    target))
+  "Create a git worktree for TASK and return its absolute path.
+Delegates to `anvil-git-worktree-add', which signals a descriptive
+error on non-zero exit."
+  (anvil-git-worktree-add
+   (anvil-orchestrator--anvil-side-worktree-path task repo-root)
+   repo-root))
 
 (defun anvil-orchestrator--apply-worktree (task)
   "Resolve worktree decisions for TASK; returns the possibly-modified plist.
