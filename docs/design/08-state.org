@@ -1,0 +1,311 @@
+#+title: Persistent State — SQLite-backed KV with Namespaces and TTL
+#+date: 2026-04-18
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+~APPROVED~ (2026-04-18、初回レビュー完了) — 実装着手可。
+Review Questions 6 件すべて既定案で resolved。Phase 1+2 同梱で ship 予定。
+
+* Goal
+
+anvil モジュール横断で使える、軽量な **永続 key-value store** を
+provide する。~~/.emacs.d/anvil-state.db~ を backing store とし、
+namespace scope、TTL、Lisp 値シリアライゼーションを備える。
+
+Phase A (anvil-browser) の in-memory cache、Phase C1 で予定する
+anvil-http の ETag cache、anvil-offload の handler-side checkpoint
+cursor 等、「daemon を跨ぐ / 再起動を挟む」軽量 state の共通バック
+エンド。
+
+* Problem
+
+** Phase A 時点の痛み
+
+anvil-browser の snapshot cache は現状 ~make-hash-table~ の in-memory
+table。2026-04-18 soak で確認した通り、daemon 再起動で消える。
+長時間稼働 (週単位) を考えるなら永続化が必要だが、browser 単体で
+SQLite schema を抱えるのは重量級すぎる。
+
+同様に:
+- anvil-offload の ~:resumable~ handler は ~anvil-preempt-checkpoint~
+  で cursor/value を保存するが、永続化層は存在せず (main daemon
+  再起動で失われる)
+- anvil-http (Phase C1) は ETag + Last-Modified を
+  URL→headers で持つ必要がある
+- anvil-embed (Phase D2) は vector → id の side table を別途要する
+
+これらを個別に SQLite テーブルで抱えると:
+- 各モジュールが schema 管理 / migration ロジックを重複持つ
+- DB ハンドル / 接続数が不必要に増える
+- 「cache を clear したい」等の横断操作が面倒
+
+** 「Lisp ハッシュテーブルを disk に書く」だけでは不十分
+
+Emacs の ~print~/~read~ で ~elisp~ ファイルに吐く愚直実装は:
+- 全量書き換えしか選択肢がない (行単位 update 不可)
+- 複数プロセス並行アクセスが壊れる (WSL / Windows Junction 越しは fsync 挙動が不穏)
+- TTL を自前で管理すると毎回全走査
+- 大量 key で起動時読み込みに比例時間がかかる
+
+SQLite + namespace + indexed expires_at にすれば、すべて点で片付く。
+
+* Proposed Design
+
+** Module boundary
+
+- 新規ファイル: ~anvil-state.el~
+- 依存 (hard): なし (anvil-server も optional — MCP tool を expose するか
+  は Review Question、本体は pure library)
+- 依存 (soft): ~emacsql~ — Emacs 28.2 でのみ必要、Emacs 29+ は built-in
+- 公開 MCP tool: Review Question で決定 (既定案は「なし」— 内部 infra に留める)
+
+** Public API (Elisp)
+
+#+begin_src elisp
+;; 設定
+(defcustom anvil-state-db-path
+  (expand-file-name "anvil-state.db" user-emacs-directory)
+  "..." :type 'file)
+
+;; 中核 API
+(anvil-state-set KEY VAL &key ns ttl)
+  ;; KEY: string.
+  ;; VAL: 任意の Lisp 値 (readable なら何でも; `prin1' / `read' ラウンド
+  ;;      トリップで復元される)。non-readable は error。
+  ;; :ns STRING  — 名前空間 (既定 "default")。module-name 慣例推奨。
+  ;; :ttl INT    — 秒後に expire (既定 nil = 無期限)。
+
+(anvil-state-get KEY &key ns default)
+  ;; 存在しない or 期限切れなら DEFAULT (既定 nil) を返す。
+  ;; 期限切れ entry はこの時 lazy に削除。
+
+(anvil-state-delete KEY &key ns)
+  ;; 戻り値: t (削除された) / nil (存在しなかった)
+
+(anvil-state-delete-ns NS)
+  ;; NS 全 key を削除。戻り値: 削除件数。
+
+(anvil-state-list-ns)
+  ;; 存在する namespace の一覧 (string list)。
+
+(anvil-state-count &optional ns)
+  ;; NS 内 key 数 (ns 省略時は全 ns 合計)。
+
+(anvil-state-vacuum)
+  ;; 期限切れ entry を物理削除 + SQLite VACUUM。
+
+;; ライフサイクル
+(anvil-state-enable)   ; DB 初期化 / MCP tool 登録 (後者は Review 次第)
+(anvil-state-disable)  ; DB 閉じる
+#+end_src
+
+** Internal: schema
+
+#+begin_src sql
+CREATE TABLE IF NOT EXISTS schema_meta (
+  version INTEGER PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS kv (
+  ns          TEXT NOT NULL,
+  k           TEXT NOT NULL,
+  v           TEXT NOT NULL,          -- prin1 シリアライズ済 Lisp 値
+  created_at  INTEGER NOT NULL,       -- unix epoch sec
+  updated_at  INTEGER NOT NULL,
+  expires_at  INTEGER,                -- nullable; NULL = 無期限
+  PRIMARY KEY (ns, k)
+);
+
+CREATE INDEX IF NOT EXISTS idx_kv_expires
+  ON kv(expires_at) WHERE expires_at IS NOT NULL;
+#+end_src
+
+primary key = ~(ns, k)~ の compound。~(ns, k)~ 単体 lookup は常に
+index hit。
+
+期限切れ cleanup は index idx_kv_expires により
+~DELETE FROM kv WHERE expires_at IS NOT NULL AND expires_at <= ?1~
+が高速。
+
+** 値シリアライゼーション
+
+~prin1-to-string~ + ~read-from-string~ で round-trip。
+
+- 全 Lisp primitive (symbol, keyword, string, number, cons, list, vector,
+  hash-table) が通る
+- non-readable (buffer, process, marker) は ~prin1~ 時点で ~#<buffer ...>~
+  のような un-readable printed form になり、~read~ で失敗 — set 側で
+  ~(read (prin1-to-string VAL))~ を試行して失敗したら ~user-error~
+- Unicode string は Emacs 内部表現 → utf-8 で保存 (SQLite TEXT で OK)
+
+JSON 化は非採用 (keyword / symbol を保持できない、plist と alist を
+混同する)。
+
+** TTL semantics
+
+- ~:ttl 300~ → ~expires_at = now + 300~
+- ~get~ 時 lazy expiry: row が取れたら expires_at を照合し、過去なら
+  削除 + nil 返却
+- ~anvil-state-vacuum~ で明示的 cleanup。timer で自動実行するかは
+  Review Question (既定: 手動 / cleanup 時に呼ぶ方が透明)
+
+** Transaction policy
+
+- 単発 set/get/delete は自動 transaction なし
+- bulk 操作 (delete-ns など) は ~BEGIN ... COMMIT~ で包む
+- マクロは ~anvil-org-index--with-transaction~ と同形で
+  ~anvil-state--with-transaction~ を provide
+
+** Concurrency
+
+現行 anvil は:
+- main daemon 1
+- mcp-worker 1
+- eat-dev 1
+- worker-* (read1/read2/write1/batch1) 4
+- 計 7 Emacs プロセスが同一 ~~/.emacs.d~ 配下を共有
+
+SQLite への **並列 read-only** は built-in sqlite で問題なし。
+**write 競合** は:
+- Phase 1: 単一 writer 仮定 (anvil-browser cache は main daemon 上
+  のみが書く)。~sqlite-execute~ の default で十分
+- Phase 2: WAL モード導入 (~PRAGMA journal_mode=WAL~) + busy_timeout
+  設定。全 Emacs プロセスから read/write 可能に
+
+WAL の migration は schema_version 2 で実施。
+
+** MCP tool (案)
+
+Review Question で決定。候補:
+
+*** 案 A: MCP tool なし (infrastructure only)
+
+anvil-state は他モジュールからの Elisp 呼び出し専用。LLM 経由で KV を
+叩く必要が出たら、そのモジュール側が専用 tool を書く (browser-cache
+clear 等)。
+
+利点: 汎用 KV を LLM に開放すると「何のために保存されたか」不明な
+値が山積みになりがち。責務分離できる。
+
+*** 案 B: MCP tool を最小限 expose
+
+~state-get~ / ~state-set~ / ~state-delete~ のみ expose。ns + key を
+明示する前提で LLM でも扱える。
+
+利点: デバッグ時に「browser cache に今どんな snapshot が入っているか」
+確認する Claude Code セッションで便利。
+
+欠点: schema 濫用のリスク (LLM が勝手な key で保存し始める)。
+
+*案 A を既定案として提案。*
+
+* Phase 分解
+
+| Phase | 内容 | 工数 |
+|-------+----------------------------------------------+------|
+| 1     | コア KV API + schema + tests + lifecycle    | 中   |
+| 2     | anvil-browser cache を state に migrate      | 小   |
+| 3     | anvil-offload checkpoint cursor を state に  | 中   |
+| 4     | WAL 有効化 (schema v2) + 並列 writer 対応   | 中   |
+| 5     | ~M-x anvil-state-dashboard~ (tabulated-list) | 小   |
+
+Phase 1+2 を同 PR で ship すると 1st user の動線が即検証できる。
+3 以降は分離可。
+
+* Non-goals
+
+- **大 blob store** — blob (>64KB) は別モジュールで。PNG / PDF
+  ポインタ保存は推奨しない (path を string で持つ)
+- **relational query** — ~anvil-state~ は純粋 KV。JOIN / ORDER BY は
+  anvil-sqlite で
+- **distributed / replicated** — 単一マシン / 単一 ~~/.emacs.d~ が前提
+- **auth / ACL** — local only。Emacs プロセスが信用できる前提
+- **schema-per-ns** — 全 ns が同一 kv テーブルを共有。ns 毎の型制約
+  は入れない
+- **event emitter** — 「この key が変わった時に callback」は Phase 5+
+  で必要性が出たら検討
+
+* Migration / Backward Compatibility
+
+- 新規モジュール。既存 tool への影響なし
+- Phase 2 で anvil-browser cache を state に差し替え。~:cache-ttl-sec~
+  の挙動は API 互換。user 視点で変わるのは「daemon 再起動で cache が
+  生き残るようになった」だけ
+- 既存 ~~/.emacs.d/anvil-state.db~ があった場合 (今は存在しない) は
+  schema_meta.version を読んで自動 migration
+
+* Risks
+
+- **prin1 で non-readable 値を入れる事故**
+  → set 側で round-trip check、失敗なら user-error。ユニットテスト
+    で回帰検出
+- **SQLite DB ファイルが壊れる**
+  → WAL モードで耐障害性向上 (Phase 4)。Phase 1-3 は journal mode
+    default。~anvil-state-vacuum~ で ~PRAGMA integrity_check~ を
+    併せて実行 (option で)
+- **並列 writer での lock 衝突** (Phase 4 前)
+  → 単一 writer 仮定。worker-* プロセスから state に書くのは
+    禁止 (readonly usage のみ)。docstring で明示
+- **schema v1 → v2 WAL 切替で既存 DB が壊れる**
+  → migration ステップを ~anvil-state--migrate~ 内で
+    ~PRAGMA journal_mode=WAL~ + integrity check。失敗したら
+    旧 DB を ~.bak~ に move して空 DB で再出発
+
+* Platform Notes
+
+** Windows
+
+- SQLite DB が MSYS 側 path と native Windows path で共有される場合
+  fsync 挙動が不穏な報告あり。~user-emacs-directory~ は native 側なので
+  影響なし (anvil-org-index で実績済)
+- WAL 有効時、ウイルス対策ソフトが ~.db-wal~ / ~.db-shm~ を掴むと
+  writer がロックされる。Defender の除外に ~user-emacs-directory~
+  全体を入れることを README で案内
+
+** macOS / Linux
+
+- 特記なし
+
+* Success Metrics
+
+- anvil-browser cache が daemon 再起動を跨いで有効 (Phase 2 完了時)
+- 10,000 key の set + get round-trip で 1 call あたり 1ms 未満
+  (bench で測定)
+- anvil-offload checkpoint が daemon crash 後も復元可 (Phase 3 完了時)
+
+* Review Questions (RESOLVED 2026-04-18)
+
+初回レビューで決定した項目 (全 6 件、既定案を採用):
+
+- [X] *Q1: MCP tool* → **出さない、infrastructure only**。LLM から KV を
+  直接叩く必要が出たら、そのモジュール側が専用 tool を書く
+- [X] *Q2: 値シリアライゼーション* → **~prin1~ / ~read~**。Lisp full
+  type 保持。non-readable 値は set 側で round-trip check → user-error
+- [X] *Q3: TTL 自動 vacuum* → **手動のみ**。~anvil-state-vacuum~ を
+  cron で。timer は透明性が下がるため避ける
+- [X] *Q4: Emacs 28.2 サポート* → **29+ のみ**。anvil-org-index と揃える
+- [X] *Q5: 並列 writer* → **Phase 4 で WAL**。Phase 1-3 は単一 writer
+  (main daemon のみ書き手) 仮定で進める
+- [X] *Q6: anvil-offload checkpoint 移行* → **Phase 3 で別立て**。
+  Phase 1+2 (core + browser cache) を先に ship して 1st user 動線を検証
+
+* Implementation Plan (Phase 1+2 想定)
+
+1. Day 0: 本 doc レビュー・Review Questions 決定
+2. Day 1: ~anvil-state.el~ スケルトン + schema + set/get/delete
+3. Day 2: delete-ns / list-ns / count / vacuum + ERT tests
+4. Day 3: anvil-browser cache を state backend に差し替え
+   (~anvil-browser--cache~ hash-table → anvil-state call)
+5. Day 4: README + docstring / anvil-optional-modules へ ~state~ 追加
+6. Day 5: merge
+
+Phase 1 単体で 2-3 日、Phase 2 同梱で +1 日。
+
+* References
+
+- Doc 07 Vision 節 ~anvil-state~ 概要: ~07-browser-framework.org~
+- 先行 SQLite モジュール: ~anvil-org-index.el~ (schema 管理 / backend
+  検出 / transaction macro のパターン)
+- 先行 SQLite read-only tool: ~anvil-sqlite.el~ (built-in sqlite 使用例)
+- 2026-04-18 anvil-browser soak: ~memory/feedback_anvil_browser_login_antibot_limits.md~
