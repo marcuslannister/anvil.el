@@ -4,15 +4,21 @@
 #+property: status DRAFT
 
 * STATUS
-~Phase 1a SHIPPED~ (2026-04-18) — =anvil-orchestrator.el= +
-=tests/anvil-orchestrator-test.el= (18 pass / 1 live skipped) +
-README section + =anvil-optional-modules= entry。byte-compile clean。
-Phase 1a scope に含まれる全項目 (provider abstraction、claude
-provider、spawn + sentinel + timeout、pool + concurrency cap、state
-persist + restore、5 MCP tools、dashboard) を実装完了。
+~Phase 1a + 1b SHIPPED~ (2026-04-18)
 
-Phase 1b-4 は design 残し、着手順は batch 進捗を見てから。Review
-Questions Q1-Q12 resolved 状態キープ。
+- Phase 1a (commit 45468b2): provider abstraction, claude provider,
+  spawn + sentinel + timeout, pool + concurrency cap, state
+  persist + restore, 5 MCP tools, tabulated-list dashboard, 18 ERT
+  pass
+- Phase 1b (commit TBD, branch feat/orchestrator-phase-1b): git
+  worktree isolation (claude native + anvil-side fallback),
+  =:depends-on= DAG with cycle / unknown-name detection +
+  propagating failure semantics, stdout/stderr head + tail
+  truncation at the 1 MB cap. ERT +12 (= 30 pass / 1 live skip)
+
+Phase 2 (aider middleware), 2b (anvil-cron), 3/3b (gemini /
+ollama native), 4 (consensus) は design 残し。Review Questions
+Q1-Q12 resolved 状態キープ。
 
 * Goal
 

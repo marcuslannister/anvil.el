@@ -688,6 +688,28 @@ queue survives a daemon restart.  Running tasks at shutdown are
 marked =failed= with a clear error on reload, since the OS pids no
 longer belong to Emacs.
 
+Phase 1b adds:
+
+- *Git worktree isolation*.  When a task's =:cwd= is inside a git
+  repo and =anvil-orchestrator-worktree-auto= is on (default), the
+  claude provider receives =--worktree NAME= so N parallel tasks
+  never stomp on the same working tree.  Providers without native
+  worktree support fall back to an =anvil-git worktree add= under
+  =anvil-orchestrator-work-dir/worktrees/=; =:cwd= is rewritten to
+  that path before spawn.  Opt out per task with =:no-worktree t=.
+- *DAG scheduling*.  A task may name sibling-in-batch dependencies
+  via =:depends-on ("other-name" …)=.  The pool only starts a task
+  once every dep has reached =done=; if any dep =failed= or
+  =cancelled=, dependents are flipped to =failed= with a
+  "dependency X did not succeed" error.  Batch-level cycle and
+  unknown-name detection happens at submit time.
+- *stdout / stderr overflow*.  Per-task output files over
+  =anvil-orchestrator-output-size-cap= (default 1 MB) are rewritten
+  as =head 256 KB= + truncation marker + =tail 256 KB=; the
+  original byte count survives on the task record as
+  =:stdout-bytes-original= so the dashboard and the parent session
+  can see that a log was slimmed down.
+
 Requires Emacs 29+ (via =anvil-state=).
 
 * Client setup — connecting your AI to Anvil

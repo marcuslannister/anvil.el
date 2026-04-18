@@ -151,6 +151,30 @@ autonomous (use with care)."
   :type 'string
   :group 'anvil-orchestrator)
 
+(defcustom anvil-orchestrator-worktree-auto t
+  "When non-nil, new tasks whose `:cwd' is inside a git repository
+get a dedicated worktree — either via the provider's native flag
+(claude's `--worktree') or via an `anvil-git worktree add' under
+`anvil-orchestrator-work-dir' when the provider lacks native
+support.  Override per task with `:no-worktree t'."
+  :type 'boolean
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-output-size-cap (* 1024 1024)
+  "Per-task stdout / stderr byte ceiling before head + tail truncation."
+  :type 'integer
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-output-head-bytes (* 256 1024)
+  "Head bytes kept intact when an output file exceeds the cap."
+  :type 'integer
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-output-tail-bytes (* 256 1024)
+  "Tail bytes kept intact when an output file exceeds the cap."
+  :type 'integer
+  :group 'anvil-orchestrator)
+
 ;;;; --- provider abstraction ----------------------------------------------
 
 (cl-defstruct anvil-orchestrator-provider
@@ -223,7 +247,11 @@ supplying a different `cost-estimator' at provider registration.")
 (defun anvil-orchestrator--claude-build-cmd (task)
   "Build the `claude' command line for TASK plist.
 Includes streaming JSON output, budget, append-system-prompt,
-permission mode, and finally the prompt."
+permission mode, optional native --worktree, and finally the
+prompt.  The native worktree flag is emitted when the task has
+`:_worktree-name' (set by `--spawn' when `--should-worktree'
+decides the task should run in an isolated worktree and the
+provider natively supports it)."
   (let* ((model    (or (plist-get task :model) "sonnet"))
          (prompt   (plist-get task :prompt))
          (budget   (or (plist-get task :budget-usd)
@@ -234,6 +262,7 @@ permission mode, and finally the prompt."
                        anvil-orchestrator-permission-mode))
          (allowed  (plist-get task :allowed-tools))
          (bare     (plist-get task :bare))
+         (wt-name  (plist-get task :_worktree-name))
          (cmd      (list (executable-find "claude")
                          "--print"
                          "--output-format" "stream-json"
@@ -247,6 +276,8 @@ permission mode, and finally the prompt."
       (setq cmd (append cmd (list "--allowedTools" allowed))))
     (when bare
       (setq cmd (append cmd (list "--bare"))))
+    (when wt-name
+      (setq cmd (append cmd (list "--worktree" wt-name))))
     ;; Prompt is the positional argument; CLI treats remaining argv as prompt.
     (append cmd (list prompt))))
 
@@ -409,6 +440,120 @@ Tasks that were `running' at shutdown are marked failed with a
     (error nil))
   (setq anvil-orchestrator--queue (nreverse anvil-orchestrator--queue)))
 
+;;;; --- worktree isolation -------------------------------------------------
+
+(defun anvil-orchestrator--repo-root (cwd)
+  "Return the git top-level directory for CWD, or nil if not inside one."
+  (when (and (stringp cwd) (file-directory-p cwd))
+    (let ((default-directory (file-name-as-directory cwd)))
+      (condition-case _err
+          (with-temp-buffer
+            (let ((rc (call-process "git" nil (current-buffer) nil
+                                    "rev-parse" "--show-toplevel")))
+              (when (and (integerp rc) (zerop rc))
+                (let ((s (string-trim (buffer-string))))
+                  (and (not (string-empty-p s)) s)))))
+        (error nil)))))
+
+(defun anvil-orchestrator--worktree-name-for (task)
+  "Return a sanitised worktree name for TASK (safe for git / CLI)."
+  (let* ((raw  (or (plist-get task :worktree-name)
+                   (plist-get task :name)))
+         (safe (replace-regexp-in-string "[^A-Za-z0-9._-]" "-" raw))
+         (trim (if (> (length safe) 48) (substring safe 0 48) safe)))
+    (concat "anvil-orch-" trim)))
+
+(defun anvil-orchestrator--should-worktree (task provider)
+  "Return non-nil when worktree isolation should be applied to TASK."
+  (and anvil-orchestrator-worktree-auto
+       (not (plist-get task :no-worktree))
+       (anvil-orchestrator-provider-supports-worktree provider)
+       (anvil-orchestrator--repo-root
+        (or (plist-get task :cwd) default-directory))))
+
+(defun anvil-orchestrator--anvil-side-worktree-path (task repo-root)
+  "Return an absolute worktree path for TASK under the orchestrator work-dir."
+  (expand-file-name
+   (format "wt-%s" (or (plist-get task :id) "anon"))
+   (expand-file-name "worktrees" anvil-orchestrator-work-dir))
+  (ignore repo-root))
+
+(defun anvil-orchestrator--create-anvil-worktree (task repo-root)
+  "Create an `anvil-git worktree add' for TASK and return its absolute path.
+Signals an error if `git worktree add' exits non-zero."
+  (let* ((target (anvil-orchestrator--anvil-side-worktree-path task repo-root))
+         (parent (file-name-directory target)))
+    (unless (file-directory-p parent) (make-directory parent t))
+    (let ((default-directory (file-name-as-directory repo-root)))
+      (with-temp-buffer
+        (let ((rc (call-process "git" nil (current-buffer) nil
+                                "worktree" "add" target "HEAD")))
+          (unless (and (integerp rc) (zerop rc))
+            (error "anvil-orchestrator: git worktree add failed: %s"
+                   (buffer-string))))))
+    target))
+
+(defun anvil-orchestrator--apply-worktree (task)
+  "Resolve worktree decisions for TASK; returns the possibly-modified plist.
+For providers that natively support worktree (e.g. claude), writes
+`:_worktree-name' so the build-cmd emits its own flag.  For other
+providers, creates an `anvil-git worktree add' under
+`anvil-orchestrator-work-dir' and rewrites `:cwd' to that path."
+  (let* ((provider (anvil-orchestrator--provider (plist-get task :provider))))
+    (if (not (anvil-orchestrator--should-worktree task provider))
+        task
+      (let* ((native (anvil-orchestrator-provider-supports-worktree provider))
+             (name   (anvil-orchestrator--worktree-name-for task)))
+        (cond
+         ((and native (memq (plist-get task :provider) '(claude)))
+          ;; Claude (and any future provider we opt-in here) owns the
+          ;; worktree lifecycle via its own --worktree flag — just
+          ;; advertise the name to build-cmd.
+          (plist-put (copy-sequence task) :_worktree-name name))
+         (t
+          ;; Generic path: anvil creates the worktree and rewrites :cwd.
+          (let* ((root (anvil-orchestrator--repo-root
+                        (or (plist-get task :cwd) default-directory)))
+                 (wt   (anvil-orchestrator--create-anvil-worktree task root))
+                 (new  (copy-sequence task)))
+            (setq new (plist-put new :cwd wt))
+            (setq new (plist-put new :_worktree-path wt))
+            new)))))))
+
+;;;; --- stdout / stderr overflow -------------------------------------------
+
+(defun anvil-orchestrator--truncate-output-file (path)
+  "If PATH is over the cap, rewrite it as head + marker + tail.
+Returns the original size (number) when truncation happened, else nil.
+Binary-safe: reads / writes via `set-buffer-multibyte nil' so
+stream-json NDJSON survives round-trip."
+  (let* ((attrs (and (file-exists-p path) (file-attributes path)))
+         (size  (and attrs (file-attribute-size attrs)))
+         (cap   anvil-orchestrator-output-size-cap)
+         (head  anvil-orchestrator-output-head-bytes)
+         (tail  anvil-orchestrator-output-tail-bytes))
+    (when (and size (> size cap))
+      (let* ((omitted (max 0 (- size (+ head tail))))
+             (tmp (concat path ".trunc"))
+             (marker (format "\n---\n[anvil-orchestrator: %d bytes truncated (%d kept as head, %d as tail)]\n---\n"
+                             omitted head tail))
+             (coding-system-for-read  'binary)
+             (coding-system-for-write 'binary))
+        (with-temp-buffer
+          (set-buffer-multibyte nil)
+          (insert-file-contents-literally path nil 0 head)
+          ;; `insert-file-contents-literally' leaves point at the start of
+          ;; the inserted region, so move to end before appending the marker.
+          (goto-char (point-max))
+          (insert marker)
+          (write-region (point-min) (point-max) tmp nil 'silent))
+        (with-temp-buffer
+          (set-buffer-multibyte nil)
+          (insert-file-contents-literally path nil (- size tail) size)
+          (write-region (point-min) (point-max) tmp t 'silent))
+        (rename-file tmp path t)
+        size))))
+
 ;;;; --- spawn + sentinel --------------------------------------------------
 
 (defun anvil-orchestrator--ensure-work-dir ()
@@ -428,6 +573,9 @@ Tasks that were `running' at shutdown are marked failed with a
   "Spawn TASK's provider CLI and record the process in the running table."
   (anvil-orchestrator--ensure-work-dir)
   (let* ((provider (anvil-orchestrator--provider (plist-get task :provider)))
+         ;; Worktree decision runs first and may rewrite :cwd / add
+         ;; :_worktree-name that build-cmd reads.
+         (task     (anvil-orchestrator--apply-worktree task))
          (cmd      (funcall (anvil-orchestrator-provider-build-cmd provider)
                             task))
          (stdout   (anvil-orchestrator--stdout-path task))
@@ -460,11 +608,14 @@ Tasks that were `running' at shutdown are marked failed with a
     (puthash (plist-get task :id) proc anvil-orchestrator--running)
     (anvil-orchestrator--task-update
      (plist-get task :id)
-     :status      'running
-     :started-at  (float-time)
-     :stdout-path stdout
-     :stderr-path stderr
-     :pid         (process-id proc))
+     :status        'running
+     :started-at    (float-time)
+     :stdout-path   stdout
+     :stderr-path   stderr
+     :pid           (process-id proc)
+     :cwd           (plist-get task :cwd)
+     :_worktree-name (plist-get task :_worktree-name)
+     :_worktree-path (plist-get task :_worktree-path))
     proc))
 
 (defun anvil-orchestrator--finalize (proc status)
@@ -484,6 +635,15 @@ Tasks that were `running' at shutdown are marked failed with a
       (with-current-buffer err-buf
         (write-region (point-min) (point-max) stderr nil 'silent))
       (kill-buffer err-buf))
+    (let ((out-orig (and stdout
+                         (anvil-orchestrator--truncate-output-file stdout)))
+          (err-orig (and stderr
+                         (anvil-orchestrator--truncate-output-file stderr))))
+      (when (or out-orig err-orig)
+        (anvil-orchestrator--task-update
+         id
+         :stdout-bytes-original out-orig
+         :stderr-bytes-original err-orig)))
     (remhash id anvil-orchestrator--running)
     (when task
       (let* ((provider (anvil-orchestrator--provider (plist-get task :provider)))
@@ -568,41 +728,79 @@ Tasks that were `running' at shutdown are marked failed with a
   (or (alist-get provider anvil-orchestrator-per-provider-concurrency)
       anvil-orchestrator-concurrency))
 
+(defun anvil-orchestrator--dep-tasks (task)
+  "Return the list of task plists TASK `:depends-on' resolves to.
+Unknown dep names silently drop out (they should already have
+been caught by `--validate-batch')."
+  (let* ((bid (plist-get task :batch-id))
+         (ids (and bid (gethash bid anvil-orchestrator--batches))))
+    (delq nil
+          (mapcar
+           (lambda (dep-name)
+             (cl-some
+              (lambda (id)
+                (let ((t0 (anvil-orchestrator--task-get id)))
+                  (and t0 (equal (plist-get t0 :name) dep-name) t0)))
+              ids))
+           (plist-get task :depends-on)))))
+
+(defun anvil-orchestrator--classify-for-pump (task)
+  "Return how to handle TASK at this pump tick.
+One of `drop' / `fail-dep' / `skip-dep' / `skip-prov' / `run'.
+Also returns (pcase `(fail-dep . DEP-NAME)') when a dep has
+already failed so the caller can record the propagation cause."
+  (cond
+   ((or (null task) (not (eq (plist-get task :status) 'queued))) 'drop)
+   (t
+    (let* ((deps (anvil-orchestrator--dep-tasks task))
+           (failed (cl-find-if
+                    (lambda (d)
+                      (memq (plist-get d :status) '(failed cancelled)))
+                    deps)))
+      (cond
+       (failed (cons 'fail-dep (plist-get failed :name)))
+       ((cl-some (lambda (d) (not (eq (plist-get d :status) 'done))) deps)
+        'skip-dep)
+       ((let ((prov (plist-get task :provider)))
+          (and prov
+               (>= (anvil-orchestrator--running-count prov)
+                   (anvil-orchestrator--per-provider-cap prov))))
+        'skip-prov)
+       (t 'run))))))
+
 (defun anvil-orchestrator--pump ()
-  "Start as many queued tasks as concurrency caps allow.
-FIFO order; if the head task is provider-capped, the scan
-continues past it so other providers can run."
+  "Start as many queued tasks as concurrency caps and the DAG allow.
+FIFO-ish: tasks blocked on deps or provider caps are held back,
+everything else runs when global concurrency permits."
   (let ((global-cap anvil-orchestrator-concurrency)
-        (skipped    nil)
-        (started    nil))
+        (held       nil))
     (while (and anvil-orchestrator--queue
                 (< (anvil-orchestrator--running-count) global-cap))
-      (let* ((id   (pop anvil-orchestrator--queue))
-             (task (anvil-orchestrator--task-get id))
-             (prov (and task (plist-get task :provider)))
-             (p-cap (and prov (anvil-orchestrator--per-provider-cap prov))))
-        (cond
-         ((or (null task) (not (eq (plist-get task :status) 'queued)))
-          ;; task gone or state changed (cancelled) — drop from queue
-          nil)
-         ((and p-cap
-               (>= (anvil-orchestrator--running-count prov) p-cap))
-          (push id skipped))
-         (t
-          (push id started)
-          (condition-case err
-              (anvil-orchestrator--spawn task)
-            (error
-             (anvil-orchestrator--task-update
-              id
-              :status 'failed
-              :finished-at (float-time)
-              :error (format "anvil-orchestrator: spawn failed: %s"
-                             (error-message-string err)))))))))
-    ;; restore provider-capped items to the head preserving FIFO
+      (let* ((id      (pop anvil-orchestrator--queue))
+             (task    (anvil-orchestrator--task-get id))
+             (action  (anvil-orchestrator--classify-for-pump task)))
+        (pcase action
+          ('drop nil)
+          ((or 'skip-dep 'skip-prov) (push id held))
+          (`(fail-dep . ,dep-name)
+           (anvil-orchestrator--task-update
+            id
+            :status      'failed
+            :finished-at (float-time)
+            :error       (format "anvil-orchestrator: dependency %s did not succeed"
+                                 dep-name)))
+          ('run
+           (condition-case err
+               (anvil-orchestrator--spawn task)
+             (error
+              (anvil-orchestrator--task-update
+               id
+               :status      'failed
+               :finished-at (float-time)
+               :error       (format "anvil-orchestrator: spawn failed: %s"
+                                    (error-message-string err)))))))))
     (setq anvil-orchestrator--queue
-          (append (nreverse skipped) anvil-orchestrator--queue))
-    (ignore started)))
+          (append (nreverse held) anvil-orchestrator--queue))))
 
 (defun anvil-orchestrator--pump-tick ()
   "Timer callback: timeout scan + pool pump."
@@ -711,6 +909,42 @@ Signals `user-error' on missing / malformed fields."
                             anvil-orchestrator-timeout-sec-default)))
     task))
 
+(defun anvil-orchestrator--validate-deps (tasks)
+  "Check every `:depends-on' entry names an existing sibling task.
+Also detects cycles.  Signals `user-error' on violation."
+  (let ((names (mapcar (lambda (t0) (plist-get t0 :name)) tasks))
+        (adj   (make-hash-table :test 'equal)))
+    ;; forward edges
+    (dolist (t0 tasks)
+      (puthash (plist-get t0 :name)
+               (or (plist-get t0 :depends-on) nil)
+               adj))
+    ;; unknown names
+    (dolist (t0 tasks)
+      (dolist (dep (plist-get t0 :depends-on))
+        (unless (member dep names)
+          (user-error "anvil-orchestrator: task %s :depends-on unknown %s"
+                      (plist-get t0 :name) dep))))
+    ;; cycle detection (iterative DFS)
+    (let ((visiting (make-hash-table :test 'equal))
+          (visited  (make-hash-table :test 'equal)))
+      (cl-labels
+          ((dfs (node stack)
+             (cond
+              ((gethash node visiting)
+               (user-error "anvil-orchestrator: cyclic :depends-on: %s"
+                           (mapconcat #'identity (reverse (cons node stack))
+                                      " -> ")))
+              ((gethash node visited) nil)
+              (t
+               (puthash node t visiting)
+               (dolist (d (gethash node adj))
+                 (dfs d (cons node stack)))
+               (remhash node visiting)
+               (puthash node t visited)))))
+        (dolist (t0 tasks)
+          (dfs (plist-get t0 :name) nil))))))
+
 (defun anvil-orchestrator--validate-batch (tasks)
   "Sanity-check the TASKS list before enqueueing.
 Signals `user-error' on any violation."
@@ -725,6 +959,7 @@ Signals `user-error' on any violation."
                   names)))
   (dolist (t0 tasks)
     (anvil-orchestrator--provider (plist-get t0 :provider)))
+  (anvil-orchestrator--validate-deps tasks)
   (let ((total (apply #'+ (mapcar (lambda (t0)
                                     (or (plist-get t0 :budget-usd) 0))
                                   tasks))))

@@ -57,6 +57,23 @@ EXIT-CODE overrides the sh exit status (default 0)."
    :parse-output #'anvil-orchestrator--claude-parse-output
    :default-model "slow"))
 
+(defun anvil-orchestrator-test--teardown-processes ()
+  "SIGKILL every process in the running table and wait briefly for exit.
+Keeps per-test state deterministic — without this, a long-lived
+stub subprocess can fire its sentinel after the fixture has
+already deleted the work-dir, which pollutes later tests."
+  (maphash
+   (lambda (_id proc)
+     (when (process-live-p proc)
+       ;; Mark as cancelled so finalize doesn't queue a retry.
+       (process-put proc 'anvil-cancel-reason 'cancelled)
+       (ignore-errors (signal-process proc 'SIGKILL))))
+   anvil-orchestrator--running)
+  (let ((deadline (+ (float-time) 2.0)))
+    (while (and (> (hash-table-count anvil-orchestrator--running) 0)
+                (< (float-time) deadline))
+      (accept-process-output nil 0.05))))
+
 (defmacro anvil-orchestrator-test--with-fresh (&rest body)
   "Run BODY inside a freshly initialised orchestrator + state DB."
   (declare (indent 0))
@@ -76,6 +93,7 @@ EXIT-CODE overrides the sh exit status (default 0)."
            (anvil-orchestrator-test--register-stub)
            ,@body)
        (anvil-orchestrator--cancel-pump-timer)
+       (anvil-orchestrator-test--teardown-processes)
        (anvil-state-disable)
        (ignore-errors (delete-file anvil-state-db-path))
        (ignore-errors
@@ -316,6 +334,158 @@ EXIT-CODE overrides the sh exit status (default 0)."
             (should (= 21 (length s)))))
       (delete-file tmp-out)
       (delete-file tmp-err))))
+
+;;;; --- Phase 1b: worktree isolation --------------------------------------
+
+(ert-deftest anvil-orchestrator-test-claude-build-cmd-adds-worktree ()
+  "`:_worktree-name' surfaces as `--worktree NAME' in the claude cmd."
+  (let* ((task (list :name "demo" :provider 'claude
+                     :prompt "hi" :_worktree-name "anvil-orch-demo"))
+         (cmd  (anvil-orchestrator--claude-build-cmd task)))
+    (should (member "--worktree" cmd))
+    (should (member "anvil-orch-demo" cmd))))
+
+(ert-deftest anvil-orchestrator-test-claude-build-cmd-no-worktree-by-default ()
+  (let* ((task (list :name "demo" :provider 'claude :prompt "hi"))
+         (cmd  (anvil-orchestrator--claude-build-cmd task)))
+    (should-not (member "--worktree" cmd))))
+
+(ert-deftest anvil-orchestrator-test-should-worktree-requires-git-repo ()
+  "Non-git cwd → never triggers worktree handling."
+  (let* ((tmp (make-temp-file "anvil-orch-no-git-" t))
+         (task (list :name "x" :provider 'claude :prompt "p" :cwd tmp)))
+    (unwind-protect
+        (should-not
+         (anvil-orchestrator--should-worktree
+          task (anvil-orchestrator--provider 'claude)))
+      (delete-directory tmp t))))
+
+(ert-deftest anvil-orchestrator-test-should-worktree-opt-out ()
+  "`:no-worktree t' suppresses worktree handling even in a repo."
+  (let* ((repo (anvil-orchestrator-test--make-repo))
+         (task (list :name "x" :provider 'claude :prompt "p"
+                     :cwd repo :no-worktree t)))
+    (unwind-protect
+        (should-not
+         (anvil-orchestrator--should-worktree
+          task (anvil-orchestrator--provider 'claude)))
+      (delete-directory repo t))))
+
+(ert-deftest anvil-orchestrator-test-should-worktree-detects-repo ()
+  "cwd inside a git repo + claude provider → worktree handling on."
+  (let* ((repo (anvil-orchestrator-test--make-repo))
+         (task (list :name "x" :provider 'claude :prompt "p" :cwd repo)))
+    (unwind-protect
+        (should (anvil-orchestrator--should-worktree
+                 task (anvil-orchestrator--provider 'claude)))
+      (delete-directory repo t))))
+
+(ert-deftest anvil-orchestrator-test-worktree-name-sanitises ()
+  (should (equal "anvil-orch-foo-bar-baz"
+                 (anvil-orchestrator--worktree-name-for
+                  (list :name "foo/bar baz")))))
+
+(defun anvil-orchestrator-test--make-repo ()
+  "Create a tiny disposable git repo and return its absolute path."
+  (let ((dir (make-temp-file "anvil-orch-repo-" t)))
+    (let ((default-directory (file-name-as-directory dir)))
+      (with-temp-buffer
+        (call-process "git" nil nil nil "init" "-q")
+        (call-process "git" nil nil nil "config" "user.email" "t@test")
+        (call-process "git" nil nil nil "config" "user.name"  "test")
+        (write-region "hi\n" nil (expand-file-name "README" dir))
+        (call-process "git" nil nil nil "add" "README")
+        (call-process "git" nil nil nil "commit" "-q" "-m" "init")))
+    dir))
+
+;;;; --- Phase 1b: :depends-on DAG -----------------------------------------
+
+(ert-deftest anvil-orchestrator-test-submit-rejects-unknown-dep ()
+  (anvil-orchestrator-test--with-fresh
+    (should-error
+     (anvil-orchestrator-submit
+      (list (list :name "a" :provider 'test :prompt "x"
+                  :depends-on '("ghost"))))
+     :type 'user-error)))
+
+(ert-deftest anvil-orchestrator-test-submit-rejects-dep-cycle ()
+  (anvil-orchestrator-test--with-fresh
+    (should-error
+     (anvil-orchestrator-submit
+      (list (list :name "a" :provider 'test :prompt "x"
+                  :depends-on '("b"))
+            (list :name "b" :provider 'test :prompt "y"
+                  :depends-on '("a"))))
+     :type 'user-error)))
+
+(ert-deftest anvil-orchestrator-test-dep-runs-after-parent-done ()
+  "Child task waits in queue until parent reaches `done'."
+  (anvil-orchestrator-test--with-fresh
+    (anvil-orchestrator-test--register-slow 0.3)
+    ;; Register parent as 'slow' + child as 'test'
+    (let ((batch (anvil-orchestrator-submit
+                  (list (list :name "parent" :provider 'slow :prompt "p")
+                        (list :name "child"  :provider 'test :prompt "c"
+                              :depends-on '("parent"))))))
+      (anvil-orchestrator-test--wait-batch batch 15)
+      (let* ((st (anvil-orchestrator-status batch))
+             (child (cl-find-if
+                     (lambda (t0) (equal "child" (plist-get t0 :name)))
+                     (plist-get st :tasks))))
+        (should (eq 'done (plist-get child :status)))
+        (should (= 2 (plist-get st :done)))))))
+
+(ert-deftest anvil-orchestrator-test-dep-propagates-failure ()
+  "If a dep fails, its dependents also flip to `failed'."
+  (anvil-orchestrator-test--with-fresh
+    (anvil-orchestrator-test--register-stub "" 2) ; failing test provider
+    (let ((batch (anvil-orchestrator-submit
+                  (list (list :name "bad"   :provider 'test :prompt "p"
+                              :auto-retry nil)
+                        (list :name "child" :provider 'test :prompt "c"
+                              :auto-retry nil
+                              :depends-on '("bad"))))))
+      (anvil-orchestrator-test--wait-batch batch 10)
+      (let* ((st (anvil-orchestrator-status batch))
+             (child (cl-find-if
+                     (lambda (t0) (equal "child" (plist-get t0 :name)))
+                     (plist-get st :tasks))))
+        (should (eq 'failed (plist-get child :status)))
+        (should (string-match-p "dependency bad" (plist-get child :error)))))))
+
+;;;; --- Phase 1b: stdout / stderr overflow --------------------------------
+
+(ert-deftest anvil-orchestrator-test-overflow-leaves-small-files-alone ()
+  (let* ((path (make-temp-file "anvil-orch-small-"))
+         (anvil-orchestrator-output-size-cap 1024))
+    (unwind-protect
+        (progn
+          (with-temp-file path (insert (make-string 200 ?a)))
+          (should-not (anvil-orchestrator--truncate-output-file path))
+          (should (= 200 (file-attribute-size (file-attributes path)))))
+      (delete-file path))))
+
+(ert-deftest anvil-orchestrator-test-overflow-truncates-large-files ()
+  (let* ((path (make-temp-file "anvil-orch-big-"))
+         (anvil-orchestrator-output-size-cap 400)
+         (anvil-orchestrator-output-head-bytes 100)
+         (anvil-orchestrator-output-tail-bytes 100))
+    (unwind-protect
+        (progn
+          (with-temp-file path
+            (dotimes (i 10)
+              (insert (format "%05d" i) (make-string 95 ?a) "\n")))
+          (let* ((orig (file-attribute-size (file-attributes path)))
+                 (returned (anvil-orchestrator--truncate-output-file path)))
+            (should (equal orig returned))
+            (let ((body (with-temp-buffer
+                          (insert-file-contents-literally path)
+                          (buffer-string))))
+              (should (string-match-p "truncated" body))
+              (should (string-match-p "\\`00000" body))
+              (should (< (length body)
+                         (+ 100 100 400 4096))))))
+      (delete-file path))))
 
 ;;;; --- live smoke test ---------------------------------------------------
 
