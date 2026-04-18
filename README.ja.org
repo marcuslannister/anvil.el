@@ -477,6 +477,7 @@ Anvil を使うと:
 | =ide=        | xref、診断、imenu、tree-sitter（オプション）   | project.el       |
 | =cron=       | ワーカーディスパッチ付きスケジュールタスクランナー | —            |
 | =elisp=      | エージェント向け Elisp 開発ツール（オプション）| —                |
+| =browser=    | agent-browser 経由の Web fetch / interact / capture / screenshot（オプション） | agent-browser CLI |
 
 * クイックスタート
 
@@ -596,12 +597,34 @@ user 向けです。
 (setq anvil-modules '(worker eval org file host git proc fs emacs text clipboard data net))
 
 ;; オプションモジュールを有効化
-(setq anvil-optional-modules '(xlsx pdf ide cron))
+(setq anvil-optional-modules '(xlsx pdf ide cron browser))
 
 ;; Anvil を起動
 (anvil-enable)
 (anvil-server-start)
 #+end_src
+
+** Browser モジュール（オプション）
+
+=browser= モジュールは [[https://agent-browser.dev/][agent-browser]] CLI をラップし、ページのアクセ
+シビリティツリー要約を MCP tool 1 call で取得できるようにします
+（生 DOM dump 比で typically 25× トークン節約）。
+
+#+begin_src shell
+npm install -g agent-browser
+agent-browser install   # 必要なら Chrome for Testing を取得
+#+end_src
+
+=browser= を =anvil-optional-modules= に追加すれば、=browser-fetch=、
+=browser-interact=、=browser-capture=、=browser-screenshot=、=browser-close=
+が MCP tool として登録されます。=browser-capture= の保存先は
+=anvil-browser-capture-dir= (defcustom) で変更可能。同じ URL の再取
+得は =anvil-browser-cache-ttl-sec= 秒（既定 300）以内なら in-memory
+キャッシュで応答します。
+
+Windows では agent-browser の Rust バイナリが Defender に誤検知され
+ることがあります。検知された場合は =%APPDATA%\npm\node_modules\agent-browser\bin\=
+を除外設定に追加してください。
 
 * クライアント設定 — AI を Anvil に接続する
 

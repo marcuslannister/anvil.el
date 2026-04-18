@@ -1,0 +1,621 @@
+;;; anvil-browser.el --- Browser automation for anvil -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2025-2026 zawatton
+
+;; This file is part of anvil.el.
+
+;; This program is free software; you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;;; Commentary:
+
+;; MCP tool wrapper around the `agent-browser' CLI
+;; (https://agent-browser.dev/, `npm install -g agent-browser').
+;;
+;; agent-browser ships an accessibility-tree + ref interface that
+;; compresses web page tokens by up to 25x for LLM consumption.  This
+;; module folds the usual four-step Claude workflow (open, snapshot,
+;; click, get) into a single MCP tool call so the client does not pay
+;; bash round-trip overhead between each step.
+;;
+;; Design doc: docs/design/07-browser-framework.org (Phase A).
+;;
+;; Transport: each tool call spawns one `agent-browser batch --json'
+;; subprocess via `make-process' with the command list piped on
+;; stdin.  This avoids shell quoting issues for URLs / JavaScript and
+;; keeps the Emacs server unblocked (accept-process-output yields).
+;;
+;; Public MCP tools (all under server-id "emacs-eval"):
+;;   browser-fetch       url [selector] [session]
+;;   browser-interact    url actions-json [session]
+;;   browser-capture     url [title] [tags] [session]
+;;   browser-screenshot  url [region] [session]
+;;   browser-close
+;;
+;; Cache (in-memory) de-duplicates same-URL fetches within
+;; `anvil-browser-cache-ttl-sec' seconds; set to 0 to disable.  The
+;; cache is per-Emacs-process and does not persist; Phase B extracts
+;; it into anvil-state for cross-session reuse.
+;;
+;; Hard runtime dependency: the agent-browser CLI must be on
+;; `exec-path'.  The module loads without it; calls error clearly.
+
+;;; Code:
+
+(require 'cl-lib)
+(require 'subr-x)
+(require 'json)
+(require 'anvil-server)
+
+;;;; --- configuration ------------------------------------------------------
+
+(defgroup anvil-browser nil
+  "Browser automation MCP tools for anvil (via agent-browser CLI)."
+  :group 'anvil
+  :prefix "anvil-browser-")
+
+(defconst anvil-browser--server-id "emacs-eval"
+  "MCP server id that anvil-browser tools register under.
+Shared with anvil-file / anvil-org / anvil-sqlite so the client
+sees one unified tool list.")
+
+(defcustom anvil-browser-cli "agent-browser"
+  "Name (or absolute path) of the agent-browser CLI.
+Resolved via `executable-find' when it is not absolute."
+  :type 'string
+  :group 'anvil-browser)
+
+(defcustom anvil-browser-session-name "anvil-default"
+  "Default value for the CLI's --session-name flag.
+agent-browser auto-saves cookies and localStorage under this name
+so repeated calls share login state.  Callers can override per
+tool invocation via the `session' argument."
+  :type 'string
+  :group 'anvil-browser)
+
+(defcustom anvil-browser-cache-ttl-sec 300
+  "Return a cached `browser-fetch' snapshot for the same URL within
+this many seconds.  Set to 0 to disable caching entirely."
+  :type 'integer
+  :group 'anvil-browser)
+
+(defcustom anvil-browser-timeout-sec 60
+  "Per-call timeout (seconds) for spawning the agent-browser CLI.
+Covers Chrome cold-start plus the full batch of commands."
+  :type 'integer
+  :group 'anvil-browser)
+
+(defcustom anvil-browser-metrics-log-size 20
+  "Number of recent fetch entries kept in `anvil-browser--metrics'.
+Surfaced by `anvil-browser-status'."
+  :type 'integer
+  :group 'anvil-browser)
+
+(defcustom anvil-browser-capture-dir
+  (expand-file-name "capture/web" "~/Cowork/Notes")
+  "Default directory for `browser-capture' output.
+Override per-project for non-Cowork users."
+  :type 'directory
+  :group 'anvil-browser)
+
+(defcustom anvil-browser-capture-template
+  "#+TITLE: %TITLE%
+#+DATE: %DATE%
+#+PROPERTY: TYPE web_summary
+#+PROPERTY: URL %URL%
+#+FILETAGS: %TAGS%
+
+%CONTENT%
+"
+  "Template used by `browser-capture' when generating the captured file.
+
+Either a STRING with %TITLE%, %DATE%, %URL%, %TAGS%, %CONTENT%
+placeholders, or a FUNCTION of one plist argument (same keys as
+keywords: :title :date :url :tags :content) that returns the
+rendered string.  The dual-type pattern mirrors
+`org-capture-templates'."
+  :type '(choice string function)
+  :group 'anvil-browser)
+
+;;;; --- internal state -----------------------------------------------------
+
+(defvar anvil-browser--cache (make-hash-table :test 'equal)
+  "URL+selector -> (:snapshot TEXT :fetched-at FLOAT-TIME) plist.
+Keys are `anvil-browser--cache-key' strings.")
+
+(defvar anvil-browser--metrics
+  (list :fetches 0 :cache-hits 0 :errors 0 :log nil)
+  "Rolling counters and recent-fetch log.
+:log is a list of (:url URL :elapsed-ms N :cached BOOL :at FLOAT-TIME).")
+
+;;;; --- internal helpers ---------------------------------------------------
+
+(defun anvil-browser--cli-path ()
+  "Return an absolute path to the agent-browser CLI or signal an error."
+  (or (and (file-name-absolute-p anvil-browser-cli)
+           (file-executable-p anvil-browser-cli)
+           anvil-browser-cli)
+      (executable-find anvil-browser-cli)
+      (user-error
+       "anvil-browser: '%s' not found on exec-path — install via 'npm install -g agent-browser'"
+       anvil-browser-cli)))
+
+(defun anvil-browser--cache-key (url selector)
+  "Build the hash-table key for URL + SELECTOR."
+  (format "%s\0%s" url (or selector "")))
+
+(defun anvil-browser--cache-get (url selector)
+  "Return cached snapshot text for URL+SELECTOR or nil when absent or stale."
+  (when (and (numberp anvil-browser-cache-ttl-sec)
+             (> anvil-browser-cache-ttl-sec 0))
+    (let* ((entry (gethash (anvil-browser--cache-key url selector)
+                           anvil-browser--cache)))
+      (when entry
+        (let ((age (- (float-time) (plist-get entry :fetched-at))))
+          (when (<= age anvil-browser-cache-ttl-sec)
+            (plist-get entry :snapshot)))))))
+
+(defun anvil-browser--cache-put (url selector snapshot)
+  "Store SNAPSHOT text in the cache under URL+SELECTOR.
+No-op when caching is disabled."
+  (when (and (numberp anvil-browser-cache-ttl-sec)
+             (> anvil-browser-cache-ttl-sec 0))
+    (puthash (anvil-browser--cache-key url selector)
+             (list :snapshot snapshot :fetched-at (float-time))
+             anvil-browser--cache)))
+
+(defun anvil-browser--metrics-bump (key &optional delta)
+  "Increment the counter at KEY in `anvil-browser--metrics' by DELTA (default 1)."
+  (let ((n (or (plist-get anvil-browser--metrics key) 0)))
+    (setq anvil-browser--metrics
+          (plist-put anvil-browser--metrics key (+ n (or delta 1))))))
+
+(defun anvil-browser--metrics-log (url elapsed-ms cached)
+  "Append a recent-fetch entry for URL with ELAPSED-MS and CACHED flag.
+Trims the log to `anvil-browser-metrics-log-size' entries."
+  (let* ((log (plist-get anvil-browser--metrics :log))
+         (entry (list :url url :elapsed-ms elapsed-ms
+                      :cached (and cached t) :at (float-time)))
+         (updated (cons entry log)))
+    (when (> (length updated) anvil-browser-metrics-log-size)
+      (setq updated (cl-subseq updated 0 anvil-browser-metrics-log-size)))
+    (setq anvil-browser--metrics
+          (plist-put anvil-browser--metrics :log updated))))
+
+(defun anvil-browser--json-encode-commands (commands)
+  "Encode COMMANDS (list of string lists) as a JSON array of arrays.
+Each inner list is (CMD ARG...) and becomes one agent-browser
+batch command."
+  (let ((json-false :json-false)
+        (json-null nil))
+    (json-encode
+     (mapcar (lambda (cmd)
+               (unless (and (listp cmd)
+                            (cl-every #'stringp cmd))
+                 (error "anvil-browser: command must be a list of strings: %S" cmd))
+               (vconcat cmd))
+             commands))))
+
+(defun anvil-browser--run-batch (commands &optional session)
+  "Spawn agent-browser with COMMANDS piped as JSON on stdin.
+
+COMMANDS is a list of string lists, e.g.
+  ((\"open\" \"https://example.com\") (\"snapshot\" \"-i\" \"-c\")).
+
+SESSION overrides `anvil-browser-session-name'.
+
+Returns the parsed JSON output (a list of per-command result
+plists).  Errors on non-zero exit, timeout, or invalid JSON."
+  (let* ((cli (anvil-browser--cli-path))
+         (session-name (or session anvil-browser-session-name))
+         (args (list "--session-name" session-name "batch" "--json"))
+         (payload (anvil-browser--json-encode-commands commands))
+         (stdout-buf (generate-new-buffer " *anvil-browser-stdout*"))
+         (stderr-buf (generate-new-buffer " *anvil-browser-stderr*"))
+         (process-coding-system-alist
+          (cons (cons "" (cons 'utf-8 'utf-8))
+                process-coding-system-alist))
+         proc)
+    (unwind-protect
+        (progn
+          (setq proc
+                (make-process
+                 :name "anvil-browser"
+                 :buffer stdout-buf
+                 :stderr stderr-buf
+                 :noquery t
+                 :connection-type 'pipe
+                 :coding 'utf-8
+                 :sentinel #'ignore
+                 :command (cons cli args)))
+          (process-send-string proc payload)
+          (process-send-eof proc)
+          (let ((deadline (+ (float-time) anvil-browser-timeout-sec)))
+            (while (and (process-live-p proc)
+                        (< (float-time) deadline))
+              (accept-process-output proc 0.1))
+            (when (process-live-p proc)
+              (delete-process proc)
+              (error "anvil-browser: timeout after %ss (commands=%d)"
+                     anvil-browser-timeout-sec (length commands))))
+          (let ((exit (process-exit-status proc))
+                (stdout (with-current-buffer stdout-buf (buffer-string)))
+                (stderr (with-current-buffer stderr-buf (buffer-string))))
+            (unless (eql exit 0)
+              (error "anvil-browser: exit %s: %s"
+                     exit (string-trim (or stderr stdout ""))))
+            (condition-case err
+                (json-parse-string stdout
+                                   :object-type 'plist
+                                   :array-type 'list
+                                   :null-object nil
+                                   :false-object nil)
+              (json-parse-error
+               (error "anvil-browser: could not parse CLI output: %s — %s"
+                      (error-message-string err)
+                      (string-trim stdout))))))
+      (when (buffer-live-p stdout-buf) (kill-buffer stdout-buf))
+      (when (buffer-live-p stderr-buf) (kill-buffer stderr-buf)))))
+
+(defun anvil-browser--last-snapshot (results)
+  "Return the snapshot text from the last snapshot-style result in RESULTS.
+Looks for the rightmost entry whose `:result' plist has a
+`:snapshot' key.  Returns nil when none is present."
+  (let ((found nil))
+    (dolist (r results)
+      (let* ((result (plist-get r :result))
+             (snap (and (listp result) (plist-get result :snapshot))))
+        (when snap (setq found snap))))
+    found))
+
+(defun anvil-browser--check-all-success (results)
+  "Error if any entry in RESULTS reports `:success' nil.
+Returns RESULTS when all succeeded."
+  (dolist (r results)
+    (unless (plist-get r :success)
+      (error "anvil-browser: command %S failed: %s"
+             (plist-get r :command)
+             (or (plist-get r :error) "(no error message)"))))
+  results)
+
+;;;; --- template rendering -------------------------------------------------
+
+(defun anvil-browser--subst-template (template plist)
+  "Substitute %TITLE% / %DATE% / %URL% / %TAGS% / %CONTENT% in TEMPLATE.
+PLIST supplies the values under the corresponding keywords.
+Unknown placeholders are left verbatim."
+  (let ((out template))
+    (dolist (cell '((:title . "%TITLE%") (:date . "%DATE%")
+                    (:url . "%URL%") (:tags . "%TAGS%")
+                    (:content . "%CONTENT%")))
+      (setq out (replace-regexp-in-string
+                 (regexp-quote (cdr cell))
+                 (or (plist-get plist (car cell)) "")
+                 out t t)))
+    out))
+
+(defun anvil-browser--render-capture (plist)
+  "Render `anvil-browser-capture-template' against PLIST.
+Accepts either a string template or a function of one argument."
+  (let ((tmpl anvil-browser-capture-template))
+    (cond
+     ((functionp tmpl) (funcall tmpl plist))
+     ((stringp tmpl)   (anvil-browser--subst-template tmpl plist))
+     (t (error "anvil-browser: invalid capture template type: %S" (type-of tmpl))))))
+
+(defun anvil-browser--capture-filename (dir)
+  "Return a new capture file path under DIR using web_YYYYMMDD_NN.org.
+Increments the counter until an unused path is found."
+  (unless (file-directory-p dir) (make-directory dir t))
+  (let* ((date (format-time-string "%Y%m%d"))
+         (n 1)
+         path)
+    (while (progn
+             (setq path (expand-file-name
+                         (format "web_%s_%02d.org" date n) dir))
+             (file-exists-p path))
+      (setq n (1+ n)))
+    path))
+
+(defun anvil-browser--normalize-tags (tags)
+  "Normalize TAGS (string or list) into an org :tag1:tag2: style string.
+Empty input returns the empty string."
+  (let ((items (cond
+                ((null tags) nil)
+                ((listp tags) tags)
+                ((stringp tags)
+                 (split-string tags "[[:space:],]+" t)))))
+    (if items
+        (concat ":" (mapconcat #'identity items ":") ":")
+      "")))
+
+;;;; --- MCP tool handlers --------------------------------------------------
+
+(defun anvil-browser--tool-fetch (url &optional selector session)
+  "Fetch URL and return a compact accessibility-tree snapshot.
+
+MCP Parameters:
+  url      - Absolute URL to open (string).
+  selector - Optional CSS selector to scope the snapshot to a
+             subtree (e.g. \"main article\").  Empty string is
+             treated as no selector.
+  session  - Optional --session-name override for persisting
+             cookies / localStorage separately from the default
+             session.
+
+Returns the accessibility tree text produced by
+`agent-browser snapshot -i -c'.  Same-URL calls within
+`anvil-browser-cache-ttl-sec' seconds are served from the
+in-memory cache.
+
+Token cost is typically 25x smaller than a raw DOM dump."
+  (anvil-server-with-error-handling
+   (let* ((sel (and (stringp selector) (not (string-empty-p selector)) selector))
+          (cached (anvil-browser--cache-get url sel))
+          (start (float-time)))
+     (anvil-browser--metrics-bump :fetches)
+     (if cached
+         (progn
+           (anvil-browser--metrics-bump :cache-hits)
+           (anvil-browser--metrics-log url 0 t)
+           cached)
+       (condition-case err
+           (let* ((snap-cmd (append '("snapshot" "-i" "-c")
+                                    (and sel (list "-s" sel))))
+                  (results (anvil-browser--check-all-success
+                            (anvil-browser--run-batch
+                             (list (list "open" url) snap-cmd)
+                             session)))
+                  (text (or (anvil-browser--last-snapshot results)
+                            (error "anvil-browser: no snapshot in batch output"))))
+             (anvil-browser--cache-put url sel text)
+             (anvil-browser--metrics-log
+              url (round (* 1000 (- (float-time) start))) nil)
+             text)
+         (error
+          (anvil-browser--metrics-bump :errors)
+          (signal (car err) (cdr err))))))))
+
+(defun anvil-browser--parse-actions (actions-json)
+  "Parse ACTIONS-JSON (string) into a list of string-lists.
+Each entry is one agent-browser batch command, e.g.
+  [[\"click\", \"@e1\"], [\"fill\", \"@e2\", \"hello\"]]"
+  (unless (and (stringp actions-json) (not (string-empty-p actions-json)))
+    (user-error "anvil-browser: actions must be a non-empty JSON array string"))
+  (let* ((parsed (condition-case err
+                     (json-parse-string actions-json
+                                        :array-type 'list
+                                        :null-object nil
+                                        :false-object nil)
+                   (json-parse-error
+                    (user-error "anvil-browser: invalid actions JSON: %s"
+                                (error-message-string err))))))
+    (unless (listp parsed)
+      (user-error "anvil-browser: actions JSON must be an array, got %s"
+                  (type-of parsed)))
+    (mapcar (lambda (cmd)
+              (unless (and (listp cmd) (cl-every #'stringp cmd))
+                (user-error
+                 "anvil-browser: each action must be an array of strings: %S"
+                 cmd))
+              cmd)
+            parsed)))
+
+(defun anvil-browser--tool-interact (url actions &optional session)
+  "Open URL, run each action in ACTIONS, and return the final snapshot.
+
+MCP Parameters:
+  url     - Absolute URL to open.
+  actions - JSON array of command arrays, e.g.
+            '[[\"click\",\"@e1\"],[\"fill\",\"@e2\",\"hi\"]]'.
+            Commands match the agent-browser CLI verbs
+            (click / fill / press / eval / etc.).
+  session - Optional --session-name override.
+
+The implementation prepends an `open' and appends a final
+`snapshot -i -c' so the return value is always the post-action
+tree.  All actions share one Chrome session to preserve DOM state."
+  (anvil-server-with-error-handling
+   (let* ((parsed (anvil-browser--parse-actions actions))
+          (batch (append (list (list "open" url))
+                         parsed
+                         (list '("snapshot" "-i" "-c"))))
+          (results (anvil-browser--check-all-success
+                    (anvil-browser--run-batch batch session))))
+     (or (anvil-browser--last-snapshot results)
+         (error "anvil-browser: interact produced no snapshot")))))
+
+(defun anvil-browser--tool-capture (url &optional title tags session)
+  "Fetch URL, render `anvil-browser-capture-template', and save to
+`anvil-browser-capture-dir'.
+
+MCP Parameters:
+  url     - Absolute URL to fetch and archive.
+  title   - Optional title for the captured org file.  Falls back
+            to the URL when empty.
+  tags    - Optional tag string; either space/comma-separated
+            words (\"ai automation\") or a ready-made org tag
+            string (\":ai:automation:\").
+  session - Optional --session-name override.
+
+Returns the absolute path of the saved file."
+  (anvil-server-with-error-handling
+   (let* ((snapshot (anvil-browser--tool-fetch url nil session))
+          (resolved-title (if (and (stringp title)
+                                   (not (string-empty-p title)))
+                              title
+                            url))
+          (norm-tags (anvil-browser--normalize-tags tags))
+          (plist (list :title resolved-title
+                       :date (format-time-string "<%Y-%m-%d %a>")
+                       :url url
+                       :tags norm-tags
+                       :content snapshot))
+          (rendered (anvil-browser--render-capture plist))
+          (path (anvil-browser--capture-filename anvil-browser-capture-dir)))
+     (let ((coding-system-for-write 'utf-8-unix))
+       (with-temp-buffer
+         (insert rendered)
+         (write-region (point-min) (point-max) path nil 'silent)))
+     path)))
+
+(defun anvil-browser--tool-screenshot (url &optional region session)
+  "Open URL and save a screenshot to a temp PNG file.
+
+MCP Parameters:
+  url     - Absolute URL to open.
+  region  - Optional CSS selector; when provided the screenshot
+            is scoped to that element (equivalent to
+            `agent-browser screenshot SELECTOR PATH').
+  session - Optional --session-name override.
+
+Returns the absolute path of the PNG file.  Caller owns cleanup."
+  (anvil-server-with-error-handling
+   (let* ((out (make-temp-file "anvil-browser-" nil ".png"))
+          (sel (and (stringp region)
+                    (not (string-empty-p region))
+                    region))
+          (shot-cmd (if sel
+                        (list "screenshot" sel out)
+                      (list "screenshot" out)))
+          (results (anvil-browser--check-all-success
+                    (anvil-browser--run-batch
+                     (list (list "open" url) shot-cmd)
+                     session))))
+     (ignore results)
+     out)))
+
+(defun anvil-browser--tool-close (&optional _ignored)
+  "Close every live agent-browser session.
+
+MCP Parameters:
+  (none — the argument is accepted for schema compat and ignored)
+
+Delegates to `agent-browser close --all'.  Safe to call when no
+sessions exist; the CLI is a no-op in that case."
+  (anvil-server-with-error-handling
+   (let* ((cli (anvil-browser--cli-path))
+          (stdout-buf (generate-new-buffer " *anvil-browser-close*"))
+          proc)
+     (unwind-protect
+         (progn
+           (setq proc
+                 (make-process
+                  :name "anvil-browser-close"
+                  :buffer stdout-buf
+                  :noquery t
+                  :sentinel #'ignore
+                  :command (list cli "close" "--all")))
+           (let ((deadline (+ (float-time) anvil-browser-timeout-sec)))
+             (while (and (process-live-p proc)
+                         (< (float-time) deadline))
+               (accept-process-output proc 0.1))
+             (when (process-live-p proc)
+               (delete-process proc)))
+           (clrhash anvil-browser--cache)
+           (format "%S"
+                   (list :ok t
+                         :exit (process-exit-status proc)
+                         :cache-cleared t)))
+       (when (buffer-live-p stdout-buf) (kill-buffer stdout-buf))))))
+
+;;;; --- status / introspection ---------------------------------------------
+
+;;;###autoload
+(defun anvil-browser-status ()
+  "Show fetch counters and recent-fetch log in *Anvil Browser*."
+  (interactive)
+  (with-help-window "*Anvil Browser*"
+    (princ (format "Anvil Browser — agent-browser wrapper\n"))
+    (princ (format "CLI       : %s\n"
+                   (or (ignore-errors (anvil-browser--cli-path))
+                       "(not found)")))
+    (princ (format "Session   : %s\n" anvil-browser-session-name))
+    (princ (format "Cache TTL : %s sec  (entries: %d)\n"
+                   anvil-browser-cache-ttl-sec
+                   (hash-table-count anvil-browser--cache)))
+    (princ (format "Fetches   : %d   cache-hits: %d   errors: %d\n"
+                   (or (plist-get anvil-browser--metrics :fetches) 0)
+                   (or (plist-get anvil-browser--metrics :cache-hits) 0)
+                   (or (plist-get anvil-browser--metrics :errors) 0)))
+    (princ "\nRecent fetches:\n")
+    (dolist (entry (plist-get anvil-browser--metrics :log))
+      (princ (format "  %5dms %s  %s\n"
+                     (or (plist-get entry :elapsed-ms) 0)
+                     (if (plist-get entry :cached) "HIT " "MISS")
+                     (plist-get entry :url))))))
+
+;;;; --- module lifecycle ---------------------------------------------------
+
+(defun anvil-browser--register-tools ()
+  "Register all browser-* MCP tools under `anvil-browser--server-id'."
+  (anvil-server-register-tool
+   #'anvil-browser--tool-fetch
+   :id "browser-fetch"
+   :server-id anvil-browser--server-id
+   :description
+   "Open a URL and return a compact accessibility-tree snapshot
+via agent-browser.  Typically 25x cheaper in tokens than a raw
+DOM dump.  Same-URL repeats within the cache TTL are served
+without relaunching Chrome."
+   :read-only t)
+
+  (anvil-server-register-tool
+   #'anvil-browser--tool-interact
+   :id "browser-interact"
+   :server-id anvil-browser--server-id
+   :description
+   "Open a URL and run a JSON array of agent-browser commands
+(click / fill / press / eval / …) in a single Chrome session,
+returning the final post-action accessibility tree.")
+
+  (anvil-server-register-tool
+   #'anvil-browser--tool-capture
+   :id "browser-capture"
+   :server-id anvil-browser--server-id
+   :description
+   "Fetch a URL and save it as an org file under
+`anvil-browser-capture-dir' using `anvil-browser-capture-template'.
+Returns the absolute path of the new file.")
+
+  (anvil-server-register-tool
+   #'anvil-browser--tool-screenshot
+   :id "browser-screenshot"
+   :server-id anvil-browser--server-id
+   :description
+   "Open a URL and save a PNG screenshot (optionally scoped to a
+CSS selector) to a temp file.  Returns the file path; the caller
+owns cleanup.")
+
+  (anvil-server-register-tool
+   #'anvil-browser--tool-close
+   :id "browser-close"
+   :server-id anvil-browser--server-id
+   :description
+   "Close every live agent-browser session and clear the in-memory
+fetch cache.  Safe when no sessions exist."))
+
+(defun anvil-browser--unregister-tools ()
+  "Remove every browser-* MCP tool from the shared server."
+  (dolist (id '("browser-fetch" "browser-interact" "browser-capture"
+                "browser-screenshot" "browser-close"))
+    (anvil-server-unregister-tool id anvil-browser--server-id)))
+
+;;;###autoload
+(defun anvil-browser-enable ()
+  "Register browser-* MCP tools.  Does not spawn a browser session.
+The first call to `browser-fetch' (or kin) lazily launches
+Chrome via agent-browser."
+  (interactive)
+  (anvil-browser--register-tools))
+
+(defun anvil-browser-disable ()
+  "Unregister browser-* MCP tools and close any live sessions."
+  (interactive)
+  (ignore-errors (anvil-browser--tool-close))
+  (anvil-browser--unregister-tools))
+
+(provide 'anvil-browser)
+;;; anvil-browser.el ends here

@@ -5,9 +5,12 @@
 
 * STATUS
 
-- Phase A (anvil-browser MVP): ~APPROVED~ (2026-04-17、初回レビュー完了)
-  — 実装着手可。Review Questions 4 件すべて resolved、Proposed Design
-  セクションの内容で fix
+- Phase A (anvil-browser MVP): ~SHIPPED~ (2026-04-18)
+  — ~anvil-browser.el~ + ~tests/anvil-browser-test.el~ (11 テスト
+  pass、live test 含む)。5 tool (~browser-fetch~ / ~-interact~ /
+  ~-capture~ / ~-screenshot~ / ~-close~) + in-memory cache +
+  metrics + ~M-x anvil-browser-status~。~anvil-optional-modules~ に
+  ~browser~ 追加で有効化
 - Phase B〜F: この doc 後半 "Next-Primitives Roadmap" で提案のみ、
   個別 doc は当該 phase 着手時に切り出す
 

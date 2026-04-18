@@ -498,6 +498,7 @@ budget goes to reasoning about your code, not re-reading it.
 | =ide=        | xref, diagnostics, imenu, tree-sitter (opt.)   | project.el       |
 | =cron=       | Scheduled task runner with worker dispatch      | —                |
 | =elisp=      | Agentic Elisp development tools (optional)     | —                |
+| =browser=    | Web fetch / interact / capture / screenshot via agent-browser (opt.) | agent-browser CLI |
 
 * Quick Start
 
@@ -618,12 +619,34 @@ risk.
 (setq anvil-modules '(worker eval org file host git proc fs emacs text clipboard data net))
 
 ;; Enable optional modules
-(setq anvil-optional-modules '(xlsx pdf ide cron))
+(setq anvil-optional-modules '(xlsx pdf ide cron browser))
 
 ;; Start anvil
 (anvil-enable)
 (anvil-server-start)
 #+end_src
+
+** Browser module (optional)
+
+The =browser= module wraps the [[https://agent-browser.dev/][agent-browser]] CLI so an MCP
+client can fetch an accessibility-tree snapshot of a page in a
+single tool call (typically 25× fewer tokens than a raw DOM dump).
+
+#+begin_src shell
+npm install -g agent-browser
+agent-browser install   # downloads Chrome for Testing if needed
+#+end_src
+
+Then add =browser= to =anvil-optional-modules= as shown above. The
+registered tools are =browser-fetch=, =browser-interact=,
+=browser-capture=, =browser-screenshot=, and =browser-close=.  Captured
+pages go to =anvil-browser-capture-dir= (defcustom). Same-URL
+fetches within =anvil-browser-cache-ttl-sec= seconds (default 300)
+are served from the in-memory cache.
+
+On Windows, the agent-browser Rust binary is occasionally flagged
+by Defender; whitelist =%APPDATA%\npm\node_modules\agent-browser\bin\=
+if you hit that.
 
 * Client setup — connecting your AI to Anvil
 

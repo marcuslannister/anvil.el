@@ -82,7 +82,10 @@ These are not loaded by default.  Available modules:
 - `dev'       — Developer helpers: `anvil-self-sync-check' for dev/installed
                 git HEAD mismatch detection
 - `offload'   — Future-based API for running heavy elisp in a batch
-                subprocess (Doc 03 Phase 1)"
+                subprocess (Doc 03 Phase 1)
+- `browser'   — agent-browser CLI wrapper: fetch / interact / capture
+                / screenshot (requires `agent-browser' on PATH,
+                Doc 07 Phase A)"
   :type '(repeat symbol)
   :group 'anvil)
 
