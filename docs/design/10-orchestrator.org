@@ -7,7 +7,7 @@
   :PROPERTIES:
   :ID:       019da30b-92e3-7674-976d-020f7465940b
   :END:
-~Phase 1a + 1b + 2 + 2b + 3 SHIPPED (develop branch)~ (2026-04-19)
+~Phase 1a + 1b + 2 + 2b + 3 + 3b SHIPPED (develop branch)~ (2026-04-19)
 
 - Phase 1a (commit 45468b2): provider abstraction, claude provider,
   spawn + sentinel + timeout, pool + concurrency cap, state
@@ -44,8 +44,19 @@
   anvil-orchestrator-test.el, 369 total across the suite, 2 live
   skips).
 
-Phase 3b (ollama native), 4 (consensus) は design 残し。Review
-Questions Q1-Q12 resolved 状態キープ。
+- Phase 3b (commit 4af336c, branch feat/orchestrator-phase-3b):
+  ollama native provider for zero-cost local inference.  argv
+  =ollama run MODEL PROMPT [extra-args]=, plain-text tail summary
+  with pull-progress + --verbose eval stats filtered out, cost
+  estimator always 0.  Capabilities: tool-use=nil (CLI plain,
+  tool use needs HTTP API), worktree=nil, budget=nil (moot —
+  local/free), sys-prompt-append=nil (=ollama run= CLI has no
+  system flag; use custom Modelfile for per-model system).
+  ERT +7 (= 65 pass / 1 live skip in anvil-orchestrator-test.el,
+  376 total across the suite, 2 live skips).
+
+Phase 4 (cross-model consensus) は design 残し。Review Questions
+Q1-Q12 resolved 状態キープ。
 
 * Goal
 
