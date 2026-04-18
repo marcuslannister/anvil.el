@@ -670,6 +670,113 @@ lines and a small set of known log prefixes."
  :default-model                 "gemini-2.5-flash"
  :cost-estimator #'anvil-orchestrator--gemini-cost)
 
+;;;; --- ollama provider (Phase 3b, built-in) ------------------------------
+
+(defcustom anvil-orchestrator-ollama-default-model "llama3.2"
+  "Default `ollama run' model name when a task omits :model.
+Must reference a model already pulled via `ollama pull MODEL'."
+  :type 'string
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-ollama-extra-args nil
+  "Extra argv appended verbatim to every `ollama run' invocation.
+Useful for flags like `--keepalive 5m' or `--verbose'."
+  :type '(repeat string)
+  :group 'anvil-orchestrator)
+
+(defun anvil-orchestrator--ollama-check ()
+  "Return t when the `ollama' CLI is on `exec-path'."
+  (if (executable-find "ollama") t
+    (error "anvil-orchestrator: `ollama' CLI not found on exec-path")))
+
+(defun anvil-orchestrator--ollama-cost (_task)
+  "Return 0 — Ollama runs locally, no per-token billing."
+  0.0)
+
+(defun anvil-orchestrator--ollama-build-cmd (task)
+  "Build the `ollama run' command line for TASK plist.
+Uses `ollama run MODEL PROMPT' for single-shot non-interactive
+invocation.  Extra argv from
+`anvil-orchestrator-ollama-extra-args' follows after positional
+args."
+  (let* ((model   (or (plist-get task :model)
+                      anvil-orchestrator-ollama-default-model))
+         (prompt  (plist-get task :prompt))
+         (cmd     (list (executable-find "ollama")
+                        "run" model prompt)))
+    (if anvil-orchestrator-ollama-extra-args
+        (append cmd anvil-orchestrator-ollama-extra-args)
+      cmd)))
+
+(defconst anvil-orchestrator--ollama-skip-prefix-re
+  (concat "\\`\\(?:"
+          "pulling manifest\\|"
+          "pulling \\|"
+          "verifying\\|"
+          "writing manifest\\|"
+          "success\\|"
+          "total duration:\\|"
+          "load duration:\\|"
+          "prompt eval count:\\|"
+          "prompt eval duration:\\|"
+          "prompt eval rate:\\|"
+          "eval count:\\|"
+          "eval duration:\\|"
+          "eval rate:"
+          "\\)")
+  "Prefixes identifying non-content ollama CLI log / stats lines.
+Stripped by `anvil-orchestrator--ollama-parse-output' when
+building the tail summary.")
+
+(defun anvil-orchestrator--ollama-parse-output (stdout-path stderr-path exit-code)
+  "Parse ollama STDOUT-PATH plain text into a summary plist.
+Returns (:summary STR :cost-usd NIL :cost-tokens NIL
+:commit-sha NIL :auto-retry-code SYM).  Strips `ollama run
+--verbose' eval stats footer + any pull-progress prefixes."
+  (let (summary)
+    (condition-case _err
+        (when (file-readable-p stdout-path)
+          (with-temp-buffer
+            (insert-file-contents stdout-path)
+            (let* ((sz (buffer-size))
+                   (tail-start (max (point-min) (- (point-max)
+                                                   (min sz 4096))))
+                   (lines nil))
+              (goto-char tail-start)
+              (while (not (eobp))
+                (let ((line (buffer-substring-no-properties
+                             (point) (line-end-position))))
+                  (unless (or (string-empty-p (string-trim line))
+                              (string-match-p
+                               anvil-orchestrator--ollama-skip-prefix-re
+                               line))
+                    (push line lines)))
+                (forward-line 1))
+              (when lines
+                (setq summary (mapconcat #'identity
+                                         (nreverse lines) "\n"))))))
+      (error nil))
+    (list :summary         (anvil-orchestrator--truncate-summary summary)
+          :cost-usd        nil
+          :cost-tokens     nil
+          :commit-sha      nil
+          :auto-retry-code (and (not summary)
+                                (anvil-orchestrator--stderr-retry-code
+                                 stderr-path exit-code)))))
+
+(anvil-orchestrator-register-provider
+ 'ollama
+ :cli "ollama"
+ :version-check #'anvil-orchestrator--ollama-check
+ :build-cmd     #'anvil-orchestrator--ollama-build-cmd
+ :parse-output  #'anvil-orchestrator--ollama-parse-output
+ :supports-tool-use             nil
+ :supports-worktree             nil
+ :supports-budget               nil
+ :supports-system-prompt-append nil
+ :default-model                 "llama3.2"
+ :cost-estimator #'anvil-orchestrator--ollama-cost)
+
 ;;;; --- UUID + internal state ---------------------------------------------
 
 (defun anvil-orchestrator--uuid ()

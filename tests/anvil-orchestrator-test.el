@@ -865,6 +865,139 @@ Registered under a distinct provider symbol so the built-in
         (should-not (string-match-p "Loaded cached"
                                     (plist-get r :summary)))))))
 
+;;;; --- Phase 3b: ollama provider -----------------------------------------
+
+(ert-deftest anvil-orchestrator-test-ollama-provider-registered ()
+  "Built-in `ollama' provider is registered on load."
+  (let ((prov (anvil-orchestrator--provider 'ollama)))
+    (should (anvil-orchestrator-provider-p prov))
+    (should (equal "ollama" (anvil-orchestrator-provider-cli prov)))
+    (should-not (anvil-orchestrator-provider-supports-tool-use prov))
+    (should-not (anvil-orchestrator-provider-supports-worktree prov))
+    (should-not (anvil-orchestrator-provider-supports-budget prov))
+    (should-not (anvil-orchestrator-provider-supports-system-prompt-append
+                 prov))
+    (should (equal "llama3.2"
+                   (anvil-orchestrator-provider-default-model prov)))))
+
+(ert-deftest anvil-orchestrator-test-ollama-build-cmd-basic ()
+  "`ollama' build-cmd emits `run MODEL PROMPT' positionals."
+  (cl-letf (((symbol-function 'executable-find)
+             (lambda (_) "/usr/bin/ollama")))
+    (let ((cmd (anvil-orchestrator--ollama-build-cmd
+                (list :prompt "summarize readme"
+                      :model "qwen2.5-coder"))))
+      (should (equal "/usr/bin/ollama"   (nth 0 cmd)))
+      (should (equal "run"               (nth 1 cmd)))
+      (should (equal "qwen2.5-coder"     (nth 2 cmd)))
+      (should (equal "summarize readme"  (nth 3 cmd))))))
+
+(ert-deftest anvil-orchestrator-test-ollama-build-cmd-default-model ()
+  "`ollama' build-cmd falls back to `anvil-orchestrator-ollama-default-model'."
+  (let ((anvil-orchestrator-ollama-default-model "llama3.2"))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (_) "/usr/bin/ollama")))
+      (let ((cmd (anvil-orchestrator--ollama-build-cmd
+                  (list :prompt "x"))))
+        (should (member "llama3.2" cmd))))))
+
+(ert-deftest anvil-orchestrator-test-ollama-build-cmd-extra-args ()
+  "`anvil-orchestrator-ollama-extra-args' is appended after positionals."
+  (let ((anvil-orchestrator-ollama-extra-args '("--keepalive" "5m")))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (_) "/usr/bin/ollama")))
+      (let ((cmd (anvil-orchestrator--ollama-build-cmd
+                  (list :prompt "p" :model "llama3.2"))))
+        (should (member "--keepalive" cmd))
+        (should (member "5m"          cmd))))))
+
+(ert-deftest anvil-orchestrator-test-ollama-parse-output-plain-text ()
+  "Parser extracts tail summary from ollama plain-text stdout,
+dropping --verbose eval stats and any pull-progress prefixes."
+  (let ((path (make-temp-file "ollama-out-")))
+    (unwind-protect
+        (progn
+          (write-region
+           (concat
+            "pulling manifest\n"
+            "pulling abcdef...    \n"
+            "verifying sha256 digest\n"
+            "writing manifest\n"
+            "success\n"
+            "\n"
+            "The repository defines an Emacs orchestrator package.\n"
+            "Key ideas: provider abstraction, worktree isolation, cost tracking.\n"
+            "\n"
+            "total duration:       2.341s\n"
+            "load duration:        120ms\n"
+            "prompt eval count:    42 tokens\n"
+            "prompt eval duration: 321ms\n"
+            "prompt eval rate:     130 tokens/s\n"
+            "eval count:           85 tokens\n"
+            "eval duration:        1.2s\n"
+            "eval rate:            71 tokens/s\n")
+           nil path nil 'silent)
+          (let ((parsed (anvil-orchestrator--ollama-parse-output path nil 0)))
+            (should (stringp (plist-get parsed :summary)))
+            (should (string-match-p "orchestrator package"
+                                    (plist-get parsed :summary)))
+            (should-not (string-match-p "pulling manifest"
+                                        (plist-get parsed :summary)))
+            (should-not (string-match-p "eval count:"
+                                        (plist-get parsed :summary)))
+            (should-not (string-match-p "total duration:"
+                                        (plist-get parsed :summary)))
+            (should-not (plist-get parsed :cost-usd))
+            (should-not (plist-get parsed :commit-sha))))
+      (delete-file path))))
+
+(ert-deftest anvil-orchestrator-test-ollama-cost-always-zero ()
+  "`anvil-orchestrator--ollama-cost' returns 0 for every task (local)."
+  (should (= 0 (anvil-orchestrator--ollama-cost
+                (list :prompt "hi" :model "llama3.2"))))
+  (should (= 0 (anvil-orchestrator--ollama-cost
+                (list :prompt (make-string 10000 ?x)
+                      :model "qwen2.5-coder")))))
+
+(ert-deftest anvil-orchestrator-test-ollama-end-to-end-stub ()
+  "End-to-end: stub ollama via sh routed through the ollama parser.
+Registered under a distinct provider symbol so the built-in
+`ollama' descriptor isn't overwritten for the rest of the suite."
+  (anvil-orchestrator-test--with-fresh
+    (anvil-orchestrator-register-provider
+     'ollama-stub
+     :cli "sh"
+     :version-check (lambda () t)
+     :build-cmd (lambda (_task)
+                  (list "sh" "-c"
+                        (concat
+                         "printf 'pulling manifest\\n"
+                         "success\\n\\n"
+                         "Your summary here.\\n"
+                         "It references the orchestrator module.\\n\\n"
+                         "total duration: 1.5s\\n"
+                         "eval count: 42 tokens\\n'")))
+     :parse-output #'anvil-orchestrator--ollama-parse-output
+     :supports-tool-use nil
+     :supports-worktree nil
+     :default-model "llama3.2"
+     :cost-estimator #'anvil-orchestrator--ollama-cost)
+    (let* ((batch (anvil-orchestrator-submit
+                   (list (list :name "ollama-stub"
+                               :provider 'ollama-stub
+                               :prompt   "summarize"
+                               :no-worktree t)))))
+      (anvil-orchestrator-test--wait-batch batch 5)
+      (let ((r (car (anvil-orchestrator-collect batch))))
+        (should (eq 'done (plist-get r :status)))
+        (should (stringp (plist-get r :summary)))
+        (should (string-match-p "orchestrator module"
+                                (plist-get r :summary)))
+        (should-not (string-match-p "pulling manifest"
+                                    (plist-get r :summary)))
+        (should-not (string-match-p "total duration"
+                                    (plist-get r :summary)))))))
+
 ;;;; --- cron integration (Phase 2b) ---------------------------------------
 
 (require 'anvil-cron)
