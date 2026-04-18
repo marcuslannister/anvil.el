@@ -281,6 +281,72 @@ subprocess left behind by BODY before removing the work dir."
         (should (string-match-p "daemon restart"
                                 (plist-get restored :error)))))))
 
+;;;; --- provider-common helpers ------------------------------------------
+
+(ert-deftest anvil-orchestrator-test-truncate-summary-clamps ()
+  "Summary over the cap is clamped + suffixed with an ellipsis."
+  (let* ((anvil-orchestrator-summary-max-chars 10)
+         (result (anvil-orchestrator--truncate-summary
+                  (make-string 25 ?x))))
+    (should (equal (concat (make-string 10 ?x) "…") result))))
+
+(ert-deftest anvil-orchestrator-test-truncate-summary-trims-whitespace ()
+  (should (equal "hello"
+                 (anvil-orchestrator--truncate-summary
+                  "  hello  \n"))))
+
+(ert-deftest anvil-orchestrator-test-truncate-summary-handles-nil-and-empty ()
+  (should-not (anvil-orchestrator--truncate-summary nil))
+  (should-not (anvil-orchestrator--truncate-summary ""))
+  (should-not (anvil-orchestrator--truncate-summary "   \n\t  ")))
+
+(ert-deftest anvil-orchestrator-test-stderr-retry-code-http ()
+  "HTTP 429 / 5xx on stderr maps to an integer retry code."
+  (let ((err (make-temp-file "anvil-retry-")))
+    (unwind-protect
+        (progn
+          (write-region "HTTP 502 Bad Gateway\n" nil err nil 'silent)
+          (should (equal 502
+                         (anvil-orchestrator--stderr-retry-code err 1))))
+      (delete-file err))))
+
+(ert-deftest anvil-orchestrator-test-stderr-retry-code-network ()
+  "Generic network keywords on stderr map to `network'."
+  (let ((err (make-temp-file "anvil-retry-")))
+    (unwind-protect
+        (progn
+          (write-region "connect ECONNRESET something\n" nil err nil 'silent)
+          (should (equal 'network
+                         (anvil-orchestrator--stderr-retry-code err 1))))
+      (delete-file err))))
+
+(ert-deftest anvil-orchestrator-test-stderr-retry-code-none ()
+  "No retryable pattern → nil.  Also nil for exit 0 or missing path."
+  (let ((err (make-temp-file "anvil-retry-")))
+    (unwind-protect
+        (progn
+          (write-region "some unrelated message\n" nil err nil 'silent)
+          (should-not (anvil-orchestrator--stderr-retry-code err 1))
+          ;; Exit 0 short-circuits the scan.
+          (write-region "HTTP 503 should be ignored\n" nil err nil 'silent)
+          (should-not (anvil-orchestrator--stderr-retry-code err 0)))
+      (delete-file err)))
+  ;; Missing path is a silent nil.
+  (should-not (anvil-orchestrator--stderr-retry-code
+               "/does/not/exist/stderr.txt" 1)))
+
+(ert-deftest anvil-orchestrator-test-argv-append-when ()
+  "Appends ITEMS only when the predicate is non-nil; does not mutate CMD."
+  (let ((cmd '("a" "b")))
+    (should (equal '("a" "b" "c")
+                   (anvil-orchestrator--argv-append-when cmd t "c")))
+    (should (equal '("a" "b")
+                   (anvil-orchestrator--argv-append-when cmd nil "c")))
+    ;; Original intact.
+    (should (equal '("a" "b") cmd)))
+  (should (equal '("x" "y" "z")
+                 (anvil-orchestrator--argv-append-when '("x") t "y" "z"))))
+
 ;;;; --- parser -------------------------------------------------------------
 
 (ert-deftest anvil-orchestrator-test-parse-stream-json-extracts-usage ()

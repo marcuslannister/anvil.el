@@ -212,6 +212,60 @@ that are already keywords)."
       (user-error "anvil-orchestrator: unknown provider %S (registered: %S)"
                   id (hash-table-keys anvil-orchestrator--providers))))
 
+;;;; --- provider-common helpers -------------------------------------------
+
+(defconst anvil-orchestrator--retry-http-re
+  "\\b\\(429\\|500\\|502\\|503\\|504\\)\\b"
+  "Regex matching retryable HTTP status codes on stderr.
+First capture group is the numeric code.")
+
+(defconst anvil-orchestrator--retry-network-re
+  "\\b\\(network\\|ECONNRESET\\|ETIMEDOUT\\|EAI_AGAIN\\)\\b"
+  "Regex matching generic network-failure keywords on stderr.")
+
+(defun anvil-orchestrator--stderr-retry-code (stderr-path exit-code)
+  "Scan STDERR-PATH (first 8 KiB) and return a retry-code symbol or nil.
+
+Returns an integer for HTTP status matches (429 / 5xx), the
+symbol `network' for generic network errors, or nil when no known
+retryable pattern is present.  Reads nothing when EXIT-CODE is
+zero or the path is not readable, so callers can unconditionally
+plug this into their parse-output epilogue."
+  (when (and (integerp exit-code)
+             (not (zerop exit-code))
+             (stringp stderr-path)
+             (file-readable-p stderr-path))
+    (with-temp-buffer
+      (insert-file-contents stderr-path nil 0 8192)
+      (goto-char (point-min))
+      (cond
+       ((re-search-forward anvil-orchestrator--retry-http-re nil t)
+        (string-to-number (match-string 1)))
+       ((progn (goto-char (point-min))
+               (re-search-forward anvil-orchestrator--retry-network-re
+                                  nil t))
+        'network)))))
+
+(defun anvil-orchestrator--truncate-summary (summary)
+  "Trim SUMMARY and clamp it to `anvil-orchestrator-summary-max-chars'.
+Appends an ellipsis when truncation happened.  Returns nil when
+SUMMARY is nil or an empty string so callers can treat the result
+as the canonical `:summary' slot value."
+  (when (and (stringp summary) (not (string-empty-p summary)))
+    (let ((trimmed (string-trim summary)))
+      (cond
+       ((string-empty-p trimmed) nil)
+       ((> (length trimmed) anvil-orchestrator-summary-max-chars)
+        (concat (substring trimmed 0 anvil-orchestrator-summary-max-chars)
+                "…"))
+       (t trimmed)))))
+
+(defun anvil-orchestrator--argv-append-when (cmd test &rest items)
+  "Return CMD with ITEMS appended iff TEST is non-nil.
+Collapses the `(setq cmd (append cmd (list ...)))' pattern that
+every provider build-cmd repeats.  Does not mutate CMD."
+  (if test (append cmd items) cmd))
+
 ;;;; --- claude provider (built-in) -----------------------------------------
 
 (defconst anvil-orchestrator--claude-price-table
@@ -271,14 +325,14 @@ provider natively supports it)."
                          "--model" model
                          "--permission-mode" perm
                          "--max-budget-usd" (format "%s" budget))))
-    (when append-p
-      (setq cmd (append cmd (list "--append-system-prompt" append-p))))
-    (when allowed
-      (setq cmd (append cmd (list "--allowedTools" allowed))))
-    (when bare
-      (setq cmd (append cmd (list "--bare"))))
-    (when wt-name
-      (setq cmd (append cmd (list "--worktree" wt-name))))
+    (setq cmd (anvil-orchestrator--argv-append-when
+               cmd append-p "--append-system-prompt" append-p))
+    (setq cmd (anvil-orchestrator--argv-append-when
+               cmd allowed  "--allowedTools" allowed))
+    (setq cmd (anvil-orchestrator--argv-append-when
+               cmd bare     "--bare"))
+    (setq cmd (anvil-orchestrator--argv-append-when
+               cmd wt-name  "--worktree" wt-name))
     ;; Prompt is the positional argument; CLI treats remaining argv as prompt.
     (append cmd (list prompt))))
 
@@ -286,7 +340,7 @@ provider natively supports it)."
   "Parse STDOUT-PATH (stream-json NDJSON) into a summary plist.
 Returns (:summary STR :cost-usd FLOAT :cost-tokens PLIST
 :commit-sha NIL :auto-retry-code SYM) — missing fields are nil."
-  (let (summary cost-usd tokens retry-code)
+  (let (summary cost-usd tokens)
     (condition-case _err
         (with-temp-buffer
           (insert-file-contents stdout-path)
@@ -314,28 +368,13 @@ Returns (:summary STR :cost-usd FLOAT :cost-tokens PLIST
                                 :cache-read  (plist-get usage :cache_read_input_tokens)))))))
             (forward-line 1)))
       (error nil))
-    ;; crude auto-retry heuristic: look at stderr for HTTP errors
-    (when (and (not summary) (integerp exit-code) (not (zerop exit-code))
-               (file-readable-p stderr-path))
-      (with-temp-buffer
-        (insert-file-contents stderr-path nil 0 8192)
-        (goto-char (point-min))
-        (cond
-         ((re-search-forward "\\b\\(429\\|500\\|502\\|503\\|504\\)\\b" nil t)
-          (setq retry-code (string-to-number (match-string 1))))
-         ((re-search-forward "\\b\\(network\\|ECONNRESET\\|ETIMEDOUT\\|EAI_AGAIN\\)\\b" nil t)
-          (setq retry-code 'network)))))
-    (when summary
-      (setq summary (string-trim summary))
-      (when (> (length summary) anvil-orchestrator-summary-max-chars)
-        (setq summary (concat
-                       (substring summary 0 anvil-orchestrator-summary-max-chars)
-                       "…"))))
-    (list :summary         summary
+    (list :summary         (anvil-orchestrator--truncate-summary summary)
           :cost-usd        cost-usd
           :cost-tokens     tokens
           :commit-sha      nil
-          :auto-retry-code retry-code)))
+          :auto-retry-code (and (not summary)
+                                (anvil-orchestrator--stderr-retry-code
+                                 stderr-path exit-code)))))
 
 (anvil-orchestrator-register-provider
  'claude
@@ -423,14 +462,15 @@ flags and before any positional file list."
                           "--no-show-release-notes"
                           "--no-analytics"
                           "--no-pretty")))
-    (when no-auto
-      (setq cmd (append cmd (list "--no-auto-commits"))))
-    (when subtree
-      (setq cmd (append cmd (list "--subtree-only"))))
+    (setq cmd (anvil-orchestrator--argv-append-when
+               cmd no-auto "--no-auto-commits"))
+    (setq cmd (anvil-orchestrator--argv-append-when
+               cmd subtree "--subtree-only"))
     (dolist (ro read-only)
-      (setq cmd (append cmd (list "--read" ro))))
-    (when anvil-orchestrator-aider-extra-args
-      (setq cmd (append cmd anvil-orchestrator-aider-extra-args)))
+      (setq cmd (anvil-orchestrator--argv-append-when cmd ro "--read" ro)))
+    (setq cmd (if anvil-orchestrator-aider-extra-args
+                  (append cmd anvil-orchestrator-aider-extra-args)
+                cmd))
     (append cmd files)))
 
 (defconst anvil-orchestrator--aider-skip-prefix-re
@@ -453,7 +493,7 @@ setup / diff / stat noise when extracting the summary tail.")
 Extracts the last commit SHA (from `^Commit [0-9a-f]+ '), takes
 the tail non-diff paragraph as the summary, and heuristically
 maps stderr HTTP / network errors to auto-retry codes."
-  (let (summary commit-sha retry-code)
+  (let (summary commit-sha)
     (condition-case _err
         (when (file-readable-p stdout-path)
           (with-temp-buffer
@@ -477,31 +517,16 @@ maps stderr HTTP / network errors to auto-retry codes."
                     (push line lines)))
                 (forward-line 1))
               (when lines
-                (setq summary
-                      (string-trim
-                       (mapconcat #'identity (nreverse lines) "\n")))))))
+                (setq summary (mapconcat #'identity
+                                         (nreverse lines) "\n"))))))
       (error nil))
-    (when (and (not summary) (integerp exit-code) (not (zerop exit-code))
-               (file-readable-p stderr-path))
-      (with-temp-buffer
-        (insert-file-contents stderr-path nil 0 8192)
-        (goto-char (point-min))
-        (cond
-         ((re-search-forward "\\b\\(429\\|500\\|502\\|503\\|504\\)\\b" nil t)
-          (setq retry-code (string-to-number (match-string 1))))
-         ((re-search-forward "\\b\\(network\\|ECONNRESET\\|ETIMEDOUT\\|EAI_AGAIN\\)\\b" nil t)
-          (setq retry-code 'network)))))
-    (when summary
-      (when (> (length summary) anvil-orchestrator-summary-max-chars)
-        (setq summary (concat
-                       (substring summary 0
-                                  anvil-orchestrator-summary-max-chars)
-                       "…"))))
-    (list :summary         summary
+    (list :summary         (anvil-orchestrator--truncate-summary summary)
           :cost-usd        nil
           :cost-tokens     nil
           :commit-sha      commit-sha
-          :auto-retry-code retry-code)))
+          :auto-retry-code (and (not summary)
+                                (anvil-orchestrator--stderr-retry-code
+                                 stderr-path exit-code)))))
 
 (anvil-orchestrator-register-provider
  'aider
