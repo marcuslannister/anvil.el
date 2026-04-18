@@ -169,6 +169,20 @@ while read -r line; do
 		base64_response="${base64_response//\\\"/\"}"
 	fi
 
+	# Repair Windows MSYS frame-boundary corruption.
+	# emacsclient.c uses a read buffer of BUFSIZ+1 bytes; on MSYS / mingw
+	# stdio.h, BUFSIZ is 512.  The Emacs server's `server-reply-print'
+	# splits its output into frames of up to `server-msg-size' (1024 by
+	# default), so on Windows every frame larger than ~512 bytes overruns
+	# the client's read buffer.  When that happens, the tail of the frame
+	# loses its `-print-nonl ' prefix and emacsclient prints it as
+	#   *ERROR*: Unknown message: <tail>
+	# interleaved with the legitimate base64 payload.  Strip those
+	# injection markers and rejoin so `base64 -d' sees clean input.
+	# (No-op on Linux/macOS where one frame fits in one read.)
+	base64_response=$(printf '%s' "$base64_response" \
+		| awk 'BEGIN{ORS=""} {sub(/^\*ERROR\*: Unknown message: /, ""); print}')
+
 	# Decode the base64 content
 	formatted_response=$(echo -n "$base64_response" | base64 -d)
 
