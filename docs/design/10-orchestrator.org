@@ -4,21 +4,26 @@
 #+property: status DRAFT
 
 * STATUS
-~Phase 1a + 1b SHIPPED~ (2026-04-18)
+~Phase 1a + 1b + 2 SHIPPED~ (2026-04-18)
 
 - Phase 1a (commit 45468b2): provider abstraction, claude provider,
   spawn + sentinel + timeout, pool + concurrency cap, state
   persist + restore, 5 MCP tools, tabulated-list dashboard, 18 ERT
   pass
-- Phase 1b (commit TBD, branch feat/orchestrator-phase-1b): git
-  worktree isolation (claude native + anvil-side fallback),
-  =:depends-on= DAG with cycle / unknown-name detection +
-  propagating failure semantics, stdout/stderr head + tail
-  truncation at the 1 MB cap. ERT +12 (= 30 pass / 1 live skip)
+- Phase 1b (commit 6675755): git worktree isolation (claude native
+  + anvil-side fallback), =:depends-on= DAG with cycle / unknown-name
+  detection + propagating failure semantics, stdout/stderr head +
+  tail truncation at the 1 MB cap. ERT +12 (= 30 pass / 1 live skip)
+- Phase 2 (commit TBD, branch feat/orchestrator-phase-2): aider
+  provider (middleware to OpenAI / Anthropic / Gemini / Ollama)
+  with =--message= non-interactive build-cmd, commit-SHA + tail
+  summary parser, stderr 429/5xx retry-code mapping, vendor-keyed
+  cost estimator. ERT +11 (= 40 pass / 1 live skip).  Worktree
+  isolation is handled by the generic anvil-side fallback shipped
+  in Phase 1b.
 
-Phase 2 (aider middleware), 2b (anvil-cron), 3/3b (gemini /
-ollama native), 4 (consensus) は design 残し。Review Questions
-Q1-Q12 resolved 状態キープ。
+Phase 2b (anvil-cron), 3/3b (gemini / ollama native), 4 (consensus)
+は design 残し。Review Questions Q1-Q12 resolved 状態キープ。
 
 * Goal
 
@@ -661,11 +666,16 @@ Phase 1a 単体で「Claude CLI ユーザーが Emacs から多並列 dispatch�
 3. stdout/stderr overflow (Doc 09 と同 pattern)
 4. ERT +6
 
-** Phase 2 — aider middleware (所要 2-3 日)
+** Phase 2 — aider middleware (所要 2-3 日) — SHIPPED
 
 1. aider provider descriptor (=aider --model <vendor/model> --message ...=)
-2. output parser (diff + commit + summary)
-3. test against OpenAI/Gemini/Claude 3 provider via aider
+2. output parser (diff + commit + summary) — last =Commit <sha>=
+   line into =:commit-sha=, trailing non-diff paragraph into =:summary=
+3. cost estimator keyed on vendor prefix (openai / anthropic /
+   gemini / ollama)
+4. ERT coverage: build-cmd (default model + extra-args + files +
+   read-only), parser (commit + tail + retry-code), end-to-end
+   via sh stub — 11 tests
 
 ** Phase 2b — anvil-cron 連携 (所要 1-2 日)
 

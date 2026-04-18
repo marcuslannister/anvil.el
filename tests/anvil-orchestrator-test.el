@@ -487,6 +487,196 @@ already deleted the work-dir, which pollutes later tests."
                          (+ 100 100 400 4096))))))
       (delete-file path))))
 
+;;;; --- Phase 2: aider provider -------------------------------------------
+
+(ert-deftest anvil-orchestrator-test-aider-provider-registered ()
+  "Built-in `aider' provider is registered on load."
+  (let ((prov (anvil-orchestrator--provider 'aider)))
+    (should (anvil-orchestrator-provider-p prov))
+    (should (equal "aider" (anvil-orchestrator-provider-cli prov)))
+    (should (anvil-orchestrator-provider-supports-tool-use prov))
+    (should-not (anvil-orchestrator-provider-supports-worktree prov))
+    (should-not (anvil-orchestrator-provider-supports-budget prov))
+    (should (equal "openai/gpt-4o-mini"
+                   (anvil-orchestrator-provider-default-model prov)))))
+
+(ert-deftest anvil-orchestrator-test-aider-build-cmd-basic ()
+  "`aider' build-cmd emits model, message, and non-interactive flags."
+  (let* ((anvil-orchestrator-aider-default-model "openai/gpt-4o-mini")
+         (cl-letf-bind
+          (cl-letf (((symbol-function 'executable-find)
+                     (lambda (_) "/usr/bin/aider")))
+            (anvil-orchestrator--aider-build-cmd
+             (list :prompt "refactor foo"
+                   :model "anthropic/claude-3-5-sonnet-latest")))))
+    (should (equal "/usr/bin/aider"     (nth 0 cl-letf-bind)))
+    (should (member "--model"           cl-letf-bind))
+    (should (member "anthropic/claude-3-5-sonnet-latest" cl-letf-bind))
+    (should (member "--message"         cl-letf-bind))
+    (should (member "refactor foo"      cl-letf-bind))
+    (should (member "--yes-always"      cl-letf-bind))
+    (should (member "--no-stream"       cl-letf-bind))
+    (should (member "--no-check-update" cl-letf-bind))
+    (should (member "--no-pretty"       cl-letf-bind))
+    (should-not (member "--no-auto-commits" cl-letf-bind))
+    (should-not (member "--subtree-only"    cl-letf-bind))))
+
+(ert-deftest anvil-orchestrator-test-aider-build-cmd-default-model ()
+  "`aider' build-cmd falls back to `anvil-orchestrator-aider-default-model'."
+  (let ((anvil-orchestrator-aider-default-model "openai/gpt-4o-mini"))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (_) "/usr/bin/aider")))
+      (let ((cmd (anvil-orchestrator--aider-build-cmd
+                  (list :prompt "x"))))
+        (should (member "openai/gpt-4o-mini" cmd))))))
+
+(ert-deftest anvil-orchestrator-test-aider-build-cmd-files-and-readonly ()
+  "`:files' become positional args; `:read-only-files' become `--read' pairs."
+  (cl-letf (((symbol-function 'executable-find)
+             (lambda (_) "/usr/bin/aider")))
+    (let ((cmd (anvil-orchestrator--aider-build-cmd
+               (list :prompt "p"
+                     :model  "openai/gpt-4o"
+                     :files  '("a.el" "b.el")
+                     :read-only-files '("CLAUDE.md")
+                     :subtree-only t
+                     :no-auto-commits t))))
+      (should (member "--subtree-only"    cmd))
+      (should (member "--no-auto-commits" cmd))
+      ;; --read <path> pairs
+      (let ((tail (member "--read" cmd)))
+        (should tail)
+        (should (equal "CLAUDE.md" (cadr tail))))
+      ;; File list sits at the end
+      (should (equal '("a.el" "b.el") (last cmd 2))))))
+
+(ert-deftest anvil-orchestrator-test-aider-build-cmd-extra-args ()
+  "`anvil-orchestrator-aider-extra-args' is appended before positionals."
+  (let ((anvil-orchestrator-aider-extra-args '("--verbose" "--no-gitignore")))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (_) "/usr/bin/aider")))
+      (let ((cmd (anvil-orchestrator--aider-build-cmd
+                 (list :prompt "x" :model "openai/gpt-4o"
+                       :files '("f.el")))))
+        (should (member "--verbose"       cmd))
+        (should (member "--no-gitignore"  cmd))
+        ;; Positional still last.
+        (should (equal "f.el" (car (last cmd))))))))
+
+(ert-deftest anvil-orchestrator-test-aider-parse-output-commit-and-summary ()
+  "Parser extracts last commit SHA + tail summary from aider stdout."
+  (let ((path (make-temp-file "aider-out-")))
+    (unwind-protect
+        (progn
+          (write-region
+           (concat
+            "Aider v0.77.0\n"
+            "Model: openai/gpt-4o-mini\n"
+            "Git repo: .git with 5 files\n"
+            "Tokens: 1.2k sent, 0.3k received\n"
+            "Cost: $0.0002 message, $0.0015 session\n"
+            "\n"
+            "Applied edit to src/foo.el\n"
+            "diff --git a/src/foo.el b/src/foo.el\n"
+            "--- a/src/foo.el\n"
+            "+++ b/src/foo.el\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old\n"
+            "+new\n"
+            "Commit abc1234 refactor foo\n"
+            "\n"
+            "I renamed the helper and updated the caller.\n"
+            "The change is backward compatible.\n")
+           nil path nil 'silent)
+          (let ((parsed (anvil-orchestrator--aider-parse-output path nil 0)))
+            (should (equal "abc1234" (plist-get parsed :commit-sha)))
+            (should (stringp (plist-get parsed :summary)))
+            (should (string-match-p "renamed the helper"
+                                    (plist-get parsed :summary)))
+            (should-not (string-match-p "diff --git"
+                                        (plist-get parsed :summary)))
+            (should-not (string-match-p "Tokens:"
+                                        (plist-get parsed :summary)))
+            (should-not (plist-get parsed :cost-usd))))
+      (delete-file path))))
+
+(ert-deftest anvil-orchestrator-test-aider-parse-output-takes-last-commit ()
+  "Parser keeps the last `Commit <sha>' when multiple appear."
+  (let ((path (make-temp-file "aider-out-")))
+    (unwind-protect
+        (progn
+          (write-region
+           "Commit aaaaaaa first change\n\ndescription one\nCommit bbbbbbb later\n\nfinal description\n"
+           nil path nil 'silent)
+          (let ((parsed (anvil-orchestrator--aider-parse-output path nil 0)))
+            (should (equal "bbbbbbb" (plist-get parsed :commit-sha)))
+            (should (string-match-p "final description"
+                                    (plist-get parsed :summary)))))
+      (delete-file path))))
+
+(ert-deftest anvil-orchestrator-test-aider-parse-output-retry-on-429 ()
+  "Parser maps 429 on stderr to :auto-retry-code 429 when no summary."
+  (let ((out (make-temp-file "aider-out-"))
+        (err (make-temp-file "aider-err-")))
+    (unwind-protect
+        (progn
+          (write-region "" nil out nil 'silent)
+          (write-region "HTTP 429 Too Many Requests\n" nil err nil 'silent)
+          (let ((parsed (anvil-orchestrator--aider-parse-output out err 1)))
+            (should-not (plist-get parsed :summary))
+            (should (equal 429 (plist-get parsed :auto-retry-code)))))
+      (delete-file out)
+      (delete-file err))))
+
+(ert-deftest anvil-orchestrator-test-aider-cost-estimator ()
+  "`anvil-orchestrator--aider-cost' returns numbers in sensible ranges."
+  (let ((small (anvil-orchestrator--aider-cost
+                (list :prompt "hi" :model "openai/gpt-4o-mini")))
+        (big   (anvil-orchestrator--aider-cost
+                (list :prompt (make-string 4000 ?x)
+                      :model "anthropic/claude-3-opus-latest")))
+        (local (anvil-orchestrator--aider-cost
+                (list :prompt "hi" :model "ollama/llama3"))))
+    (should (and (numberp small) (>= small 0) (< small 0.01)))
+    (should (and (numberp big)   (> big small)))
+    (should (= 0 local))))
+
+(ert-deftest anvil-orchestrator-test-aider-end-to-end-stub ()
+  "End-to-end: stub aider via sh routed through the aider parser.
+Registered under a distinct provider symbol so the built-in
+`aider' descriptor isn't overwritten for the rest of the suite."
+  (anvil-orchestrator-test--with-fresh
+    (anvil-orchestrator-register-provider
+     'aider-stub
+     :cli "sh"
+     :version-check (lambda () t)
+     :build-cmd (lambda (_task)
+                  (list "sh" "-c"
+                        (concat
+                         "printf 'Aider v0.77.0\\n"
+                         "Model: openai/gpt-4o-mini\\n"
+                         "Tokens: 1k sent\\n"
+                         "Applied edit to f.el\\n"
+                         "Commit deadbee stub change\\n\\n"
+                         "Made the requested tweak to f.el.\\n'")))
+     :parse-output #'anvil-orchestrator--aider-parse-output
+     :supports-tool-use t
+     :supports-worktree nil
+     :default-model "openai/gpt-4o-mini"
+     :cost-estimator #'anvil-orchestrator--aider-cost)
+    (let* ((batch (anvil-orchestrator-submit
+                   (list (list :name "aider-stub"
+                               :provider 'aider-stub
+                               :prompt   "tweak f.el"
+                               :no-worktree t)))))
+      (anvil-orchestrator-test--wait-batch batch 5)
+      (let ((r (car (anvil-orchestrator-collect batch))))
+        (should (eq 'done (plist-get r :status)))
+        (should (equal "deadbee" (plist-get r :commit-sha)))
+        (should (stringp (plist-get r :summary)))
+        (should (string-match-p "requested tweak"
+                                (plist-get r :summary)))))))
+
 ;;;; --- live smoke test ---------------------------------------------------
 
 (ert-deftest anvil-orchestrator-test-live-claude ()

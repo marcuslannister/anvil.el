@@ -351,6 +351,170 @@ Returns (:summary STR :cost-usd FLOAT :cost-tokens PLIST
                                  (plist-get task :prompt)
                                  (plist-get task :model))))
 
+;;;; --- aider provider (Phase 2, built-in) --------------------------------
+
+(defcustom anvil-orchestrator-aider-default-model "openai/gpt-4o-mini"
+  "Default `aider --model' value when a task omits :model.
+Format is `<vendor>/<model>', e.g. `openai/gpt-4o',
+`anthropic/claude-3-5-sonnet', `gemini/gemini-2.0-flash'."
+  :type 'string
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-aider-extra-args nil
+  "Extra argv appended verbatim to every `aider' invocation.
+Useful for persistent flags like `--no-check-update' or
+`--read .aider.conf.yml' that are already non-default here."
+  :type '(repeat string)
+  :group 'anvil-orchestrator)
+
+(defun anvil-orchestrator--aider-check ()
+  "Return t when the `aider' CLI is on `exec-path'."
+  (if (executable-find "aider") t
+    (error "anvil-orchestrator: `aider' CLI not found on exec-path")))
+
+(defun anvil-orchestrator--aider-cost (task)
+  "Rough pre-submit USD estimate for TASK under the aider model.
+Uses a coarse per-vendor price table.  Returns 0 for local
+providers (ollama / any model matching `local')."
+  (let* ((model  (or (plist-get task :model)
+                     anvil-orchestrator-aider-default-model))
+         (prompt (or (plist-get task :prompt) ""))
+         (in-tok (/ (length prompt) 4.0))
+         (out-tok (* 2.0 in-tok))
+         (prices
+          (cond
+           ((string-match-p "gpt-4o-mini"         model) '(:i 0.00000015 :o 0.0000006))
+           ((string-match-p "gpt-4o"              model) '(:i 0.0000025  :o 0.00001))
+           ((string-match-p "\\`o[13]\\|o1-mini"  model) '(:i 0.0000025  :o 0.00001))
+           ((string-match-p "claude-3-5-haiku"    model) '(:i 0.0000008  :o 0.000004))
+           ((string-match-p "claude-3-5-sonnet"   model) '(:i 0.000003   :o 0.000015))
+           ((string-match-p "claude-3-opus"       model) '(:i 0.000015   :o 0.000075))
+           ((string-match-p "gemini-2\\.0-flash"  model) '(:i 0.0000001  :o 0.0000004))
+           ((string-match-p "gemini"              model) '(:i 0.00000035 :o 0.00000105))
+           ((string-match-p "ollama/\\|/local"    model) '(:i 0          :o 0))
+           (t                                            '(:i 0.000003   :o 0.000015)))))
+    (+ (* in-tok  (plist-get prices :i))
+       (* out-tok (plist-get prices :o)))))
+
+(defun anvil-orchestrator--aider-build-cmd (task)
+  "Build the `aider' command line for TASK plist.
+Uses `--message' for single-shot non-interactive invocation,
+`--yes-always' to skip prompts, `--no-stream' for deterministic
+stdout, and `--no-check-update' to avoid network pings.  Files
+under `:files' become positional args; `:read-only-files' become
+`--read FILE' pairs; `:subtree-only', `:no-auto-commits',
+`:no-pretty', `:no-gitignore' are honoured.  Extra argv from
+`anvil-orchestrator-aider-extra-args' is appended after the
+flags and before any positional file list."
+  (let* ((model     (or (plist-get task :model)
+                        anvil-orchestrator-aider-default-model))
+         (prompt    (plist-get task :prompt))
+         (files     (plist-get task :files))
+         (read-only (plist-get task :read-only-files))
+         (no-auto   (plist-get task :no-auto-commits))
+         (subtree   (plist-get task :subtree-only))
+         (cmd       (list (executable-find "aider")
+                          "--model" model
+                          "--message" prompt
+                          "--yes-always"
+                          "--no-stream"
+                          "--no-check-update"
+                          "--no-show-release-notes"
+                          "--no-analytics"
+                          "--no-pretty")))
+    (when no-auto
+      (setq cmd (append cmd (list "--no-auto-commits"))))
+    (when subtree
+      (setq cmd (append cmd (list "--subtree-only"))))
+    (dolist (ro read-only)
+      (setq cmd (append cmd (list "--read" ro))))
+    (when anvil-orchestrator-aider-extra-args
+      (setq cmd (append cmd anvil-orchestrator-aider-extra-args)))
+    (append cmd files)))
+
+(defconst anvil-orchestrator--aider-skip-prefix-re
+  (concat "\\`\\(?:"
+          "[+-]\\{1,3\\}\\| \\|@@\\|"
+          "diff \\|index \\|---\\|\\+\\+\\+\\|"
+          "\\$ \\|>>>>>>>\\|<<<<<<<\\|=======\\|"
+          "Applied edit\\|Added \\|Dropped \\|Files\\|Repo\\|"
+          "Main model\\|Weak model\\|Editor model\\|"
+          "Tokens:\\|Cost:\\|Commit \\|"
+          "Aider v\\|Model: \\|Git repo:\\|Using \\|"
+          "Scanning repo\\|Repo-map:"
+          "\\)")
+  "Prefixes identifying non-summary aider output lines.
+Used by `anvil-orchestrator--aider-parse-output' to drop
+setup / diff / stat noise when extracting the summary tail.")
+
+(defun anvil-orchestrator--aider-parse-output (stdout-path stderr-path exit-code)
+  "Parse aider STDOUT-PATH into a summary plist.
+Extracts the last commit SHA (from `^Commit [0-9a-f]+ '), takes
+the tail non-diff paragraph as the summary, and heuristically
+maps stderr HTTP / network errors to auto-retry codes."
+  (let (summary commit-sha retry-code)
+    (condition-case _err
+        (when (file-readable-p stdout-path)
+          (with-temp-buffer
+            (insert-file-contents stdout-path)
+            (goto-char (point-min))
+            (while (re-search-forward
+                    "^Commit \\([0-9a-f]\\{7,40\\}\\)\\b" nil t)
+              (setq commit-sha (match-string 1)))
+            (let* ((sz (buffer-size))
+                   (tail-start (max (point-min) (- (point-max)
+                                                   (min sz 4096))))
+                   (lines nil))
+              (goto-char tail-start)
+              (while (not (eobp))
+                (let ((line (buffer-substring-no-properties
+                             (point) (line-end-position))))
+                  (unless (or (string-empty-p (string-trim line))
+                              (string-match-p
+                               anvil-orchestrator--aider-skip-prefix-re
+                               line))
+                    (push line lines)))
+                (forward-line 1))
+              (when lines
+                (setq summary
+                      (string-trim
+                       (mapconcat #'identity (nreverse lines) "\n")))))))
+      (error nil))
+    (when (and (not summary) (integerp exit-code) (not (zerop exit-code))
+               (file-readable-p stderr-path))
+      (with-temp-buffer
+        (insert-file-contents stderr-path nil 0 8192)
+        (goto-char (point-min))
+        (cond
+         ((re-search-forward "\\b\\(429\\|500\\|502\\|503\\|504\\)\\b" nil t)
+          (setq retry-code (string-to-number (match-string 1))))
+         ((re-search-forward "\\b\\(network\\|ECONNRESET\\|ETIMEDOUT\\|EAI_AGAIN\\)\\b" nil t)
+          (setq retry-code 'network)))))
+    (when summary
+      (when (> (length summary) anvil-orchestrator-summary-max-chars)
+        (setq summary (concat
+                       (substring summary 0
+                                  anvil-orchestrator-summary-max-chars)
+                       "…"))))
+    (list :summary         summary
+          :cost-usd        nil
+          :cost-tokens     nil
+          :commit-sha      commit-sha
+          :auto-retry-code retry-code)))
+
+(anvil-orchestrator-register-provider
+ 'aider
+ :cli "aider"
+ :version-check #'anvil-orchestrator--aider-check
+ :build-cmd     #'anvil-orchestrator--aider-build-cmd
+ :parse-output  #'anvil-orchestrator--aider-parse-output
+ :supports-tool-use             t
+ :supports-worktree             nil
+ :supports-budget               nil
+ :supports-system-prompt-append nil
+ :default-model                 "openai/gpt-4o-mini"
+ :cost-estimator #'anvil-orchestrator--aider-cost)
+
 ;;;; --- UUID + internal state ---------------------------------------------
 
 (defun anvil-orchestrator--uuid ()

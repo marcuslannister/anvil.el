@@ -672,9 +672,14 @@ are:
 - =orchestrator-cancel= — SIGTERM / SIGKILL a running or queued task.
 - =orchestrator-retry= — re-submit a task under a new id.
 
-Phase 1a ships one provider: =claude= (hard dependency on the
-=claude= CLI on =exec-path=).  aider / gemini / ollama adapters land
-in Phase 2+.  Concurrency caps (=anvil-orchestrator-concurrency=,
+Phase 1a ships the =claude= provider (hard dependency on the
+=claude= CLI on =exec-path=).  Phase 2 adds the =aider= provider —
+use =:provider 'aider= with =:model "<vendor>/<model>"= (e.g.
+=openai/gpt-4o-mini=, =anthropic/claude-3-5-sonnet-latest=,
+=gemini/gemini-2.0-flash=, =ollama/llama3=) to route a single
+=aider --message= shot through the multi-vendor aider CLI.
+gemini / ollama native adapters land in Phase 3+.  Concurrency caps
+(=anvil-orchestrator-concurrency=,
 =anvil-orchestrator-per-provider-concurrency=) protect against
 draining a Claude MAX plan's 5-hour window; the default is 3 global
 and 3 per-provider.
@@ -709,6 +714,22 @@ Phase 1b adds:
   original byte count survives on the task record as
   =:stdout-bytes-original= so the dashboard and the parent session
   can see that a log was slimmed down.
+
+Phase 2 adds:
+
+- *aider provider*.  =:provider 'aider= routes the prompt through
+  =aider --message --yes-always --no-stream --no-check-update= with
+  the target model selected by =:model=.  Optional task fields:
+  =:files= (positional args aider is allowed to edit),
+  =:read-only-files= (become =--read FILE= pairs),
+  =:subtree-only=, =:no-auto-commits=.  The parser extracts the
+  last =Commit <sha>= line into =:commit-sha= and the trailing
+  non-diff paragraph into =:summary=.  Since aider has no native
+  worktree flag, anvil creates a =git worktree add= under
+  =anvil-orchestrator-work-dir/worktrees/= and rewrites =:cwd=
+  before spawn (same fallback path Phase 1b uses for every
+  non-claude provider).  Persistent extra flags go in
+  =anvil-orchestrator-aider-extra-args=.
 
 Requires Emacs 29+ (via =anvil-state=).
 
