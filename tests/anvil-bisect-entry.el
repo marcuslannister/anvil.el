@@ -1,0 +1,57 @@
+;;; anvil-bisect-entry.el --- Subprocess entry point for anvil-bisect  -*- lexical-binding: t; -*-
+
+;;; Commentary:
+
+;; Invoked by `anvil-bisect--run-step' inside `emacs --batch'.  Loads
+;; a single ERT test file, runs one named test, and exits:
+;;   0    pass
+;;   1    fail / unexpected result
+;;   125  skip (test symbol missing, file could not be loaded — the
+;;         git-bisect convention for "cannot decide on this commit")
+;;
+;; Keep this file free of anvil requires so a commit lacking the
+;; module we are bisecting can still run the entry cleanly.
+
+;;; Code:
+
+(require 'ert)
+
+(defun anvil-bisect-entry (test-name test-file)
+  "Run ERT test TEST-NAME defined in TEST-FILE.
+TEST-FILE is interpreted relative to `default-directory' (which
+is the worktree when called from `anvil-bisect').  Exits the
+Emacs process with 0 on pass, 1 on fail, 125 on skip."
+  (condition-case err
+      (let ((path (expand-file-name test-file))
+            (sym  (cond ((symbolp test-name) test-name)
+                        ((stringp test-name) (intern test-name))
+                        (t (error "test-name must be symbol or string")))))
+        (unless (file-readable-p path)
+          (message "anvil-bisect-entry: cannot read test file %s" path)
+          (kill-emacs 125))
+        (load path nil t)
+        (let ((test (ignore-errors (ert-get-test sym))))
+          (unless test
+            (message "anvil-bisect-entry: test %S not defined after load"
+                     sym)
+            (kill-emacs 125))
+          ;; `ert-run-test' runs the test and stores the outcome on
+          ;; the test's most-recent-result slot; the function itself
+          ;; returns the test struct, not a result object, so we fetch
+          ;; the result explicitly before classifying.
+          ;;
+          ;; Note: `ert-test-result-type-p' with a quoted symbol
+          ;; argument hits a `pcase-exhaustive' mismatch on
+          ;; Emacs 30.1 — use the direct `ert-test-passed-p'
+          ;; predicate which is stable across versions.
+          (ert-run-test test)
+          (let ((result (ert-test-most-recent-result test)))
+            (if (ert-test-passed-p result)
+                (kill-emacs 0)
+              (kill-emacs 1)))))
+    (error
+     (message "anvil-bisect-entry: %s" (error-message-string err))
+     (kill-emacs 125))))
+
+(provide 'anvil-bisect-entry)
+;;; anvil-bisect-entry.el ends here

@@ -101,7 +101,14 @@ These are not loaded by default.  Available modules:
 - `pty-broker' — node-pty TCP broker for TUI programs; moves PTY
                  handling out of the Emacs daemon to avoid filter
                  starvation / ConPTY stdin quirks (Doc 04 Phase 1,
-                 requires node + `npm install node-pty')"
+                 requires node + `npm install node-pty')
+- `defs'      — SQLite-backed elisp symbol index (defs, refs,
+                requires/provides) with defs-search /
+                defs-references / defs-signature etc.
+                (Doc 11 Phase 1+2, requires Emacs 29+)
+- `bisect'    — Test-driven git bisect that pins a failing ERT
+                test to the introducing commit via worktree-
+                isolated emacs --batch steps (Doc 13 Phase 1)"
   :type '(repeat symbol)
   :group 'anvil)
 
