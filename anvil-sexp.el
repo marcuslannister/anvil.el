@@ -23,6 +23,7 @@
 (require 'pp)
 (require 'subr-x)
 (require 'bytecomp)
+(require 'anvil-defs nil t)
 
 ;; Dynamic variables owned by `checkdoc'; declared so that the
 ;; byte compiler treats the `let' bindings in
@@ -491,9 +492,12 @@ POINT lies outside any sexp."
 ;; Reader-only backend.  Each .el file in scope is parsed via
 ;; `anvil-sexp--read-file' to get the top-level forms with their byte
 ;; ranges, and each range is text-scanned for the target symbol with
-;; `syntax-ppss' filtering out strings and comments.  A future
-;; Phase 2b will swap the resolver for Doc 11 `anvil-defs-references'
-;; with no public API change.
+;; `syntax-ppss' filtering out strings and comments.  Phase 2b
+;; (committed 2026-04-20) adds a Doc 11 `anvil-defs' fast path: when
+;; an index is available it narrows the candidate file set before the
+;; reader scan, turning O(project) into O(touched-files); each
+;; candidate file still falls through to the reader so the emitted
+;; plan is byte-equal with or without the index.
 
 (defgroup anvil-sexp-project nil
   "Project-scope settings for `anvil-sexp' Phase 2a rename."
@@ -512,6 +516,16 @@ POINT lies outside any sexp."
   :type '(repeat regexp)
   :group 'anvil-sexp-project)
 
+(defcustom anvil-sexp-use-index-backend t
+  "When non-nil, use `anvil-defs' to narrow project rename scans.
+The index only chooses candidate files; each chosen file is still
+rescanned via the reader backend so the resulting edit plan stays
+byte-for-byte identical to the full reader walk.  Set to nil to
+force the pure Phase 2a path (useful for backend-parity testing
+and when debugging index staleness)."
+  :type 'boolean
+  :group 'anvil-sexp-project)
+
 (defun anvil-sexp--project-root (&optional hint)
   "Return the project root containing HINT (or `default-directory').
 Uses the nearest `.git' ancestor; falls back to HINT itself."
@@ -519,6 +533,35 @@ Uses the nearest `.git' ancestor; falls back to HINT itself."
     (or (ignore-errors
           (locate-dominating-file d ".git"))
         (file-name-directory d))))
+
+(defun anvil-sexp--index-candidate-files (sym)
+  "Return the set of .el files the Doc 11 index reports as touching SYM.
+Returns nil when `anvil-defs' is not loaded, the index is empty,
+or `anvil-sexp-use-index-backend' is non-nil but false.  Includes
+files from both `anvil-defs-references' (call / quote / symbol /
+var sites) and `anvil-defs-search' (definition name sites) so a
+never-referenced defun-name is still surfaced.  Any candidate
+whose on-disk mtime is newer than the indexed mtime is lazily
+re-ingested before it is returned."
+  (when (and anvil-sexp-use-index-backend
+             (featurep 'anvil-defs)
+             (fboundp 'anvil-defs-index-status)
+             (fboundp 'anvil-defs-references)
+             (fboundp 'anvil-defs-search)
+             (> (or (plist-get (anvil-defs-index-status) :files) 0) 0))
+    (let* ((name (if (symbolp sym) (symbol-name sym) sym))
+           (files
+            (delete-dups
+             (delq nil
+                   (append
+                    (mapcar (lambda (h) (plist-get h :file))
+                            (anvil-defs-references name :limit 100000))
+                    (mapcar (lambda (h) (plist-get h :file))
+                            (anvil-defs-search name :limit 1000)))))))
+      (when (fboundp 'anvil-defs-refresh-if-stale)
+        (dolist (f files)
+          (anvil-defs-refresh-if-stale f)))
+      files)))
 
 (defun anvil-sexp--project-el-files (root)
   "List .el source files under ROOT, respecting
@@ -709,10 +752,19 @@ SCOPE may be:
 
 (defun anvil-sexp--rename-plan (scope old new &optional kinds)
   "Build an edit plan renaming OLD to NEW across SCOPE.
-KINDS restricts reference kinds (list of symbols; nil = all)."
-  (let* ((files (anvil-sexp--resolve-scope scope))
-         (old-name (if (symbolp old) (symbol-name old) old))
+KINDS restricts reference kinds (list of symbols; nil = all).
+When SCOPE is the project default, prefer the Doc 11 index to
+narrow the file set before the reader scan; results are
+byte-identical either way since each candidate file still goes
+through `anvil-sexp--scan-symbol-refs'."
+  (let* ((old-name (if (symbolp old) (symbol-name old) old))
          (new-name (if (symbolp new) (symbol-name new) new))
+         (project-scope-p (or (null scope)
+                              (equal scope "")
+                              (equal scope "project")))
+         (index-files (and project-scope-p
+                           (anvil-sexp--index-candidate-files old-name)))
+         (files (or index-files (anvil-sexp--resolve-scope scope)))
          (kinds-filter (cond ((null kinds) nil)
                              ((listp kinds) kinds)
                              ((stringp kinds)

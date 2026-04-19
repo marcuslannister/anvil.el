@@ -751,6 +751,54 @@
        (should (>= (length skipped) 1))
        (should (string-match-p "skipped" summary))))))
 
+;;;; --- Phase 2b parity: plan output equal with / without index ---------
+
+(ert-deftest anvil-sexp-test-phase2b-backend-parity ()
+  "With `anvil-sexp-use-index-backend' flipped on vs off against the
+same project, `anvil-sexp--tool-rename-symbol' must emit the same
+edit plan (ops count + byte ranges + replacement texts)."
+  (require 'anvil-defs)
+  (anvil-sexp-test--with-phase2a-dir
+   (lambda (dir file)
+     (let* ((anvil-defs-index-db-path
+             (expand-file-name "defs.db" dir))
+            (anvil-defs-paths (list dir))
+            (anvil-defs--db nil)
+            (anvil-defs--backend nil))
+       (unwind-protect
+           (progn
+             (anvil-defs-index-rebuild (list dir))
+             (let* ((plan-index
+                     (let ((anvil-sexp-use-index-backend t))
+                       (anvil-sexp--tool-rename-symbol
+                        "p2a-hello" "p2a-hi" nil file)))
+                    (plan-reader
+                     (let ((anvil-sexp-use-index-backend nil))
+                       (anvil-sexp--tool-rename-symbol
+                        "p2a-hello" "p2a-hi" nil file))))
+               (should (= (length (plist-get plan-index :ops))
+                          (length (plist-get plan-reader :ops))))
+               (cl-loop for a in (plist-get plan-index :ops)
+                        for b in (plist-get plan-reader :ops)
+                        do (should (equal (plist-get a :range)
+                                          (plist-get b :range)))
+                        do (should (equal (plist-get a :replacement)
+                                          (plist-get b :replacement))))))
+         (when anvil-defs--db
+           (anvil-defs--close anvil-defs--db)
+           (setq anvil-defs--db nil)))))))
+
+(ert-deftest anvil-sexp-test-phase2b-disabled-fallthrough ()
+  "When the index backend is disabled, rename still succeeds."
+  (anvil-sexp-test--with-phase2a-dir
+   (lambda (_dir file)
+     (let ((anvil-sexp-use-index-backend nil))
+       (let* ((plan (anvil-sexp--tool-rename-symbol
+                     "p2a-hello" "p2a-hi" nil file))
+              (ops (plist-get plan :ops)))
+         (should (>= (length ops) 4)))))))
+
+
 (ert-deftest anvil-sexp-test-rename-var-binding-kind ()
   "rename-symbol with kinds=var touches only LHS-binding sites."
   (let ((tmp (make-temp-file "anvil-sexp-var-" nil ".el")))

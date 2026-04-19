@@ -41,7 +41,18 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'anvil-server)
-(require 'anvil-sexp)
+
+;; anvil-sexp is required lazily (inside functions that use its
+;; reader helpers) because anvil-sexp also optionally requires us
+;; back to pick up the Phase 2b fast path, and a top-level require
+;; in both directions produces a "Recursive require" error at load
+;; time.  The byte-compiler is kept happy via `declare-function'.
+(declare-function anvil-sexp--with-elisp-syntax "anvil-sexp" (fn))
+(declare-function anvil-sexp--read-current-buffer "anvil-sexp" ())
+(declare-function anvil-sexp--project-root "anvil-sexp" (&optional hint))
+(declare-function anvil-sexp--truthy "anvil-sexp" (v))
+(defvar anvil-sexp--function-defining-forms)
+(defvar anvil-sexp--defining-forms)
 
 
 ;;;; --- group / config -----------------------------------------------------
@@ -213,6 +224,7 @@ availability (see memory feedback_sqlite_with_transaction_not_portable)."
   "Return absolute .el paths under PATHS (default `anvil-defs-paths').
 Falls back to the nearest git ancestor of `default-directory' when
 both are unset."
+  (require 'anvil-sexp)
   (let* ((roots (or paths anvil-defs-paths
                     (list (anvil-sexp--project-root))))
          (acc nil))
@@ -227,9 +239,13 @@ both are unset."
 
 ;;;; --- scanner -----------------------------------------------------------
 
-(defconst anvil-defs--kinds-function
-  anvil-sexp--function-defining-forms
-  "Forms whose name denotes a function or macro for `arity_*' extraction.")
+(defun anvil-defs--kinds-function ()
+  "Forms whose name denotes a function or macro for `arity_*' extraction.
+Reads `anvil-sexp--function-defining-forms' lazily so the top
+level of `anvil-defs' does not depend on `anvil-sexp' loading
+(the two modules are mutually optional)."
+  (require 'anvil-sexp)
+  anvil-sexp--function-defining-forms)
 
 (defun anvil-defs--first-line (s)
   "Return the first line of S, trimmed and clipped to 160 chars."
@@ -287,13 +303,24 @@ For `cl-defstruct' (whose CADR is (NAME :option ...)), returns nil."
         (second (cadr sexp))
         (third (caddr sexp)))
     (cond
-     ((memq op anvil-defs--kinds-function)
+     ((memq op (anvil-defs--kinds-function))
       ;; Most function-likes: (OP NAME ARGLIST ...).  For cl-defstruct
       ;; the NAME position is itself a list and there is no separate
       ;; arglist.
       (when (and (symbolp second) (listp third))
         third))
      (t nil))))
+
+(defun anvil-defs--walk-each (xs fn)
+  "Apply FN to each element of XS, tolerating improper / dotted lists.
+`dolist' signals on the dotted tail; callers walking arbitrary
+reader output (including literal alists like `(:title . \"x\")')
+must not rely on the proper-list invariant.  FN receives each
+`car' and, if XS ends in a non-nil atom, that atom itself."
+  (while (consp xs)
+    (funcall fn (car xs))
+    (setq xs (cdr xs)))
+  (when xs (funcall fn xs)))
 
 (defconst anvil-defs--walker-skip-symbols
   '(nil t)
@@ -346,12 +373,16 @@ line.  The walker records:
        ;; (OP ARGS...) — record a call on OP, then recurse into args.
        ((and (symbolp op) (not (anvil-defs--walker-ignored-p op)))
         (funcall emit 'call (symbol-name op) line context)
-        (dolist (sub (cdr sexp))
-          (anvil-defs--walk-form-refs sub context line emit)))
-       ;; non-symbol operator (e.g. ((lambda (x) x) 1)) — walk every child.
+        (anvil-defs--walk-each
+         (cdr sexp)
+         (lambda (sub) (anvil-defs--walk-form-refs sub context line emit))))
+       ;; non-symbol operator (e.g. ((lambda (x) x) 1)) / dotted alists
+       ;; like (:key . "value") — walk every element; the walker
+       ;; helper tolerates improper lists.
        (t
-        (dolist (sub sexp)
-          (anvil-defs--walk-form-refs sub context line emit))))))
+        (anvil-defs--walk-each
+         sexp
+         (lambda (sub) (anvil-defs--walk-form-refs sub context line emit)))))))
    ;; Bare value-position symbol reference (variable read, argument,
    ;; element of a literal list, etc.).  Without this branch, forms
    ;; like `(setq handlers (list anvil-state-set ...))' miss the
@@ -372,6 +403,7 @@ line.  The walker records:
 All items are plists suitable for direct insertion by the ingest
 path.  Uses `anvil-sexp--read-file' so every caller shares the
 same top-level parser."
+  (require 'anvil-sexp)
   (let ((defs nil) (refs nil) (features nil)
         (forms nil))
     (anvil-sexp--with-elisp-syntax
@@ -704,6 +736,8 @@ When multiple definitions exist the first encountered is returned."
 
 (defun anvil-defs--tool-search (name &optional kind fuzzy limit)
   "List indexed definitions matching NAME.
+Lazy-loads `anvil-sexp' for the shared truthy helper so the
+`anvil-defs' top-level has no build-time dep on `anvil-sexp'.
 
 MCP Parameters:
   name   - Symbol name (string).
@@ -711,6 +745,7 @@ MCP Parameters:
   fuzzy  - Non-nil truthy string enables LIKE %NAME% matching.
   limit  - Maximum rows (string or integer); default 50."
   (anvil-server-with-error-handling
+   (require 'anvil-sexp)
    (let ((k (and (stringp kind) (not (string-empty-p kind))
                  (split-string kind "[ ,]+" t))))
      (anvil-defs-search name
