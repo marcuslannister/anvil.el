@@ -1,0 +1,13 @@
+tool,url,iter,from-cache,wall-ms,body-bytes,status
+http,https://example.com/,1,,38,528,200
+http,https://example.com/,2,t,0,528,200
+http,https://example.com/,3,t,0,528,200
+browser,https://example.com/,1,,175,73,
+browser,https://example.com/,2,t,0,73,
+browser,https://example.com/,3,t,0,73,
+http,https://httpbin.org/json,1,,845,429,200
+http,https://httpbin.org/json,2,t,0,429,200
+http,https://httpbin.org/json,3,t,0,429,200
+browser,https://httpbin.org/json,1,,767,49,
+browser,https://httpbin.org/json,2,t,0,49,
+browser,https://httpbin.org/json,3,t,0,49,
