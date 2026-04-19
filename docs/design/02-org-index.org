@@ -3,7 +3,8 @@
 #+property: status DRAFT
 
 * STATUS
-~APPROVED~ (2026-04-15) — Phase 1 実装着手可
+~Phase 1 + 2 + 3 + 4 + 5a (search) SHIPPED~ (2026-04-19) — Phase 5b (tag-list / todo-list MCP tools) と Phase 6 (observability) は deferred。
+~org-index-search~ / ~org-index-rebuild~ は MCP 登録済、filenotify watcher + periodic scan 稼働中、既存 ~org-read-*~ は index 経由で 177× 高速化 (memory ~project_anvil_org_index.md~ 参照)。
 
 ** Decisions
 
@@ -223,29 +224,32 @@ CREATE INDEX idx_property_key ON property(key);
 
 * Implementation Plan
 
-1. *Phase 1 — Schema + rebuild* (~1 週間)
+1. *Phase 1 — Schema + rebuild* (~1 週間) *SHIPPED*
    - ~anvil-org-index.el~ 新規作成
    - schema 作成、~anvil-org-index-rebuild~ 実装 (全 path scan → 全件 DELETE + INSERT)
    - CI test: 既知 org ファイル → 期待 row 数
 
-2. *Phase 2 — Incremental update* (~3 日)
+2. *Phase 2 — Incremental update* (~3 日) *SHIPPED*
    - ~anvil-org-index-refresh-if-stale~ 実装
    - mtime 比較、ファイル単位で更新
 
-3. *Phase 3 — Filesystem watcher* (~3 日)
+3. *Phase 3 — Filesystem watcher* (~3 日) *SHIPPED*
    - ~filenotify-add-watch~ 使用
    - Windows/macOS/Linux で動作確認
-   - debounce ロジック
+   - debounce ロジック + periodic scan safety net
 
-4. *Phase 4 — MCP tool 差し替え* (~1 週間)
+4. *Phase 4 — MCP tool 差し替え* (~1 週間) *SHIPPED*
    - 既存 ~org-read-*~ tool の内部を index 経由に。API は不変。
    - 既存 tests 全 pass を gate
 
-5. *Phase 5 — 新 MCP tool* (~3 日)
-   - ~org-search~, ~org-tag-list~, ~org-todo-list~
+5. *Phase 5a — 新 MCP tool (search)* (~3 日) *SHIPPED*
+   - ~org-index-search~ (title LIKE / tag AND / TODO IN / 日付境界 / path LIKE)
 
-6. *Phase 6 — Observability* (~2 日)
-   - ~anvil-org-index-status~, metrics (hit rate 等)
+6. *Phase 5b — 新 MCP tool (tag-list / todo-list)* *deferred*
+   - ~org-tag-list~, ~org-todo-list~ は利用頻度低、search で代替可能なため後回し。
+
+7. *Phase 6 — Observability* *deferred*
+   - ~anvil-org-index-status~, metrics (hit rate 等)。現状 ~sqlite-query~ + ~anvil-state~ で必要分は取得可能。
 
 * Migration
 
