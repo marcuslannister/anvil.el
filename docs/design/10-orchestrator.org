@@ -7,7 +7,7 @@
   :PROPERTIES:
   :ID:       019da30b-92e3-7674-976d-020f7465940b
   :END:
-~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 + 4b + 5 + 6C MVP + 6C' + 6C'' + gemma4-strip + observability + glue-helpers SHIPPED (develop branch)~ (2026-04-19)
+~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 + 4b + 5 + 6C MVP + 6C' + 6C'' + gemma4-strip + observability + glue-helpers + 7a SHIPPED (develop branch)~ (2026-04-19)
 
 - Phase 1a (commit 45468b2): provider abstraction, claude provider,
   spawn + sentinel + timeout, pool + concurrency cap, state
@@ -892,7 +892,7 @@ buffer) が main daemon 側にあるため、cron dispatcher は
 
 Phase 7 はこの 3 項目を sub-phase に分けて潰す。
 
-*** Phase 7a — ~orchestrator-submit-and-collect~ sync API (所要 2-4h)
+*** Phase 7a — ~orchestrator-submit-and-collect~ sync API *SHIPPED* (2026-04-19)
 
 **Scope:**
 - 既存 ~anvil-orchestrator-submit-one~ + ~-tail~ + ~-extract-result~ を
