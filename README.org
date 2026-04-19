@@ -501,6 +501,8 @@ budget goes to reasoning about your code, not re-reading it.
 | =browser=    | Web fetch / interact / capture / screenshot via agent-browser (opt.) | agent-browser CLI |
 | =state=      | Persistent SQLite-backed KV store (ns / TTL, opt.) | Emacs 29+        |
 | =http=       | GET/HEAD with ETag/TTL cache via `url-retrieve' (opt.) | Emacs 29+ (state) |
+| =orchestrator= | Parallel AI CLI dispatcher (claude / aider / gemini / ollama / codex) with DAG, consensus, meta-LLM judge, live streaming, cron + worktree isolation (opt.) | AI CLIs, Emacs 29+ |
+| =pty-broker=  | Node-pty TCP broker for spawning processes that need a real TTY (opt.) | Node.js, node-pty |
 
 * Quick Start
 
@@ -517,9 +519,9 @@ Then run =M-x anvil-describe-setup= for client configuration instructions.
 Two tracks are supported. Pick *stable* unless you know why you
 want master.
 
-** Stable (recommended) — tag =v0.2.1=
+** Stable (recommended) — tag =v0.3.0=
 
-=v0.2.1= is the current stable tag.  New features and fixes
+=v0.3.0= is the current stable tag.  New features and fixes
 land on =master= continuously; periodically a tag is cut once
 the surface has settled enough to recommend.  Pin to this tag
 unless you have a reason to track =master=.
@@ -530,7 +532,7 @@ unless you have a reason to track =master=.
 
 #+begin_src emacs-lisp
 (async-installer-git-add "https://github.com/zawatton/anvil.el.git"
-                            :tag "v0.2.1"
+                            :tag "v0.3.0"
                             :main "anvil.el")
 #+end_src
 
@@ -539,14 +541,14 @@ unless you have a reason to track =master=.
 #+begin_src emacs-lisp
 (straight-use-package
  '(anvil :type git :host github :repo "zawatton/anvil.el"
-         :branch "v0.2.1"))
+         :branch "v0.3.0"))
 #+end_src
 
 *** elpaca
 
 #+begin_src emacs-lisp
 (elpaca (anvil :host github :repo "zawatton/anvil.el"
-               :ref "v0.2.1"))
+               :ref "v0.3.0"))
 #+end_src
 
 *** use-package (with straight or elpaca)
@@ -555,11 +557,11 @@ unless you have a reason to track =master=.
 ;; with straight
 (use-package anvil
   :straight (anvil :type git :host github :repo "zawatton/anvil.el"
-                   :branch "v0.2.1"))
+                   :branch "v0.3.0"))
 
 ;; with elpaca
 (use-package anvil
-  :ensure (:host github :repo "zawatton/anvil.el" :ref "v0.2.1"))
+  :ensure (:host github :repo "zawatton/anvil.el" :ref "v0.3.0"))
 #+end_src
 
 ** Bleeding edge — =master= (strongly discouraged)
@@ -610,8 +612,8 @@ Clone this repository and add it to your =load-path=:
 (require 'anvil)
 #+end_src
 
-When cloning manually, check out the =v0.2.1= tag for the stable
-track (=git checkout v0.2.1=), or stay on =master= at your own
+When cloning manually, check out the =v0.3.0= tag for the stable
+track (=git checkout v0.3.0=), or stay on =master= at your own
 risk.
 
 * Configuration
@@ -649,6 +651,151 @@ are served from the in-memory cache.
 On Windows, the agent-browser Rust binary is occasionally flagged
 by Defender; whitelist =%APPDATA%\npm\node_modules\agent-browser\bin\=
 if you hit that.
+
+** Orchestrator module (optional)
+
+The =orchestrator= module spawns several agentic AI CLI subprocesses
+in parallel and exposes a terse submit / status / collect API, so the
+parent Claude session only spends context on task ids and final
+summaries — not on the intermediate tool calls each sub-task makes.
+
+Add =orchestrator= to =anvil-optional-modules=.  The registered tools
+are:
+
+- =orchestrator-submit= — queue a batch of tasks (JSON array); each
+  task is a plist with =name=, =provider=, =prompt= (plus optional
+  =model=, =budget_usd=, =timeout_sec=, …).  Returns a batch id
+  without blocking.
+- =orchestrator-status= — return counts + slim per-task plist for a
+  batch (or a single task).
+- =orchestrator-collect= — return the list of slim task results for a
+  batch; with =wait="t"= blocks until every task is terminal.
+- =orchestrator-cancel= — SIGTERM / SIGKILL a running or queued task.
+- =orchestrator-retry= — re-submit a task under a new id.
+
+Phase 1a ships the =claude= provider (hard dependency on the
+=claude= CLI on =exec-path=).  Phase 2 adds the =aider= provider —
+use =:provider 'aider= with =:model "<vendor>/<model>"= (e.g.
+=openai/gpt-4o-mini=, =anthropic/claude-3-5-sonnet-latest=,
+=gemini/gemini-2.0-flash=, =ollama/llama3=) to route a single
+=aider --message= shot through the multi-vendor aider CLI.
+gemini / ollama native adapters land in Phase 3+.  Concurrency caps
+(=anvil-orchestrator-concurrency=,
+=anvil-orchestrator-per-provider-concurrency=) protect against
+draining a Claude MAX plan's 5-hour window; the default is 3 global
+and 3 per-provider.
+
+=M-x anvil-orchestrator-dashboard= opens a =tabulated-list= view of
+every task: keys =g= refresh, =RET= open stdout file, =k= cancel,
+=r= retry.
+
+Task state is persisted to =anvil-state= (ns=orchestrator) so the
+queue survives a daemon restart.  Running tasks at shutdown are
+marked =failed= with a clear error on reload, since the OS pids no
+longer belong to Emacs.
+
+Phase 1b adds:
+
+- *Git worktree isolation*.  When a task's =:cwd= is inside a git
+  repo and =anvil-orchestrator-worktree-auto= is on (default), the
+  claude provider receives =--worktree NAME= so N parallel tasks
+  never stomp on the same working tree.  Providers without native
+  worktree support fall back to an =anvil-git worktree add= under
+  =anvil-orchestrator-work-dir/worktrees/=; =:cwd= is rewritten to
+  that path before spawn.  Opt out per task with =:no-worktree t=.
+- *DAG scheduling*.  A task may name sibling-in-batch dependencies
+  via =:depends-on ("other-name" …)=.  The pool only starts a task
+  once every dep has reached =done=; if any dep =failed= or
+  =cancelled=, dependents are flipped to =failed= with a
+  "dependency X did not succeed" error.  Batch-level cycle and
+  unknown-name detection happens at submit time.
+- *stdout / stderr overflow*.  Per-task output files over
+  =anvil-orchestrator-output-size-cap= (default 1 MB) are rewritten
+  as =head 256 KB= + truncation marker + =tail 256 KB=; the
+  original byte count survives on the task record as
+  =:stdout-bytes-original= so the dashboard and the parent session
+  can see that a log was slimmed down.
+
+Phase 2 adds:
+
+- *aider provider*.  =:provider 'aider= routes the prompt through
+  =aider --message --yes-always --no-stream --no-check-update= with
+  the target model selected by =:model=.  Optional task fields:
+  =:files= (positional args aider is allowed to edit),
+  =:read-only-files= (become =--read FILE= pairs),
+  =:subtree-only=, =:no-auto-commits=.  The parser extracts the
+  last =Commit <sha>= line into =:commit-sha= and the trailing
+  non-diff paragraph into =:summary=.  Since aider has no native
+  worktree flag, anvil creates a =git worktree add= under
+  =anvil-orchestrator-work-dir/worktrees/= and rewrites =:cwd=
+  before spawn (same fallback path Phase 1b uses for every
+  non-claude provider).  Persistent extra flags go in
+  =anvil-orchestrator-aider-extra-args=.
+
+- *Scheduled batches via anvil-cron*.  Register a dispatcher
+  function that calls =anvil-orchestrator-submit=, then schedule
+  it with =anvil-cron-register :time "02:00"= for autonomous
+  overnight runs.  See =examples/nightly-orchestrator.org= for
+  four end-to-end patterns (dispatch-only, dispatch-then-collect,
+  hook-based batch-id logging, multi-provider mix) and the
+  worker-vs-main-daemon trade-off.
+
+Requires Emacs 29+ (via =anvil-state=).
+
+** Git helpers
+
+The =git= module is part of the default =anvil-modules= list.  It
+exposes read-only git inspection tools under the shared
+=emacs-eval= server id:
+
+- =git-repo-root= — top-level directory for a path, nil outside
+  a repo.
+- =git-head-sha= — full or abbreviated HEAD commit.
+- =git-branch-current= — current branch name, nil for detached.
+- =git-log= — recent commits as =(hash, date, author, subject)=
+  objects, capped at =anvil-git-log-default-count=.
+- =git-diff-names= — paths changed between FROM and TO.
+- =git-diff-stats= — structured =(files, insertions, deletions)=
+  counts.
+- =git-status= — branch / upstream / ahead / behind + buckets of
+  staged / modified / untracked / unmerged paths.
+- =git-worktree-list= — attached worktrees with =(path, head,
+  branch, bare, detached)=.
+
+The Elisp API adds =anvil-git-worktree-add= and
+=anvil-git-worktree-remove= (write operations, deliberately not
+exposed via MCP — =anvil-orchestrator= uses them to isolate
+parallel tasks).  Every call runs =git --no-pager -c
+core.quotepath=false ...= so Japanese paths round-trip cleanly
+and pager-configured repos don't leak terminal escapes.
+
+** HTTP module (optional)
+
+The =http= module is a thin wrapper around Emacs' built-in
+=url-retrieve-synchronously= that adds a SQLite-backed ETag/TTL cache
+(via =anvil-state=).  It is the right tool for static HTTP/JSON
+resources where a full browser session would be wasteful — REST APIs,
+=.json= endpoints that JS-challenge Chrome, RSS feeds, public docs
+polling.
+
+Add =http= to =anvil-optional-modules=.  The registered tools are:
+
+- =http-fetch= — GET with cache awareness.  Within
+  =anvil-http-cache-ttl-sec= (default 300 s) the response is served
+  without any network call; otherwise a conditional GET with
+  =If-None-Match= / =If-Modified-Since= is issued and a =304= refreshes
+  the cached entry with zero body transfer.  Retries =5xx= / =408= /
+  =429= with exponential backoff (=Retry-After= honoured on 429).
+- =http-head= — HEAD probe for cheap metadata checks; never cached.
+- =http-cache-clear= — drop a single URL or flush the whole http
+  namespace.
+
+Scheme guard: only =http= / =https= are accepted
+(=anvil-http-allowed-schemes=), so =file://= / =javascript:= are
+refused.  =url-max-redirections= is clamped to 5 per call, well below
+Emacs' default 30.
+
+Requires Emacs 29+ (for the built-in =sqlite-*= used by =anvil-state=).
 
 * Client setup — connecting your AI to Anvil
 

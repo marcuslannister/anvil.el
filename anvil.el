@@ -4,7 +4,7 @@
 
 ;; Author: zawatton
 ;; Keywords: comm, tools, ai, mcp
-;; Version: 0.2.1
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "28.2"))
 ;; URL: https://github.com/zawatton21/anvil.el
 
@@ -90,7 +90,15 @@ These are not loaded by default.  Available modules:
                 (ns / TTL / Lisp prin1 values, requires Emacs 29+,
                 Doc 08 Phase 1)
 - `http'      — HTTP client via `url-retrieve-synchronously' with a
-                state-backed ETag/TTL cache (Doc 09 Phase 1a)"
+                state-backed ETag/TTL cache (Doc 09 Phase 1a)
+- `orchestrator' — Parallel AI CLI dispatcher (claude today, more
+                   providers in Phase 2+) with concurrency-capped
+                   queue, state-persisted status, and a
+                   tabulated-list dashboard (Doc 10 Phase 1a)
+- `pty-broker' — node-pty TCP broker for TUI programs; moves PTY
+                 handling out of the Emacs daemon to avoid filter
+                 starvation / ConPTY stdin quirks (Doc 04 Phase 1,
+                 requires node + `npm install node-pty')"
   :type '(repeat symbol)
   :group 'anvil)
 
