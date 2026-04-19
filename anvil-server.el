@@ -4,7 +4,7 @@
 
 ;; Author: Laurynas Biveinis (original mcp-server-lib), zawatton (anvil fork)
 ;; Keywords: comm, tools
-;; Version: 0.2.0
+;; Version: 0.2.1
 ;; Package-Requires: ((emacs "27.1"))
 ;; URL: https://github.com/zawatton/anvil.el
 

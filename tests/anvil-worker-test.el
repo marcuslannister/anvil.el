@@ -568,7 +568,7 @@ deadlock on Windows (2026-04-16) that could not be broken with
               ;; isolate metrics state
               (anvil-worker--metrics-classify '(:read 3 :write 1))
               (anvil-worker--metrics-latency nil))
-      (let ((report (anvil-worker--tool-probe nil)))
+      (let ((report (anvil-worker--tool-probe)))
         (should (stringp report))
         (should (string-match-p "pool: read=2 write=1 batch=1" report))
         (should (string-match-p "\\[read\\]" report))
@@ -592,7 +592,7 @@ deadlock on Windows (2026-04-16) that could not be broken with
                (lambda () (push 'kill calls)))
               ((symbol-function 'anvil-worker-spawn)
                (lambda () (push 'spawn calls))))
-      (let ((ret (anvil-worker--tool-reset-pool nil)))
+      (let ((ret (anvil-worker--tool-reset-pool)))
         (should (stringp ret))
         (should (string-match-p "killed \\+ respawning" ret))
         ;; kill before spawn — order matters so the new daemons don't

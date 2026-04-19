@@ -4,7 +4,7 @@
 
 ;; Author: Laurynas Biveinis <laurynas.biveinis@gmail.com>
 ;; Keywords: tools, testing
-;; Version: 0.2.0
+;; Version: 0.2.1
 ;; URL: https://github.com/zawatton/anvil.el
 
 ;; This file is NOT part of GNU Emacs.

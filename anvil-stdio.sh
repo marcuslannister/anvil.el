@@ -43,6 +43,16 @@ if [ -n "$EMACS_MCP_DEBUG_LOG" ]; then
 	}
 
 	mcp_debug_log "INFO" "Debug logging enabled"
+
+	# Log version/path so future failure reports can tell which copy of
+	# anvil-stdio.sh was actually executed (opencode/zed MCP configs
+	# sometimes point to a checkout other than the user's working copy).
+	_anvil_script_path="$0"
+	_anvil_script_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo '?')"
+	_anvil_git_sha="$(git -C "$_anvil_script_dir" rev-parse --short HEAD 2>/dev/null || echo 'no-git')"
+	_anvil_mtime="$(stat -c %Y "$_anvil_script_path" 2>/dev/null || stat -f %m "$_anvil_script_path" 2>/dev/null || echo 'unknown')"
+	mcp_debug_log "INFO" "anvil-stdio.sh path=$_anvil_script_path git=$_anvil_git_sha mtime=$_anvil_mtime"
+	mcp_debug_log "INFO" "tooling bash=$(command -v bash || echo '?') sed=$(command -v sed || echo '?') tr=$(command -v tr || echo '?') base64=$(command -v base64 || echo '?') emacsclient=$(command -v emacsclient || echo '?')"
 else
 	# No-op function when debug logging is disabled
 	mcp_debug_log() {
@@ -178,20 +188,41 @@ while read -r line; do
 	# loses its `-print-nonl ' prefix and emacsclient prints it as
 	#   *ERROR*: Unknown message: <tail>
 	# interleaved with the legitimate base64 payload.  Strip those
-	# injection markers, then remove ALL CR/LF bytes (frame boundaries
-	# leave CRLF behind; whether awk recognises `\r' in its regex and
-	# whether it auto-strips CR with RS varies across gawk / mawk / MSYS
-	# builds, so do the CR/LF removal outside awk with `tr' for
-	# portability).  Finally decode with --ignore-garbage so any residual
-	# non-base64 bytes (odd whitespace, stray control chars) are tolerated
-	# instead of killing the whole script under `set -e'.
+	# injection markers with `sed s///g' (POSIX BRE, so `\*' is
+	# unambiguously a literal asterisk on every sed implementation --
+	# unlike `awk' where `\*' in ERE is treated differently by gawk /
+	# mawk / busybox / git-bash-bundled awk and may cause the strip to
+	# silently fail).  Then remove ALL CR/LF bytes; frame boundaries
+	# leave CRLF behind, and `tr' is trivially portable.  `--ignore-
+	# garbage' on the base64 decoder is NOT sufficient on its own: the
+	# marker text "ERROR Unknown message" is 15 base64-alphabet bytes
+	# that the decoder happily consumes as payload, throwing off the
+	# multiple-of-4 requirement and yielding `invalid input' under
+	# `set -e -o pipefail'.  Stripping the marker textually, before
+	# decoding, is what makes Windows work at all.
 	# (No-op on Linux/macOS where one frame fits in one read.)
 	base64_response=$(printf '%s' "$base64_response" \
-		| awk 'BEGIN{ORS=""} {sub(/^\*ERROR\*: Unknown message: /, ""); print}' \
+		| sed 's/\*ERROR\*: Unknown message: //g' \
 		| tr -d '\r\n')
 
-	# Decode the base64 content (lenient against stray non-base64 bytes)
-	formatted_response=$(echo -n "$base64_response" | base64 -d --ignore-garbage)
+	# Diagnostic: confirm strip actually happened.  If markers survived,
+	# base64 -d will almost certainly fail below, and we want the log to
+	# say so out loud rather than just ending at BASE64-RESPONSE.
+	_anvil_marker_survivors=$(printf '%s' "$base64_response" | grep -c '\*ERROR\*' || true)
+	mcp_debug_log "INFO" "after-strip len=${#base64_response} markers=$_anvil_marker_survivors"
+
+	# Decode the base64 content (lenient against stray non-base64 bytes).
+	# Capture rc/stderr explicitly so that a decode failure is logged
+	# instead of silently killing the script under `set -e -o pipefail'.
+	_anvil_decode_err="/tmp/mcp-decode-err.$$-$(date +%s%N)"
+	set +e
+	formatted_response=$(printf '%s' "$base64_response" | base64 -d --ignore-garbage 2>"$_anvil_decode_err")
+	_anvil_decode_rc=$?
+	set -e
+	if [ "$_anvil_decode_rc" != 0 ]; then
+		mcp_debug_log "DECODE-ERROR" "rc=$_anvil_decode_rc stderr=$(cat "$_anvil_decode_err" 2>/dev/null | tr '\n' ' ') input_head=${base64_response:0:160}"
+	fi
+	rm -f "$_anvil_decode_err"
 
 	mcp_debug_log "RESPONSE" "$formatted_response"
 

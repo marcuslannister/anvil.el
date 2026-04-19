@@ -276,11 +276,8 @@ ENABLED defaults to t."
 
 ;;; MCP tools
 
-(defun anvil-cron--tool-list (_args)
-  "List all scheduled tasks.
-
-MCP Parameters:
-  (none)"
+(defun anvil-cron--tool-list ()
+  "List all scheduled tasks."
   (anvil-cron-list))
 
 (defun anvil-cron--tool-run (task_id)
@@ -294,11 +291,8 @@ MCP Parameters:
       (error "task_id required"))
     (anvil-cron-run-now (intern task_id))))
 
-(defun anvil-cron--tool-status (_args)
-  "Show detailed status of all tasks.
-
-MCP Parameters:
-  (none)"
+(defun anvil-cron--tool-status ()
+  "Show detailed status of all tasks."
   (let (entries)
     (maphash
      (lambda (_id task)
