@@ -1,0 +1,350 @@
+;;; anvil-sexp-test.el --- Tests for anvil-sexp -*- lexical-binding: t; -*-
+
+;;; Commentary:
+
+;; Phase 1 ERT suite for `anvil-sexp'.  Covers reader primitives,
+;; read-only locators, preview/apply edit plans, and the verify
+;; diagnostics pipeline.
+
+;;; Code:
+
+(require 'ert)
+(require 'cl-lib)
+(require 'anvil-sexp)
+
+
+;;;; --- fixture helpers ----------------------------------------------------
+
+(defvar anvil-sexp-test--sample "\
+;;; sample.el --- fixture -*- lexical-binding: t; -*-
+
+;;; Commentary:
+;; A tiny sample with a few defining forms.
+
+;;; Code:
+
+(defvar sample-var 42
+  \"A variable we pretend matters.\")
+
+(defun sample-add (a b)
+  \"Return A plus B.\"
+  (+ a b))
+
+(defmacro sample-when-positive (x &rest body)
+  \"When X is positive evaluate BODY.\"
+  (declare (indent 1))
+  `(when (> ,x 0) ,@body))
+
+;; sample-add is called once:
+(sample-add 1 2)
+
+(provide 'sample)
+;;; sample.el ends here
+")
+
+(defun anvil-sexp-test--with-sample (fn)
+  "Write the sample fixture to a temp file and call FN with its path."
+  (let ((tmp (make-temp-file "anvil-sexp-test-" nil ".el")))
+    (unwind-protect
+        (progn
+          (with-temp-file tmp
+            (insert anvil-sexp-test--sample))
+          (funcall fn tmp))
+      (when (file-exists-p tmp) (delete-file tmp))
+      (let ((elc (concat tmp "c")))
+        (when (file-exists-p elc) (delete-file elc))))))
+
+
+;;;; --- reader primitives --------------------------------------------------
+
+(ert-deftest anvil-sexp-test-feature-provided ()
+  "The module's feature symbol is provided after load."
+  (should (featurep 'anvil-sexp)))
+
+(ert-deftest anvil-sexp-test-enable-disable-callable ()
+  "Enable and disable stubs exist."
+  (should (fboundp 'anvil-sexp-enable))
+  (should (fboundp 'anvil-sexp-disable)))
+
+(ert-deftest anvil-sexp-test-read-file-returns-forms ()
+  "read-file returns every top-level form with kind / name / range."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (let ((forms (anvil-sexp--read-file path)))
+       (should (>= (length forms) 5))
+       (let ((defun-form (cl-find-if
+                          (lambda (f) (eq (plist-get f :kind) 'defun))
+                          forms)))
+         (should defun-form)
+         (should (eq (plist-get defun-form :name) 'sample-add))
+         (should (integerp (plist-get defun-form :start)))
+         (should (> (plist-get defun-form :end)
+                    (plist-get defun-form :start))))))))
+
+(ert-deftest anvil-sexp-test-read-file-skips-comments ()
+  "Comments and blank lines do not show up as forms."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (let ((forms (anvil-sexp--read-file path)))
+       (should-not (cl-find-if
+                    (lambda (f) (eq (plist-get f :kind) 'Commentary:))
+                    forms))))))
+
+(ert-deftest anvil-sexp-test-find-form-by-name ()
+  "find-form-by-name locates a defun by symbol."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (let ((hit (anvil-sexp--find-form-by-name path 'sample-add)))
+       (should hit)
+       (should (eq (plist-get hit :kind) 'defun))))))
+
+(ert-deftest anvil-sexp-test-find-form-by-name-missing ()
+  "find-form-by-name returns nil when no form matches."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (should (null (anvil-sexp--find-form-by-name path 'does-not-exist))))))
+
+
+;;;; --- read-only MCP tools -----------------------------------------------
+
+(ert-deftest anvil-sexp-test-tool-read-file-shape ()
+  "sexp-read-file returns JSON-friendly plists with :text."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (let ((result (anvil-sexp--tool-read-file path)))
+       (should (listp result))
+       (dolist (entry result)
+         (should (stringp (plist-get entry :text))))
+       (let ((names (delq nil (mapcar (lambda (e) (plist-get e :name)) result))))
+         (should (member "sample-add" names))
+         (should (member "sample-var" names)))))))
+
+(ert-deftest anvil-sexp-test-surrounding-form ()
+  "surrounding-form identifies the enclosing defun for a given point."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (let* ((forms (anvil-sexp--read-file path))
+            (defun-form (cl-find-if
+                         (lambda (f) (eq (plist-get f :name) 'sample-add))
+                         forms))
+            (mid (/ (+ (plist-get defun-form :start)
+                       (plist-get defun-form :end))
+                    2))
+            (hit (anvil-sexp--tool-surrounding-form path mid)))
+       (should hit)
+       (should (equal (plist-get hit :name) "sample-add"))))))
+
+(ert-deftest anvil-sexp-test-surrounding-form-kind-filter ()
+  "surrounding-form respects the optional kind filter."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (let* ((forms (anvil-sexp--read-file path))
+            (defmacro-form (cl-find-if
+                            (lambda (f) (eq (plist-get f :name)
+                                            'sample-when-positive))
+                            forms))
+            (mid (/ (+ (plist-get defmacro-form :start)
+                       (plist-get defmacro-form :end))
+                    2)))
+       ;; Correct kind -> match.
+       (should (anvil-sexp--tool-surrounding-form path mid "defmacro"))
+       ;; Wrong kind -> no match.
+       (should-not (anvil-sexp--tool-surrounding-form path mid "defun"))))))
+
+(ert-deftest anvil-sexp-test-macroexpand ()
+  "sexp-macroexpand expands a named macro form."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (let ((out (anvil-sexp--tool-macroexpand
+                 path "sample-when-positive")))
+       (should (equal (plist-get out :name) "sample-when-positive"))
+       (should (stringp (plist-get out :expanded)))
+       (should (stringp (plist-get out :original)))))))
+
+(ert-deftest anvil-sexp-test-macroexpand-unknown ()
+  "sexp-macroexpand errors when the name does not exist."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (should (stringp (plist-get
+                       (anvil-sexp--tool-macroexpand path "sample-add")
+                       :original)))
+     (should-error
+      (anvil-sexp--tool-macroexpand path "nope-not-here")
+      :type 'anvil-server-tool-error))))
+
+
+;;;; --- edit plan: preview vs apply ----------------------------------------
+
+(ert-deftest anvil-sexp-test-replace-defun-preview ()
+  "Preview returns a plan but does not write the file."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (let* ((before (with-temp-buffer
+                      (insert-file-contents path)
+                      (buffer-string)))
+            (plan (anvil-sexp--tool-replace-defun
+                   path "sample-add"
+                   "(defun sample-add (a b)\n  \"Return A plus B.\"\n  (+ a b 0))"))
+            (after (with-temp-buffer
+                     (insert-file-contents path)
+                     (buffer-string))))
+       (should (plist-get plan :ops))
+       (should (stringp (plist-get plan :diff-preview)))
+       (should (null (plist-get plan :applied-at)))
+       (should (equal before after))))))
+
+(ert-deftest anvil-sexp-test-replace-defun-apply-writes ()
+  "apply=t writes the change and records :applied-at."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (let* ((new "(defun sample-add (a b)\n  \"Doubled.\"\n  (+ a b 100))")
+            (plan (anvil-sexp--tool-replace-defun
+                   path "sample-add" new "t"))
+            (after (with-temp-buffer
+                     (insert-file-contents path)
+                     (buffer-string))))
+       (should (plist-get plan :applied-at))
+       (should (string-match-p "(\\+ a b 100)" after))
+       (should-not (string-match-p "(\\+ a b)" after))))))
+
+(ert-deftest anvil-sexp-test-replace-defun-missing-refuses ()
+  "replace-defun refuses when the target name is absent."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (should-error
+      (anvil-sexp--tool-replace-defun
+       path "no-such-symbol" "(defun no-such-symbol () 1)" "t")
+      :type 'anvil-server-tool-error))))
+
+(ert-deftest anvil-sexp-test-replace-defun-invalid-new-form ()
+  "replace-defun refuses when NEW_FORM does not parse."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (should-error
+      (anvil-sexp--tool-replace-defun
+       path "sample-add" "(defun broken (" "t")
+      :type 'anvil-server-tool-error))))
+
+(ert-deftest anvil-sexp-test-wrap-form-previews ()
+  "wrap-form substitutes the placeholder and previews by default."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (let* ((forms (anvil-sexp--read-file path))
+            (call-form (cl-find-if
+                        (lambda (f)
+                          (let ((s (plist-get f :sexp)))
+                            (and (consp s) (eq (car s) 'sample-add))))
+                        forms))
+            (pos (plist-get call-form :start))
+            (plan (anvil-sexp--tool-wrap-form
+                   path pos
+                   "(when (numberp 1) |anvil-sexp-hole|)")))
+       (should (stringp (plist-get plan :diff-preview)))
+       (should (null (plist-get plan :applied-at)))
+       (let ((ops (plist-get plan :ops)))
+         (should (= 1 (length ops)))
+         (should (string-match-p "when (numberp 1)"
+                                 (plist-get (car ops) :replacement))))))))
+
+(ert-deftest anvil-sexp-test-wrap-form-requires-placeholder ()
+  "wrap-form refuses wrappers without the placeholder token."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (should-error
+      (anvil-sexp--tool-wrap-form path 10 "(when t nil)")
+      :type 'anvil-server-tool-error))))
+
+(ert-deftest anvil-sexp-test-apply-plan-is-order-safe ()
+  "Multiple ops on one file apply back-to-front without range drift."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (let* ((forms (anvil-sexp--read-file path))
+            (add (cl-find-if (lambda (f) (eq (plist-get f :name) 'sample-add)) forms))
+            (var (cl-find-if (lambda (f) (eq (plist-get f :name) 'sample-var)) forms))
+            (plan (list :ops
+                        (list
+                         (list :file path
+                               :range (cons (plist-get add :start)
+                                            (plist-get add :end))
+                               :replacement "(defun sample-add (a b) (+ a b 1))"
+                               :reason "test add")
+                         (list :file path
+                               :range (cons (plist-get var :start)
+                                            (plist-get var :end))
+                               :replacement "(defvar sample-var 99)"
+                               :reason "test var"))
+                        :summary "test" :diff-preview "")))
+       (anvil-sexp--apply-plan plan)
+       (let ((after (with-temp-buffer
+                      (insert-file-contents path)
+                      (buffer-string))))
+         (should (string-match-p "sample-var 99" after))
+         (should (string-match-p "(\\+ a b 1)" after)))))))
+
+
+;;;; --- verify pipeline ---------------------------------------------------
+
+(ert-deftest anvil-sexp-test-verify-clean-file ()
+  "verify on a clean fixture has no :kind 'error diagnostics."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (let ((r (anvil-sexp--tool-verify path nil nil)))
+       ;; Everything skipped when both checks disabled by "nil".
+       (should (equal (plist-get r :file) path))
+       (should (plist-get r :passed)))
+     (let ((r (anvil-sexp--tool-verify path)))
+       ;; Byte-compile on a normal fixture succeeds.
+       (should (plist-get r :passed))))))
+
+(ert-deftest anvil-sexp-test-verify-captures-warnings ()
+  "A file with an obviously unused lexical variable surfaces a warning."
+  (let ((tmp (make-temp-file "anvil-sexp-warn-" nil ".el")))
+    (unwind-protect
+        (progn
+          (with-temp-file tmp
+            (insert ";;; warn.el --- warns -*- lexical-binding: t; -*-\n"
+                    ";;; Commentary:\n;; warn.\n;;; Code:\n"
+                    "(defun anvil-sexp-test-unused ()\n"
+                    "  (let ((x 1)) 2))\n"
+                    "(provide 'warn)\n"
+                    ";;; warn.el ends here\n"))
+          (let ((r (anvil-sexp--tool-verify tmp nil "nil")))
+            ;; Some warning entry should exist.
+            (should (> (length (plist-get r :diagnostics)) 0))))
+      (when (file-exists-p tmp) (delete-file tmp))
+      (let ((elc (concat tmp "c")))
+        (when (file-exists-p elc) (delete-file elc))))))
+
+
+;;;; --- ship criterion: stub + verify + restore round-trip ----------------
+
+(ert-deftest anvil-sexp-test-ship-criterion-stub-and-restore ()
+  "Phase 1 ship criterion: replace a defun with a stub, verify, restore."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (let* ((forms (anvil-sexp--read-file path))
+            (original (plist-get
+                       (cl-find-if
+                        (lambda (f) (eq (plist-get f :name) 'sample-add))
+                        forms)
+                       :sexp))
+            (original-text (prin1-to-string original))
+            (stub "(defun sample-add (_a _b) \"Stub.\" 0)"))
+       ;; Stub.
+       (anvil-sexp--tool-replace-defun path "sample-add" stub "t")
+       (let ((after (with-temp-buffer (insert-file-contents path)
+                                      (buffer-string))))
+         (should (string-match-p "\"Stub\\.\"" after)))
+       ;; Verify still passes (or at least does not error).
+       (let ((v (anvil-sexp--tool-verify path nil "nil")))
+         (should (listp (plist-get v :diagnostics))))
+       ;; Restore.
+       (anvil-sexp--tool-replace-defun path "sample-add" original-text "t")
+       (let ((restored (with-temp-buffer (insert-file-contents path)
+                                         (buffer-string))))
+         (should (string-match-p "\\+ a b" restored))
+         (should-not (string-match-p "\"Stub\\.\"" restored)))))))
+
+
+(provide 'anvil-sexp-test)
+;;; anvil-sexp-test.el ends here
