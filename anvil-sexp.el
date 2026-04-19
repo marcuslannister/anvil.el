@@ -58,6 +58,16 @@
     define-error)
   "Top-level forms recognized as carrying a name in their second position.")
 
+(defconst anvil-sexp--function-defining-forms
+  '(defun defmacro defsubst defalias
+    cl-defun cl-defmacro cl-defgeneric cl-defmethod
+    define-minor-mode define-derived-mode define-globalized-minor-mode
+    define-obsolete-function-alias)
+  "Subset of defining forms whose name refers to a function or macro.
+`anvil-sexp-replace-defun' restricts matching to this set so a
+caller asking to replace foo the function does not accidentally
+hit foo the variable.")
+
 
 ;;;; --- form inspection helpers --------------------------------------------
 
@@ -67,13 +77,17 @@
 
 (defun anvil-sexp--form-name (sexp)
   "Return the defined name carried by SEXP, or nil if none.
-Recognizes the operators in `anvil-sexp--defining-forms'."
+Recognizes the operators in `anvil-sexp--defining-forms'.  Also
+handles `cl-defstruct' and similar forms whose name position may
+be a list of the shape (NAME :option value ...), returning the
+leading NAME."
   (when (and (consp sexp)
              (memq (car sexp) anvil-sexp--defining-forms)
              (consp (cdr sexp)))
     (let ((name (cadr sexp)))
       (cond ((symbolp name) name)
             ((stringp name) (intern name))
+            ((and (consp name) (symbolp (car name))) (car name))
             (t nil)))))
 
 
@@ -92,23 +106,49 @@ Ensures `;' comments and string escapes behave correctly during
   (forward-comment most-positive-fixnum)
   (if (eobp) nil (point)))
 
+(defun anvil-sexp--cookie-start-before (form-start)
+  "Return start-of-line of the topmost `;;;###' cookie block before FORM-START.
+Returns nil when no cookie line directly precedes FORM-START on
+its own line.  A cookie block is any run of consecutive lines each
+beginning with `;;;###' (e.g. `;;;###autoload', `;;;###tramp-autoload')
+whose last line ends immediately before FORM-START's line."
+  (save-excursion
+    (goto-char form-start)
+    (beginning-of-line)
+    ;; If form-start is not at column 0 we can't attribute a cookie
+    ;; above — the form shares its line with something else.
+    (when (= (point) form-start)
+      (let ((cookie-top nil))
+        (while (and (> (point) (point-min))
+                    (save-excursion
+                      (forward-line -1)
+                      (looking-at-p "^;;;###")))
+          (forward-line -1)
+          (setq cookie-top (point)))
+        cookie-top))))
+
 (defun anvil-sexp--read-current-buffer ()
   "Return list of top-level form plists for the current buffer.
 Each element is (:sexp SEXP :start POS :end POS :kind SYMBOL
-:name SYMBOL-OR-NIL).  Positions are 1-based buffer points."
+:name SYMBOL-OR-NIL :form-start POS).  :start includes any
+`;;;###...' autoload cookies directly above the form; :form-start
+points at the opening paren itself."
   (goto-char (point-min))
   (let (forms)
     (while (anvil-sexp--skip-to-form)
-      (let* ((start (point))
+      (let* ((form-start (point))
              (sexp (condition-case err
                        (read (current-buffer))
                      (end-of-file (signal (car err) (cdr err)))
                      (invalid-read-syntax
                       (error "Invalid elisp at position %d: %s"
-                             start (error-message-string err)))))
-             (end (point)))
+                             form-start (error-message-string err)))))
+             (end (point))
+             (cookie-start (anvil-sexp--cookie-start-before form-start))
+             (start (or cookie-start form-start)))
         (push (list :sexp sexp
                     :start start
+                    :form-start form-start
                     :end end
                     :kind (anvil-sexp--form-kind sexp)
                     :name (anvil-sexp--form-name sexp))
@@ -125,13 +165,17 @@ Each element is (:sexp SEXP :start POS :end POS :kind SYMBOL
 (defun anvil-sexp--find-form-by-name (path name &optional kind)
   "Return form plist in PATH whose :name equals NAME.
 When KIND is non-nil restrict to forms whose :kind matches.
-Returns nil when no form matches."
-  (let ((target (if (symbolp name) name (intern name))))
+KIND may be a single symbol, a string, or a list of symbols
+(matches if the form's kind is `memq'-in the list)."
+  (let ((target (if (symbolp name) name (intern name)))
+        (kinds (cond ((null kind) nil)
+                     ((listp kind) kind)
+                     ((symbolp kind) (list kind))
+                     ((stringp kind) (list (intern kind))))))
     (cl-find-if (lambda (f)
                   (and (eq (plist-get f :name) target)
-                       (or (null kind)
-                           (eq (plist-get f :kind)
-                               (if (symbolp kind) kind (intern kind))))))
+                       (or (null kinds)
+                           (memq (plist-get f :kind) kinds))))
                 (anvil-sexp--read-file path))))
 
 (defun anvil-sexp--file-substring (path beg end)
@@ -166,12 +210,36 @@ Returns nil when no form matches."
         :summary (format "%s: 1 op on %s" reason (file-name-nondirectory file))
         :diff-preview (anvil-sexp--unified-diff file beg end replacement)))
 
+(defun anvil-sexp--assert-ops-non-overlapping (ops)
+  "Signal an error when any two OPS on the same file overlap.
+Ops that abut exactly (a-end == b-start) are allowed; any strict
+overlap is refused so back-to-front application cannot silently
+use stale coordinates."
+  (let ((by-file (make-hash-table :test 'equal)))
+    (dolist (op ops)
+      (push op (gethash (plist-get op :file) by-file)))
+    (maphash
+     (lambda (file file-ops)
+       (let ((sorted (sort (copy-sequence file-ops)
+                           (lambda (a b) (< (car (plist-get a :range))
+                                            (car (plist-get b :range)))))))
+         (cl-loop for (a b) on sorted while b do
+                  (let ((a-end (cdr (plist-get a :range)))
+                        (b-beg (car (plist-get b :range))))
+                    (when (> a-end b-beg)
+                      (error "anvil-sexp: overlapping ops in %s: %S vs %S"
+                             file (plist-get a :range)
+                             (plist-get b :range)))))))
+     by-file)))
+
 (defun anvil-sexp--apply-plan (plan)
   "Write every op in PLAN to disk.  Return PLAN with :applied-at added.
 Ops on the same file are applied back-to-front so earlier ranges stay
-valid after later replacements shift text."
+valid after later replacements shift text.  Refuses when any two
+ops on the same file overlap."
   (let* ((ops (plist-get plan :ops))
          (by-file (make-hash-table :test 'equal)))
+    (anvil-sexp--assert-ops-non-overlapping ops)
     (dolist (op ops)
       (push op (gethash (plist-get op :file) by-file)))
     (maphash
@@ -192,14 +260,21 @@ valid after later replacements shift text."
     (append plan (list :applied-at (format-time-string "%FT%T%z")))))
 
 (defun anvil-sexp--truthy (v)
-  "Non-nil when V is a non-empty truthy MCP value.
-Treats the strings \"nil\", \"false\", \"0\", \"\", and the elisp
-symbol nil as falsy; everything else is truthy.  Used to unify
-the apply/byte_compile/checkdoc/all argument shapes coming over
-the MCP wire."
+  "Non-nil when V is a truthy MCP value.
+Every shape a JSON/elisp bridge can produce for \"false\" is
+treated as falsy:
+  - elisp nil
+  - :json-false / :false (json.el / other JSON readers)
+  - strings \"\", \"nil\", \"false\", \"0\" (case-insensitive,
+    surrounding whitespace trimmed)
+Any other value is truthy.  Used to unify the
+apply/byte_compile/checkdoc/all argument shapes coming across the
+MCP wire."
   (cond ((null v) nil)
+        ((or (eq v :json-false) (eq v :false)) nil)
         ((stringp v)
-         (not (member (downcase v) '("" "nil" "false" "0"))))
+         (let ((norm (downcase (string-trim v))))
+           (not (member norm '("" "nil" "false" "0")))))
         (t t)))
 
 (defun anvil-sexp--maybe-apply (plan apply)
@@ -336,9 +411,11 @@ form with NAME is found."
   (anvil-server-with-error-handling
    (unless (file-readable-p file)
      (error "anvil-sexp-replace-defun: cannot read %s" file))
-   (let* ((form (anvil-sexp--find-form-by-name file name)))
+   (let* ((form (anvil-sexp--find-form-by-name
+                 file name anvil-sexp--function-defining-forms)))
      (unless form
-       (error "anvil-sexp-replace-defun: no form named %s in %s" name file))
+       (error "anvil-sexp-replace-defun: no function-like form named %s in %s (defvar/defcustom are not targets of this tool)"
+              name file))
      ;; Validate replacement parses as one sexp
      (anvil-sexp--parse-sexp-string new_form "replace-defun new_form")
      (let* ((beg (plist-get form :start))
@@ -476,9 +553,12 @@ leak in."
                 (checkdoc-autofix-flag 'never)
                 (checkdoc-spellcheck-documentation-flag nil)
                 (checkdoc-verb-check-experimental-flag nil))
-            (condition-case _
+            (condition-case err
                 (checkdoc-file file)
-              (error nil)))
+              (error
+               (push (list :kind 'error :source 'checkdoc :line 0
+                           :message (error-message-string err))
+                     diags))))
           (with-current-buffer warn-buf
             (goto-char (point-min))
             (while (re-search-forward
@@ -530,6 +610,52 @@ later phase when needed."
                                (lambda (d) (eq (plist-get d :kind) 'error))
                                diags)))
            :diagnostics diags))))
+
+
+;;;; --- public elisp API (Doc 12 Phase 1) ---------------------------------
+
+;; Thin keyword-style wrappers over the flat `--tool-*' handlers.
+;; The flat form is what `anvil-server-register-tool' expects from
+;; an MCP client; elisp callers get the nicer shape described in
+;; Doc 12's Public API section.
+
+(cl-defun anvil-sexp-read-file (path &key _include)
+  "List top-level forms in PATH.  See `sexp-read-file' MCP tool.
+`:include' is accepted for forward compatibility with Doc 12
+Phase 1+ but is currently ignored; the reader already skips
+strings and comments by construction."
+  (anvil-sexp--tool-read-file path))
+
+(cl-defun anvil-sexp-surrounding-form (file point &key kind)
+  "Return the top-level form containing POINT in FILE.  See
+`sexp-surrounding-form' MCP tool for argument semantics."
+  (anvil-sexp--tool-surrounding-form file point
+                                     (and kind (symbol-name kind))))
+
+(cl-defun anvil-sexp-replace-defun (file name new-form &key apply)
+  "Replace the function-like form named NAME in FILE with NEW-FORM.
+NEW-FORM is an elisp source string.  See `sexp-replace-defun' MCP
+tool; defaults to preview unless APPLY is non-nil."
+  (anvil-sexp--tool-replace-defun file name new-form (when apply "t")))
+
+(cl-defun anvil-sexp-wrap-form (file point wrapper &key apply)
+  "Wrap the sexp surrounding POINT in FILE with WRAPPER.
+WRAPPER is source text containing `|anvil-sexp-hole|'.  See
+`sexp-wrap-form' MCP tool."
+  (anvil-sexp--tool-wrap-form file point wrapper (when apply "t")))
+
+(cl-defun anvil-sexp-macroexpand (file name &key all)
+  "Macroexpand the form named NAME in FILE.  See `sexp-macroexpand'
+MCP tool.  When ALL is non-nil uses `macroexpand-all'."
+  (anvil-sexp--tool-macroexpand file name (when all "t")))
+
+(cl-defun anvil-sexp-verify (file &key (byte-compile t) (checkdoc t))
+  "Run byte-compile and checkdoc on FILE and return diagnostics.
+See `sexp-verify' MCP tool.  Pass :byte-compile nil or :checkdoc
+nil to skip a check."
+  (anvil-sexp--tool-verify file
+                           (if byte-compile "t" "nil")
+                           (if checkdoc "t" "nil")))
 
 
 ;;;; --- module lifecycle ---------------------------------------------------

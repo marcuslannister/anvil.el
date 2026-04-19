@@ -346,5 +346,161 @@
          (should-not (string-match-p "\"Stub\\.\"" restored)))))))
 
 
+;;;; --- review feedback: truthy edge cases --------------------------------
+
+(ert-deftest anvil-sexp-test-truthy-json-false ()
+  "anvil-sexp--truthy treats JSON-shaped falsy values as nil."
+  (should-not (anvil-sexp--truthy nil))
+  (should-not (anvil-sexp--truthy :json-false))
+  (should-not (anvil-sexp--truthy :false))
+  (should-not (anvil-sexp--truthy ""))
+  (should-not (anvil-sexp--truthy "nil"))
+  (should-not (anvil-sexp--truthy "NIL"))
+  (should-not (anvil-sexp--truthy "false"))
+  (should-not (anvil-sexp--truthy "FALSE"))
+  (should-not (anvil-sexp--truthy "0"))
+  (should-not (anvil-sexp--truthy "  false  "))
+  (should-not (anvil-sexp--truthy "\tnil\n"))
+  (should (anvil-sexp--truthy t))
+  (should (anvil-sexp--truthy "t"))
+  (should (anvil-sexp--truthy "true"))
+  (should (anvil-sexp--truthy 1)))
+
+(ert-deftest anvil-sexp-test-json-false-preview-safe ()
+  "apply=:json-false must not write the file — safety invariant."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (let ((before (with-temp-buffer (insert-file-contents path)
+                                     (buffer-string))))
+       (anvil-sexp--tool-replace-defun
+        path "sample-add"
+        "(defun sample-add (a b) \"x\" 99)"
+        :json-false)
+       (let ((after (with-temp-buffer (insert-file-contents path)
+                                      (buffer-string))))
+         (should (equal before after)))))))
+
+
+;;;; --- review feedback: kind restriction on replace-defun ---------------
+
+(ert-deftest anvil-sexp-test-replace-defun-refuses-defvar ()
+  "replace-defun targets function-defining forms only, not defvar."
+  (let ((tmp (make-temp-file "anvil-sexp-collide-" nil ".el")))
+    (unwind-protect
+        (progn
+          (with-temp-file tmp
+            (insert ";;; collide.el --- -*- lexical-binding: t; -*-\n"
+                    ";;; Commentary:\n;; collide.\n;;; Code:\n"
+                    "(defvar sample-name 1 \"var.\")\n\n"
+                    "(defun other-fn () nil)\n"
+                    "(provide 'collide)\n"
+                    ";;; collide.el ends here\n"))
+          (should-error
+           (anvil-sexp--tool-replace-defun
+            tmp "sample-name" "(defvar sample-name 2)" "t")
+           :type 'anvil-server-tool-error))
+      (when (file-exists-p tmp) (delete-file tmp))
+      (let ((elc (concat tmp "c")))
+        (when (file-exists-p elc) (delete-file elc))))))
+
+
+;;;; --- review feedback: apply-plan overlap detection -------------------
+
+(ert-deftest anvil-sexp-test-apply-plan-refuses-overlap ()
+  "Overlapping ops on one file cause apply-plan to signal an error."
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (let ((plan (list :ops
+                       (list (list :file path
+                                   :range (cons 10 30)
+                                   :replacement ""
+                                   :reason "a")
+                             (list :file path
+                                   :range (cons 20 40)
+                                   :replacement ""
+                                   :reason "b"))
+                       :summary "test" :diff-preview "")))
+       (should-error (anvil-sexp--apply-plan plan))))))
+
+
+;;;; --- review feedback: autoload cookie inclusion -----------------------
+
+(ert-deftest anvil-sexp-test-autoload-cookie-included-in-range ()
+  "`;;;###autoload' cookies preceding a defun are part of the form range."
+  (let ((tmp (make-temp-file "anvil-sexp-auto-" nil ".el")))
+    (unwind-protect
+        (progn
+          (with-temp-file tmp
+            (insert ";;; auto.el --- -*- lexical-binding: t; -*-\n"
+                    ";;; Commentary:\n;; auto.\n;;; Code:\n"
+                    ";;;###autoload\n"
+                    "(defun sample-auto () \"doc.\" 1)\n"
+                    "(provide 'auto)\n"
+                    ";;; auto.el ends here\n"))
+          (let* ((forms (anvil-sexp--read-file tmp))
+                 (f (cl-find-if (lambda (e) (eq (plist-get e :name) 'sample-auto))
+                                forms)))
+            (should f)
+            (should (< (plist-get f :start) (plist-get f :form-start)))
+            (let ((text (with-temp-buffer
+                          (insert-file-contents tmp)
+                          (buffer-substring-no-properties
+                           (plist-get f :start)
+                           (plist-get f :end)))))
+              (should (string-match-p "^;;;###autoload" text)))))
+      (when (file-exists-p tmp) (delete-file tmp))
+      (let ((elc (concat tmp "c")))
+        (when (file-exists-p elc) (delete-file elc))))))
+
+
+;;;; --- review feedback: cl-defstruct with options ----------------------
+
+(ert-deftest anvil-sexp-test-cl-defstruct-with-options-name ()
+  "cl-defstruct (NAME :option val ...) forms still surface NAME."
+  (let ((tmp (make-temp-file "anvil-sexp-struct-" nil ".el")))
+    (unwind-protect
+        (progn
+          (with-temp-file tmp
+            (insert ";;; struct.el --- -*- lexical-binding: t; -*-\n"
+                    ";;; Commentary:\n;; struct.\n;;; Code:\n"
+                    "(require 'cl-lib)\n"
+                    "(cl-defstruct (anvil-sexp-test-point (:predicate nil)) x y)\n"
+                    "(provide 'struct)\n"
+                    ";;; struct.el ends here\n"))
+          (let* ((forms (anvil-sexp--read-file tmp))
+                 (f (cl-find-if (lambda (e) (eq (plist-get e :kind) 'cl-defstruct))
+                                forms)))
+            (should f)
+            (should (eq (plist-get f :name) 'anvil-sexp-test-point))))
+      (when (file-exists-p tmp) (delete-file tmp))
+      (let ((elc (concat tmp "c")))
+        (when (file-exists-p elc) (delete-file elc))))))
+
+
+;;;; --- review feedback: public elisp API wrappers ----------------------
+
+(ert-deftest anvil-sexp-test-public-api-wrappers-callable ()
+  "Doc 12 Phase 1 public names resolve and delegate to tool handlers."
+  (should (fboundp 'anvil-sexp-read-file))
+  (should (fboundp 'anvil-sexp-surrounding-form))
+  (should (fboundp 'anvil-sexp-replace-defun))
+  (should (fboundp 'anvil-sexp-wrap-form))
+  (should (fboundp 'anvil-sexp-macroexpand))
+  (should (fboundp 'anvil-sexp-verify))
+  (anvil-sexp-test--with-sample
+   (lambda (path)
+     (let ((entries (anvil-sexp-read-file path)))
+       (should (listp entries))
+       (should (> (length entries) 0))
+       (should (member "sample-add"
+                       (delq nil (mapcar (lambda (e) (plist-get e :name))
+                                         entries)))))
+     (let ((plan (anvil-sexp-replace-defun
+                  path "sample-add"
+                  "(defun sample-add (a b) \"New.\" (* a b))")))
+       (should (plist-get plan :ops))
+       (should-not (plist-get plan :applied-at))))))
+
+
 (provide 'anvil-sexp-test)
 ;;; anvil-sexp-test.el ends here
