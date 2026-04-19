@@ -7,7 +7,7 @@
   :PROPERTIES:
   :ID:       019da30b-92e3-7674-976d-020f7465940b
   :END:
-~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 + 4b + 5 + 6C MVP SHIPPED (develop branch)~ (2026-04-19)
+~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 + 4b + 5 + 6C MVP + 6C' SHIPPED (develop branch)~ (2026-04-19)
 
 - Phase 1a (commit 45468b2): provider abstraction, claude provider,
   spawn + sentinel + timeout, pool + concurrency cap, state
@@ -122,7 +122,34 @@
   skips). Non-goal (6C' に延期): DAG resume across daemon
   restart、Retry-After header、per-provider backoff schedule。
 
-Doc 10 の全 Phase (1a / 1b / 2 / 2b / 3 / 3b / 4 / 4b / 5 / 6C MVP) を
+- Phase 6C' (commit f2cc383, merge 69c304d, branch
+  feat/orchestrator-phase-6c-prime): 6C MVP の上に 2 つの独立な
+  refinement を重ねる。Task A =Retry-After= header honouring: 新
+  helper =--stderr-retry-after-ms= が stderr 先頭 8 KiB を
+  case-insensitive で scan し、=Retry-After: N= (HTTP header) or
+  =\"retry_after\": N= (JSON error body) を整数秒として拾い N*1000
+  ms を [0, 600000] に clamp (10 分の sanity cap)。=--finalize= が
+  failed 時に =:retry-after-ms= を task record に set、retry logic
+  が provider の explicit hint を見られる。Task B per-provider
+  backoff: =anvil-orchestrator-per-provider-backoff= defcustom
+  (alist of provider → plist of =:base-ms= / =:max-delay-ms= /
+  =:jitter-pct= overrides, default nil)。新 helper
+  =--resolve-backoff (provider)= が per-key fallback (numeric
+  override が勝ち、それ以外は global defcustom) で effective plist
+  を返す。=--compute-retry-delay-ms= signature を
+  =(tries &optional provider retry-after-ms)= に拡張: backoff
+  base/cap/jitter を per-provider に解決、RETRY-AFTER-MS が数値の
+  時は =(max retry-after-ms computed)= で provider-authoritative
+  floor を実装。既存 1-arg caller は backward compatible。
+  =--maybe-auto-retry= は task の provider と :retry-after-ms を
+  helper に渡して両 refinement を全自動 retry clone に適用。
+  dogfooded (codex 3 並列 A/B/C → claude Edit 統合)。ERT +6
+  (= 114 pass / 1 live skip in anvil-orchestrator-test.el, 426
+  total across the suite, 2 live skips). Non-goal (6C'' / 6C''' に
+  延期): DAG resume across daemon restart、HTTP-date 形式の
+  Retry-After、その他 rate-limit hint format。
+
+Doc 10 の全 Phase (1a / 1b / 2 / 2b / 3 / 3b / 4 / 4b / 5 / 6C MVP / 6C') を
 develop branch 上で ship 済み。さらに同日の 2 件 bug fix (commit
 31d2f3f stdin EOF / 5a2610f shared-tail copy-sequence) も含む。
 Review Questions Q1-Q12 resolved 状態キープ。
