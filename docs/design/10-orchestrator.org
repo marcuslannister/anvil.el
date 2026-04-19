@@ -7,7 +7,7 @@
   :PROPERTIES:
   :ID:       019da30b-92e3-7674-976d-020f7465940b
   :END:
-~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 + 4b + 5 SHIPPED (develop branch)~ (2026-04-19)
+~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 + 4b + 5 + 6C MVP SHIPPED (develop branch)~ (2026-04-19)
 
 - Phase 1a (commit 45468b2): provider abstraction, claude provider,
   spawn + sentinel + timeout, pool + concurrency cap, state
@@ -100,7 +100,29 @@
   ERT +12 (= 102 pass / 1 live skip in anvil-orchestrator-test.el,
   414 total across the suite, 2 live skips).
 
-Doc 10 の全 Phase (1a / 1b / 2 / 2b / 3 / 3b / 4 / 4b / 5) を
+- Phase 6C MVP (commit fa98020, merge 777c2a3, branch
+  feat/orchestrator-phase-6c-mvp): auto-retry を production-grade
+  化。3 defcustoms 追加: =auto-retry-base-ms= (既定 200 ms)、
+  =auto-retry-max-delay-ms= (既定 30000 ms, 上限 cap)、
+  =auto-retry-jitter-pct= (既定 25, 内部で [0,100] clamp)。
+  =auto-retry-on= の default list に =network= symbol を追加
+  (infrastructure は既にあったが対象外扱いだった)。新 helper
+  =--compute-retry-delay-ms (tries)= は min(cap, base * 2^tries)
+  に対称 full-jitter (raw ± raw*pct/100) を適用、jitter=0 で
+  deterministic。=--maybe-auto-retry= を helper 呼び出しに
+  書き換え、retry clone に =:retry-reason= (auto-retry-code) を
+  付与して dashboard / analytics / resume 側で「なぜ clone したか」
+  を追跡可能に。=--dashboard-entries= の Status column は
+  =:retry-count= 正の時 ="done×2"= / ="failed×1"= 形式で render
+  (column width 10 は "failed×9" 最悪ケースに収まる)。実装は
+  orchestrator 自身で dogfood: codex Phase 5 に 3 並列 dispatch
+  (defcustoms / helpers / dashboard+tests) → claude が Edit で
+  統合。ERT +6 (= 108 pass / 1 live skip in
+  anvil-orchestrator-test.el, 420 total across the suite, 2 live
+  skips). Non-goal (6C' に延期): DAG resume across daemon
+  restart、Retry-After header、per-provider backoff schedule。
+
+Doc 10 の全 Phase (1a / 1b / 2 / 2b / 3 / 3b / 4 / 4b / 5 / 6C MVP) を
 develop branch 上で ship 済み。さらに同日の 2 件 bug fix (commit
 31d2f3f stdin EOF / 5a2610f shared-tail copy-sequence) も含む。
 Review Questions Q1-Q12 resolved 状態キープ。
