@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-04-19
+
+Hotfix surfaced by the v0.3.0 orchestrator benchmark
+([develop: `benchmarks/results/report-2026-04-19.org`](https://github.com/zawatton/anvil.el/blob/develop/benchmarks/results/report-2026-04-19.org)).
+The bench's first programmatic `orchestrator-*` call hit the
+cons-return bug; every fix here fell out of the investigation.
+
+### Fixed
+
+- **`orchestrator` MCP wrappers returned plists instead of strings**,
+  tripping the `anvil-server` contract and breaking every
+  programmatic `orchestrator-*` call from Claude Code / OpenCode /
+  other MCP clients with `"Tool handler must return string or nil,
+  got: cons"`. Added `anvil-orchestrator--encode-handler` which
+  wraps each registered tool at registration time and JSON-encodes
+  the plist result. Tool bodies stay unchanged (and still return
+  rich plists for direct Elisp / ERT callers).
+- Added `anvil-orchestrator--batch-task-ids` accessor + docstring
+  note on the `anvil-orchestrator--batches` /
+  `anvil-orchestrator--consensus-groups` shape asymmetry, so future
+  callers stay decoupled from the storage representation.
+
+### Changed
+
+- Raised the `codex` per-provider concurrency default from **3 → 6**.
+  The v0.3.0 ramp benchmark reached 8 concurrent `codex` jobs on
+  ChatGPT Plus OAuth with zero 429s; the old default was defensive
+  past its evidence. Users on throttled accounts can set it back
+  via `anvil-orchestrator-per-provider-concurrency`.
+
 ## [0.3.0] - 2026-04-19
 
 Major release covering 10 design documents worth of new primitives:
@@ -125,6 +155,7 @@ Initial tagged release — see git history for details.
 
 Project inception.
 
+[0.3.1]: https://github.com/zawatton21/anvil.el/releases/tag/v0.3.1
 [0.3.0]: https://github.com/zawatton21/anvil.el/releases/tag/v0.3.0
 [0.2.1]: https://github.com/zawatton21/anvil.el/releases/tag/v0.2.1
 [0.2.0]: https://github.com/zawatton21/anvil.el/releases/tag/v0.2.0
