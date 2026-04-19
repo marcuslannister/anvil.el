@@ -1024,14 +1024,11 @@ comparison visible in `anvil-worker-latency-metrics-show'."
 (defvar anvil-worker--server-id "emacs-eval"
   "MCP server ID for `anvil-worker' tool registration.")
 
-(defun anvil-worker--tool-probe (_args)
+(defun anvil-worker--tool-probe ()
   "Return a per-lane status report: workers, PIDs, metrics summary.
 
 Uses the non-blocking `quick-alive-p' check so the response is
-cheap enough to poll at interactive rates.
-
-MCP Parameters:
-  (none)"
+cheap enough to poll at interactive rates."
   (anvil-server-with-error-handling
     (unless anvil-worker--pool
       (anvil-worker--init-pool))
@@ -1080,14 +1077,11 @@ MCP Parameters:
         (push (format "latency:  %s" latency-summary) lines))
       (mapconcat #'identity (nreverse lines) "\n"))))
 
-(defun anvil-worker--tool-reset-pool (_args)
+(defun anvil-worker--tool-reset-pool ()
   "Kill all workers, then respawn fresh daemons.  Recovers from stuck pool.
 
 Does NOT drop metrics (classify / latency) — use the UI
-`r' key or `anvil-worker-latency-metrics-reset' for that.
-
-MCP Parameters:
-  (none)"
+`r' key or `anvil-worker-latency-metrics-reset' for that."
   (anvil-server-with-error-handling
     (anvil-worker-kill)
     (anvil-worker-spawn)
