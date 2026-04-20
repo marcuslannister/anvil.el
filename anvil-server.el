@@ -784,41 +784,54 @@ This is called after successful initialization to complete the handshake.
 The client sends this notification to acknowledge the server's response
 to the initialize request.")
 
+(defvar anvil-server-tool-filter-function nil
+  "Optional filter applied to tools/list advertisements.
+When bound to a function, it is called with (TOOL-ID TOOL-PLIST) for
+each registered tool and must return non-nil to keep the tool in the
+response.  Handlers remain live either way, so hidden tools stay
+callable via explicit tools/call.
+
+Set by `anvil-manifest' (Doc 26) to implement ANVIL_PROFILE.")
+
 (defun anvil-server--handle-tools-list (id server-id)
   "Handle tools/list request with ID for SERVER-ID.
-Returns a list of all registered tools with their metadata."
+Returns a list of registered tools with their metadata, minus any
+filtered out by `anvil-server-tool-filter-function'."
   (let ((tool-list (vector)))
     (when-let* ((tools-table
                  (gethash server-id anvil-server--tools)))
       (maphash
        (lambda (tool-id tool)
-         (let* ((tool-description (plist-get tool :description))
-                (tool-title (plist-get tool :title))
-                (tool-read-only (plist-get tool :read-only))
-                (tool-schema
-                 (or (plist-get tool :schema) '((type . "object"))))
-                (tool-entry
-                 `((name . ,tool-id)
-                   (description . ,tool-description)
-                   (inputSchema . ,tool-schema)))
-                (annotations nil))
-           ;; Collect annotations if present
-           (when tool-title
-             (push (cons 'title tool-title) annotations))
-           ;; Add readOnlyHint when :read-only is explicitly provided (both t
-           ;; and nil)
-           (when (plist-member tool :read-only)
-             (let ((annot-value
-                    (if tool-read-only
-                        t
-                      :json-false)))
-               (push (cons 'readOnlyHint annot-value) annotations)))
-           ;; Add annotations to tool entry if any exist
-           (when annotations
-             (setq tool-entry
-                   (append
-                    tool-entry `((annotations . ,annotations)))))
-           (setq tool-list (vconcat tool-list (vector tool-entry)))))
+         (when (or (null anvil-server-tool-filter-function)
+                   (funcall anvil-server-tool-filter-function
+                            tool-id tool))
+           (let* ((tool-description (plist-get tool :description))
+                  (tool-title (plist-get tool :title))
+                  (tool-read-only (plist-get tool :read-only))
+                  (tool-schema
+                   (or (plist-get tool :schema) '((type . "object"))))
+                  (tool-entry
+                   `((name . ,tool-id)
+                     (description . ,tool-description)
+                     (inputSchema . ,tool-schema)))
+                  (annotations nil))
+             ;; Collect annotations if present
+             (when tool-title
+               (push (cons 'title tool-title) annotations))
+             ;; Add readOnlyHint when :read-only is explicitly provided (both t
+             ;; and nil)
+             (when (plist-member tool :read-only)
+               (let ((annot-value
+                      (if tool-read-only
+                          t
+                        :json-false)))
+                 (push (cons 'readOnlyHint annot-value) annotations)))
+             ;; Add annotations to tool entry if any exist
+             (when annotations
+               (setq tool-entry
+                     (append
+                      tool-entry `((annotations . ,annotations)))))
+             (setq tool-list (vconcat tool-list (vector tool-entry))))))
        tools-table))
     (anvil-server--jsonrpc-response id `((tools . ,tool-list)))))
 

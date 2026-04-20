@@ -1,15 +1,28 @@
 #+title: anvil-manifest-profile — Per-Session tools/list Filter
 #+date: 2026-04-20
 #+author: zawatton
-#+property: status DRAFT
+#+property: status APPROVED
 #+property: scope GENERIC
 
 * STATUS
   :PROPERTIES:
   :ID:       c6f05c1e-72a6-4e3b-87a6-d0a6a3b7c001
   :END:
-~DRAFT~ (2026-04-20) — Week-3 Ship 1, 競合 token-savior の
-=TOKEN_SAVIOR_PROFILE= を anvil に移植する。実装 ETA 半日。
+~APPROVED~ (2026-04-20) — DRAFT 1 回目は Phase 1 impl を main session
+で先行 ship したが、*opt-in 化* と *Phase 0 実測* を待たずに develop
+merge した点で別 session の review から reset がかかった。
+
+方針調整 (2026-04-20 review):
+- =manifest= モジュールは =anvil-optional-modules= 側に置く。
+  =anvil-modules= default からは外す。既存挙動と完全互換。
+- Phase 1 impl (=anvil-manifest.el= + filter hook + manifest-cost
+  tool + 16 ERT) は feat/doc-26-manifest-profile で cherry-pick 済、
+  self-PR 経由で squash merge 予定。
+- Phase 0 として *actual token 実測* を先に走らせ、main session
+  (Opus 1M) で ROI < 1% なら Phase 1 の main session 適用は中止、
+  orchestrator child session 限定に絞る。
+
+Week-3 Ship 1、競合 token-savior の =TOKEN_SAVIOR_PROFILE= 移植。
 
 * Motivation
 
@@ -157,17 +170,40 @@ context window が 30-50% 広く使えると期待できる。
 
 * Phases
 
-** Phase 1 — static profile + manifest-cost (~DRAFT~)
+** Phase 0 — Actual-token ROI 実測 (~OPEN~, Review Q 4 先行条件)
 
-1. =anvil-manifest-profiles.el= 新規追加、4 profile を =defconst=。
-2. =anvil-register-tools= マクロに =:profiles= keyword 対応追加。
-3. 既存 20 モジュールの registration に =:profiles= を付与 (= 90 件
-   × 数秒なので =file-batch-across= で一括編集)。
-4. =anvil-server-handle-tools-list= で filter 適用。
-5. =manifest-cost= MCP tool を =anvil-server-commands.el= に追加。
-6. =tests/anvil-manifest-profile-test.el= で 4 profile × ERT。
-7. =tests/manifest-cost-snapshot.el= で各 profile の advertised 数
-   を固定 (regression 検出)。
+Phase 1 を main session (Opus 1M) に適用するかどうかを決めるため、
+*実装前* に実測を走らせる。main daemon で:
+
+1. =anvil-server-advertised-tools= を数え、全 tool の JSON-Schema
+   を =json-encode= した合計 char 数を得る。
+2. =tiktoken= (外部) か Anthropic の token counter で実測。
+3. Main session の 1 turn あたり token 消費 (Claude Code の context
+   usage 報告値) と比較。
+4. ROI 判定:
+   - Opus 1M で manifest が 全 context の *1% 未満* なら main session
+     への =ultra= 適用は不採用、=full= 固定。
+   - Orchestrator child session (fresh、短命、多数並列) では毎回
+     manifest をフル送信する性質があるので、ROI は大きい想定。
+     ここに =ANVIL_PROFILE=ultra= を *限定適用* する方針に倒す。
+
+Phase 0 の実測結果は =benchmarks/results/manifest-cost-YYYY-MM-DD.org=
+に記録、Phase 1 本採用の gate にする。
+
+** Phase 1 — static profile + manifest-cost (~Impl on feat branch~)
+
+1. =anvil-manifest.el= 新規追加、4 profile を =defconst= (ultra /
+   nav / core / lean) + =full= sentinel。
+2. =anvil-server.el= に =anvil-server-tool-filter-function= defvar
+   追加、=anvil-server--handle-tools-list= で filter 適用。
+3. =manifest-cost= MCP tool を =anvil-manifest.el= 内に同梱。
+4. =anvil-manifest= を =anvil-optional-modules= 側に登録 (default
+   load 対象外、既存挙動完全互換)。
+5. =tests/anvil-manifest-test.el= で 16 ERT (profile 包含関係 /
+   filter hook / manifest-cost / snapshot regression)。
+
+実装は feat/doc-26-manifest-profile branch 上 (cherry-pick 後 opt-in
+修正済)。self-PR → squash merge で develop へ。
 
 ** Phase 2 — lazy discovery (=ultra= + meta-tool)
 
@@ -225,6 +261,34 @@ env var =ANVIL_PROFILE= は Windows (cmd.exe / PowerShell) でも
 3. Q. =manifest-cost= の approx token 計算は JSON-encode → ÷ 4 で
    十分か? 実測 tiktoken との乖離は? → Phase 1 は概算で良い。
    ±20% でも profile 選択判断には足りる。
+4. Q. (2026-04-20 review 追加) Main session (Opus 1M) で ROI は実際
+   に出るのか? tools/list は session 冒頭 1 回 + prompt cache 対象で
+   per-turn ゲインは薄いはず。
+   → A. Phase 0 で実測。ROI < 1% なら main session 適用は不採用、
+   orchestrator child session 限定 (=ANVIL_PROFILE=ultra= を
+   orchestrator worker の env に設定) で使う方針に倒す。
+5. Q. (2026-04-20 review 追加) Profile 所属ルールはどう決める?
+   新 tool 追加時に誰がどの profile に入れるか、tag 付け忘れは
+   どう検出?
+   → A. ルール:
+   - read-only tool (= =:read-only t=) は自動で =nav= 候補。
+   - 編集系 tool (=file-replace-*= / =json-object-add= 等) は =core=
+     候補。orchestrator/browser/pty/cron は non-core (full 限定)。
+   - tag 付け忘れは =anvil-release-audit= の 6 本目 scanner として
+     実装: 「=:read-only t= だが nav 所属でない」「新 tool id が
+     どの profile にも現れない」を warning として出す。
+   - ultra は author 主観 (Phase 0/1 後に measurement ベースで再
+     調整、Review Q 6 参照)。
+6. Q. (2026-04-20 review 追加) =ultra= 16 tools の根拠は? 客観基準
+   が無いと 2 ヶ月後に誰も更新できない。
+   → A. Phase 1 時点は *author 主観* (daily-driver の頻度感覚)。
+   Phase 2 で =orchestrator-stats= + main session tool-call log を
+   組み合わせ、*直近 30 日の tools/call frequency 上位 N* を候補
+   として提示する仕組みを追加。=anvil-manifest-suggest-ultra= command
+   で periodic に推薦。
+   ただし頻度だけで hot 判定すると =file-outline= 等「低頻度だが
+   絶対外せない」tool を落とす恐れ。frequency × "alternative cost"
+   (= 同目的の他 tool 必要ツールホップ数) で重み付け。
 
 * References
 
