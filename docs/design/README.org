@@ -70,15 +70,28 @@ Tier 凡例:
 - *Tier 2* — 大きな生産性向上.  Tier 1 の上に乗る使い勝手と安全性。
 - *Tier 3* — 増幅器.  他 AI 連携、cross-session、semantic 検索、Windows TUI。
 
-** Week-3 Wave (Doc 21–, DRAFT, 2026-04-19 提案)
+** Week-3 Wave — non-elisp language family (Doc 21 / 24 / 25, DRAFT)
 
 Emacs を AI にとって最も価値ある editor にする戦略的ベット
-(Doc 12 の続き)。elisp は reader-only (Doc 12)、非 elisp 言語は
-tree-sitter で構造編集する。
+(Doc 12 の続き)。言語を 3 family に分けて扱う:
+
+1. *elisp* — reader-native (Doc 12)
+2. *brace-keyword languages* (Python / TS / JS / Rust / Go / …) —
+   tree-sitter (Doc 21)
+3. *Lisp-family* (Common Lisp / Scheme / Clojure) — 各方言の
+   native reader / REPL 経由 (Doc 24)
+4. *structured text* (HTML / CSS / YAML / TOML / JSON / Markdown /
+   SQL) — path / selector / heading ベースの別 API family (Doc 25
+   → 26-30 に分割)
 
 | #  | Doc                                         | 依存   | 想定工数 | Tier | 状態  |
 |----+---------------------------------------------+--------+----------+------+-------|
-| 21 | [[file:21-ts-js-edits.org][TS / JS Tree-sitter Edits]]                   | 06     | 大       | 2    | DRAFT |
+| 21 | [[file:21-treesit-edits.org][Tree-sitter Edits (Py / TS / JS)]]            | 06     | 大       | 2    | DRAFT |
+| 24 | [[file:24-lisp-reader.org][Lisp-family Reader (CL / Scheme / Clojure)]]  | 12     | 大       | 2    | DRAFT |
+| 25 | [[file:25-structured-text.org][Structured Text Family (concept doc)]]        | 06     | 中       | 3    | DRAFT |
+
+/Revision 2026-04-20:/ Doc 21 を Python 先行 + TS/JS 後に再構成、
+Doc 24 / 25 を新規 draft。詳細は Doc 21 の revision note 参照。
 
 ** Orchestrator Polish (Doc 22–23, DRAFT, 2026-04-19)
 

@@ -1,4 +1,4 @@
-#+title: anvil-ts + anvil-js — Tree-sitter Structural Edits for TypeScript and JavaScript
+#+title: anvil-treesit — Tree-sitter Structural Edits (Python / TypeScript / JavaScript)
 #+date: 2026-04-19
 #+author: zawatton
 #+property: status DRAFT
@@ -7,19 +7,33 @@
   :PROPERTIES:
   :ID:       d157a927-ac3a-4d51-b3d2-f132810ac087
   :END:
-~DRAFT~ (2026-04-19)
+~DRAFT~ (revised 2026-04-20)
 
 Sibling of Doc 12 (anvil-sexp, elisp).  Provides tree-sitter-backed
-structural editing for TypeScript and JavaScript files, with a thin
-per-language front-end over a shared core.  Phase 1 covers read-only
-structural locators; edits and rename follow in later phases.
+structural editing for brace-and-keyword languages, with a shared
+core and per-language front-ends.
 
-/Why combined:/ TypeScript is a syntactic superset of JavaScript and
-shares the vast majority of the node kinds we care about (functions,
-classes, imports, exports, variables).  One design doc covers both
-to avoid duplication; the implementation splits into
-~anvil-treesit.el~ (shared core), ~anvil-ts.el~ (TS / TSX queries),
-~anvil-js.el~ (JS / JSX queries).
+/Revision 2026-04-20:/ reordered to lead with *Python*.  The v1
+orchestrator benchmark and the r/emacs post narrative both showed
+Python as the most immediate user need (author's Excel automation,
+Reddit audience, stable tree-sitter grammar).  TypeScript and
+JavaScript follow.  The shared core lands with the first language so
+adding the next two is mostly queries + fixtures.
+
+Implementation split:
+- ~anvil-treesit.el~ — shared core (grammar registry, query cache,
+  node-range helpers, edit-plan serializer, file→language dispatch).
+- ~anvil-py.el~ — Python queries (def, async def, class, decorator,
+  import / from-import, with, global, match).
+- ~anvil-ts.el~ — TypeScript (TS / TSX) queries.
+- ~anvil-js.el~ — JavaScript (JS / JSX / MJS / CJS) queries.
+
+Phase 1a ships the shared core + Python.  Phase 1b adds TS + JS.
+Phase 2 layers structural edits across all three.  Other languages
+(Rust / Go / Ruby / Bash / SQL) are explicit out-of-scope for this
+doc; they get their own docs once this pattern has production
+evidence.  Lisp-family languages (Common Lisp / Scheme) go through
+Doc 24 instead — reader-native rather than tree-sitter.
 
 * Vision — completing the Emacs-as-AI-editor bet
 
@@ -44,12 +58,21 @@ anvil tools on top of the ~treesit.el~ builtin (Emacs 29+) gives AI:
   anvil-sexp (Doc 12) and ~code-add-field-by-map~ (Doc 06)
   convention.
 
-anvil-ts and anvil-js are the first step.  Python, Rust, Go, Ruby
-follow in separate modules once the pattern proves out in
-production.  The combined bet — elisp via reader (Doc 12) +
-everything else via tree-sitter (this doc and successors) — is
+anvil-py, anvil-ts, anvil-js are the first step.  The combined bet
+— elisp via reader (Doc 12), Lisp-family via reader extension
+(Doc 24), brace-keyword languages via tree-sitter (this doc) — is
 what distinguishes Emacs + anvil from any other AI editing
 environment.
+
+/Language-pick rationale:/ Python leads because (a) the author's own
+Excel automation is Python + openpyxl; (b) r/emacs audience heavily
+uses Python; (c) tree-sitter-python is the most stable non-C grammar
+in the ecosystem.  TS leads JS because TS is a syntactic superset —
+implementing TS queries gives JS support for free once grammar
+switching is in place.  Doc 24 (Lisp-family reader) and Doc 25
+(HTML / CSS / YAML / TOML / JSON / Markdown — structured text
+editors) explicitly sit *outside* this doc; they serve different
+editing models and would bloat this scope.
 
 * Motivation
 
@@ -124,22 +147,43 @@ provides ~treesit-parser-create~, ~treesit-node-at~,
 
 * Architecture
 
-** Three-file split
+** Four-file split
 
 - ~anvil-treesit.el~ — shared core.  Grammar registry, query
   compile cache, node-range helpers, edit-plan serializer, file-to-
   language dispatch.  No language-specific knowledge.
+- ~anvil-py.el~ — Python queries and dispatch.  Handles ~.py~,
+  ~.pyi~.
 - ~anvil-ts.el~ — TypeScript queries and dispatch.  Handles ~.ts~
   and ~.tsx~.
 - ~anvil-js.el~ — JavaScript queries and dispatch.  Handles ~.js~,
   ~.jsx~, ~.mjs~, ~.cjs~.
 
-The split lets TS-specific queries (decorators, type annotations,
-interfaces, generics) stay out of the JS module, while the shared
-core avoids duplicated plumbing.  Both surface modules register
-their MCP tools through the same ~anvil-server-register~ entry
-points, so grammar bootstrap and edit-plan handling are
-single-sourced.
+The split lets language-specific queries (Python decorators and
+match-case, TS interfaces and generics, JSX tags) stay out of one
+another while the shared core avoids duplicated plumbing.  All three
+surface modules register their MCP tools through the same
+~anvil-server-register~ entry points, so grammar bootstrap and
+edit-plan handling are single-sourced.
+
+*Python-specific kinds* (beyond the common def / class / import / call):
+- ~async def~ — separate node kind, treated as a sibling of def for
+  locate purposes; edits respect the ~async~ modifier.
+- ~@decorator~ chains — ordered, attached to the following def /
+  class.  Locate returns decorators with their target; edits insert
+  before or after the decorator block by caller choice.
+- ~from X import Y~ vs ~import X~ vs ~import X as Z~ — three
+  distinct node kinds; add-import / remove-import normalize to the
+  caller-specified shape.
+- ~with~ blocks and context-manager chains — structural locate
+  only (no edits Phase 2).
+- ~match~ / ~case~ (3.10+) — grammar has it; structural locate only.
+
+*TS-specific* (beyond JS): interfaces, type aliases, generics,
+decorators (stage-3 proposal syntax), ambient declarations.
+
+*JS-only* (beyond TS): none — JS is a subset from tree-sitter's
+perspective.  ~anvil-js.el~ is 90 % re-exports.
 
 ** Grammar bootstrap
 
@@ -268,22 +312,29 @@ queries.  Safety gates adapted for JS semantics (closure capture,
 
 | id                          | phase | lang    | args                                 | returns     | notes              |
 |-----------------------------+-------+---------+--------------------------------------+-------------+--------------------|
-| ~ts-list-imports~           |     1 | ts/tsx  | file                                 | list        | read-only          |
-| ~ts-list-exports~           |     1 | ts/tsx  | file                                 | list        | read-only          |
-| ~ts-list-functions~         |     1 | ts/tsx  | file                                 | list        | read-only          |
-| ~ts-list-classes~           |     1 | ts/tsx  | file                                 | list        | read-only          |
-| ~ts-list-methods~           |     1 | ts/tsx  | file, class-name                     | list        | read-only          |
-| ~ts-list-interfaces~        |     1 | ts/tsx  | file                                 | list        | TS-only, read-only |
-| ~ts-list-type-aliases~      |     1 | ts/tsx  | file                                 | list        | TS-only, read-only |
-| ~ts-find-definition~        |     1 | ts/tsx  | file, name                           | form+bound  | read-only          |
-| ~ts-surrounding-form~       |     1 | ts/tsx  | file, point, kind?                   | form+bound  | read-only          |
-| ~js-list-imports~           |     1 | js/jsx  | file                                 | list        | read-only          |
-| ~js-list-exports~           |     1 | js/jsx  | file                                 | list        | read-only          |
-| ~js-list-functions~         |     1 | js/jsx  | file                                 | list        | read-only          |
-| ~js-list-classes~           |     1 | js/jsx  | file                                 | list        | read-only          |
-| ~js-list-methods~           |     1 | js/jsx  | file, class-name                     | list        | read-only          |
-| ~js-find-definition~        |     1 | js/jsx  | file, name                           | form+bound  | read-only          |
-| ~js-surrounding-form~       |     1 | js/jsx  | file, point, kind?                   | form+bound  | read-only          |
+| ~py-list-imports~           |    1a | py      | file                                 | list        | read-only          |
+| ~py-list-functions~         |    1a | py      | file                                 | list        | includes async def |
+| ~py-list-classes~           |    1a | py      | file                                 | list        | read-only          |
+| ~py-list-methods~           |    1a | py      | file, class-name                     | list        | read-only          |
+| ~py-list-decorators~        |    1a | py      | file                                 | list        | with targets       |
+| ~py-find-definition~        |    1a | py      | file, name                           | form+bound  | read-only          |
+| ~py-surrounding-form~       |    1a | py      | file, point, kind?                   | form+bound  | read-only          |
+| ~ts-list-imports~           |    1b | ts/tsx  | file                                 | list        | read-only          |
+| ~ts-list-exports~           |    1b | ts/tsx | file                                 | list        | read-only          |
+| ~ts-list-functions~         |    1b | ts/tsx | file                                 | list        | read-only          |
+| ~ts-list-classes~           |    1b | ts/tsx | file                                 | list        | read-only          |
+| ~ts-list-methods~           |    1b | ts/tsx | file, class-name                     | list        | read-only          |
+| ~ts-list-interfaces~        |    1b | ts/tsx | file                                 | list        | TS-only, read-only |
+| ~ts-list-type-aliases~      |    1b | ts/tsx | file                                 | list        | TS-only, read-only |
+| ~ts-find-definition~        |    1b | ts/tsx | file, name                           | form+bound  | read-only          |
+| ~ts-surrounding-form~       |    1b | ts/tsx | file, point, kind?                   | form+bound  | read-only          |
+| ~js-list-imports~           |    1b | js/jsx | file                                 | list        | read-only          |
+| ~js-list-exports~           |    1b | js/jsx | file                                 | list        | read-only          |
+| ~js-list-functions~         |    1b | js/jsx | file                                 | list        | read-only          |
+| ~js-list-classes~           |    1b | js/jsx | file                                 | list        | read-only          |
+| ~js-list-methods~           |    1b | js/jsx | file, class-name                     | list        | read-only          |
+| ~js-find-definition~        |    1b | js/jsx | file, name                           | form+bound  | read-only          |
+| ~js-surrounding-form~       |    1b | js/jsx | file, point, kind?                   | form+bound  | read-only          |
 | ~ts-replace-function~       |     2 | ts/tsx  | file, name, new-body, apply?         | plan        | preview default    |
 | ~ts-add-import~             |     2 | ts/tsx  | file, spec, apply?                   | plan        | idempotent merge   |
 | ~ts-remove-import~          |     2 | ts/tsx  | file, spec, apply?                   | plan        |                    |
@@ -303,20 +354,40 @@ All writing tools default to ~apply=false~ (preview).
 
 * Phases
 
-** Phase 1 — grammar bootstrap + read-only locators
+** Phase 1a — shared core + Python read-only locators
 
 - ~anvil-treesit.el~ shared core: grammar registry, query cache,
   node-range helpers, file-to-language dispatch, grammar-missing
   structured error.
-- ~anvil-ts.el~ and ~anvil-js.el~ with the Phase 1 locators.
-- Entries in ~treesit-language-source-alist~ for ~typescript~,
-  ~tsx~, ~javascript~ (vendored or documented install command).
+- ~anvil-py.el~ with the Phase 1 locators (~py-list-functions~,
+  ~py-list-classes~, ~py-list-methods~, ~py-list-imports~,
+  ~py-list-decorators~, ~py-find-definition~, ~py-surrounding-form~).
+- Entry in ~treesit-language-source-alist~ for ~python~.
 - ERT 20+ tests against golden fixtures in
-  ~tests/fixtures/ts-sample/~, ~tests/fixtures/tsx-sample/~,
-  ~tests/fixtures/js-sample/~, ~tests/fixtures/jsx-sample/~.
+  ~tests/fixtures/py-sample/~ (plain functions, decorators, async
+  def, class + methods, from-imports, match-case).
+- Dogfood fixture: a small openpyxl script echoing the author's
+  report-automation usage — the locators should list every ~def~
+  in that file correctly, including decorators.
+- *Ship criterion*: ~py-list-imports~ and ~py-list-functions~
+  return the expected lists against fixture files; grammar-missing
+  error round-trips cleanly; works on Linux and Windows.
+
+** Phase 1b — TypeScript + JavaScript
+
+Once Phase 1a's core is in production (= has caught a real bug),
+re-use the shared plumbing for the remaining two languages:
+
+- ~anvil-ts.el~ and ~anvil-js.el~ with the same locator surface
+  (functions / classes / methods / imports / exports, plus
+  interfaces / type-aliases for TS).
+- Entries in ~treesit-language-source-alist~ for ~typescript~,
+  ~tsx~, ~javascript~.
+- ERT +15 tests against ~tests/fixtures/ts-sample/~,
+  ~tests/fixtures/tsx-sample/~, ~tests/fixtures/js-sample/~,
+  ~tests/fixtures/jsx-sample/~.
 - *Ship criterion*: ~ts-list-imports~ and ~js-list-imports~ return
-  the expected lists against fixture files; grammar-missing error
-  round-trips cleanly; works on Linux and Windows.
+  the expected lists; grammar-missing error round-trips cleanly.
 
 ** Phase 2 — structural edits
 
@@ -382,10 +453,20 @@ All writing tools default to ~apply=false~ (preview).
 
 * Out of scope / future
 
-- *Other languages.*  Python (~anvil-py~), Rust (~anvil-rs~),
-  Go (~anvil-go~), Ruby (~anvil-rb~) follow the same shape and
-  reuse ~anvil-treesit.el~.  Each gets its own design doc when it
-  comes up.
+- *Other brace-keyword languages.*  Rust (~anvil-rs~), Go
+  (~anvil-go~), Ruby (~anvil-rb~), Bash (~anvil-sh~) follow the
+  same shape and reuse ~anvil-treesit.el~.  Each gets its own
+  design doc after Python / TS / JS ship and r/emacs feedback
+  signals real demand for them.
+- *Lisp-family languages (Common Lisp, Scheme, Clojure).*  These
+  belong to Doc 24, not here.  They are reader-native like elisp
+  and gain nothing from tree-sitter — the host Lisp's own reader
+  already produces a perfect tree.
+- *Non-code structured text (HTML, CSS, YAML, TOML, JSON, Markdown,
+  SQL).*  Doc 25 covers these.  The editing model is
+  path-based / selector-based / heading-based, not function- or
+  class-oriented; the anvil-treesit API shape doesn't transfer
+  cleanly.
 - *Type-aware refactors.*  tsserver integration deferred.  When
   needed, it fits as a peer backend to tree-sitter (preview plans
   come from tsserver; apply goes through the same ~file-batch~
@@ -404,7 +485,14 @@ All writing tools default to ~apply=false~ (preview).
   plist plan style we inherit.
 - Doc 12 (~12-sexp-edits.org~): elisp companion; this doc is its
   non-elisp counterpart.  The two together realize the Emacs + AI
-  thesis: reader-native for elisp, tree-sitter for everything else.
+  thesis: reader-native for elisp, reader-extended for the Lisp
+  family (Doc 24), tree-sitter for brace-keyword languages (this
+  doc), and a separate document family for structured text
+  (Doc 25).
+- Doc 24 (~24-lisp-reader.org~): Common Lisp / Scheme via host-Lisp
+  readers.  Explicit sibling of this doc.
+- Doc 25 (~25-structured-text.org~): HTML / CSS / YAML / TOML /
+  JSON / Markdown — concept doc for the non-code editor family.
 - Emacs 29 ~treesit.el~ manual: (info "(elisp) Parsing Program Source").
 - Memory =project_windows_claude_backends.md=: background on the
   Windows native-compile friction that shapes the grammar-install
