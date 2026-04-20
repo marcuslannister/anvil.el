@@ -724,6 +724,104 @@ Returns a list of plists `(:file NAME :line N :defun SYM)'."
   (anvil-dev--audit-scan-plist-return-in-files
    (anvil-dev--audit-module-files root)))
 
+(defcustom anvil-dev-audit-issue-fix-commit-depth 20
+  "How many recent commits `anvil-dev--audit-scan-issue-fix-without-test' inspects.
+20 commits covers a typical two-week anvil push cadence.  Set to a
+larger value before the release cut, or to 0 to disable the scan
+(useful in environments where git history is shallow or absent, e.g.
+a fresh CI clone with fetch-depth=1)."
+  :type 'integer
+  :group 'anvil-dev)
+
+(defconst anvil-dev--audit-issue-fix-regex
+  "\\(?:Fixes\\|Closes\\|Resolves\\) +#\\([0-9]+\\)"
+  "Regex that detects an issue-closing commit-message keyword.
+Case-sensitive on purpose — matches the GitHub-canonical verbs
+that auto-close the referenced issue.  Lower-cased variants
+(\"fix #12\") do not auto-close on GitHub and are intentionally
+not flagged; anvil commits that truly close an issue spell the
+verb in title case by convention.")
+
+(defun anvil-dev--audit--git-available-p (root)
+  "Return non-nil when ROOT looks like a git worktree with history."
+  (and (file-directory-p (expand-file-name ".git" root))
+       (executable-find "git")))
+
+(defun anvil-dev--audit--git-commit-info (root sha)
+  "Return (:sha :subject :body :files) for SHA inside ROOT.
+Uses two `git show' calls so parsing stays format-agnostic:
+`--format=%s%n%b' for the human-readable message and a separate
+`--name-only' call for the file list.  Slightly chattier than one
+big `git log' invocation but much easier to keep correct when
+commit messages contain arbitrary text (including blank lines)."
+  (let ((default-directory (file-name-as-directory root)))
+    (let ((msg (with-temp-buffer
+                 (when (eq 0 (call-process "git" nil t nil "show" "-s"
+                                           "--format=%s%n%b" sha))
+                   (buffer-string))))
+          (files (with-temp-buffer
+                   (when (eq 0 (call-process "git" nil t nil "show"
+                                             "--name-only" "--format=" sha))
+                     (split-string (buffer-string) "\n" t "[ \t]+")))))
+      (when msg
+        (let* ((lines (split-string msg "\n" nil))
+               (subject (car lines))
+               (body (mapconcat #'identity (cdr lines) "\n")))
+          (list :sha sha
+                :subject (or subject "")
+                :body (or body "")
+                :files files))))))
+
+(defun anvil-dev--audit--git-log-commits (root depth)
+  "Return DEPTH most recent commits as a list of (:sha :subject :body :files).
+Returns nil when ROOT is not a usable git worktree or DEPTH <= 0."
+  (when (and (anvil-dev--audit--git-available-p root)
+             (integerp depth) (> depth 0))
+    (let ((default-directory (file-name-as-directory root)))
+      (let ((shas (with-temp-buffer
+                    (when (eq 0 (call-process "git" nil t nil "log"
+                                              (format "-n%d" depth)
+                                              "--format=%H"))
+                      (split-string (buffer-string) "\n" t "[ \t]+")))))
+        (delq nil
+              (mapcar (lambda (sha)
+                        (anvil-dev--audit--git-commit-info root sha))
+                      shas))))))
+
+(defun anvil-dev--audit-scan-issue-fix-without-test (root)
+  "Scan the last N commits (N=`anvil-dev-audit-issue-fix-commit-depth').
+Flag any commit whose subject or body contains `Fixes #N', `Closes
+#N', or `Resolves #N' but did not add / modify any file under
+`tests/'.  Catches the shape of the v0.3.1 hotfix (37fcc52) where a
+hastily-shipped fix skipped the regression guard.  Does not catch the
+harder case where a test was added but misses the reporter's
+scenario — that one needs human review.
+
+Returns a list of plists `(:sha SHA :issue N :subject STR)'."
+  (let ((commits (anvil-dev--audit--git-log-commits
+                  root anvil-dev-audit-issue-fix-commit-depth))
+        findings)
+    (dolist (c commits)
+      (let* ((sha (plist-get c :sha))
+             (subject (plist-get c :subject))
+             (body (plist-get c :body))
+             (text (concat subject "\n" body))
+             (files (plist-get c :files))
+             (issue (when (and (stringp text)
+                               (string-match anvil-dev--audit-issue-fix-regex
+                                             text))
+                      (string-to-number (match-string 1 text))))
+             (has-test (cl-some (lambda (f)
+                                  (and (stringp f)
+                                       (string-match-p "\\`tests/" f)))
+                                files)))
+        (when (and issue (not has-test))
+          (push (list :sha (substring sha 0 (min 10 (length sha)))
+                      :issue issue
+                      :subject subject)
+                findings))))
+    (nreverse findings)))
+
 (defun anvil-dev--audit-design-doc-status (file)
   "Extract the first non-blank line of FILE's `* STATUS' section.
 Returns the trimmed string or nil when the file has no STATUS
@@ -796,7 +894,7 @@ SCOPE nil returns FILES unchanged.  Non-existent SCOPE returns nil."
 (cl-defun anvil-dev-release-audit (&optional project-dir &key scope)
   "Audit the anvil tree at PROJECT-DIR for pre-release hazards.
 
-Runs four cheap scanners (see the `release audit' section for
+Runs five cheap scanners (see the `release audit' section for
 details) and returns a plist:
 
   :arglist-strip    — list of wrapper plists hit by the Emacs 30
@@ -807,9 +905,14 @@ details) and returns a plist:
                       a `(list :K ...)' form (MCP contract violation
                       unless the file opts out via the
                       `tools-wrapped-at-registration' marker)
+  :issue-fix-no-test — list of commit plists whose message closes
+                      an issue but whose diff does NOT touch
+                      `tests/' (guards against the 37fcc52 pattern —
+                      ship a fix without a regression test).  Skipped
+                      when git history is unavailable (shallow clone).
   :non-shipped-docs — list of `(:file :status)' plists for design
                       docs whose STATUS line lacks `SHIPPED'
-  :clean-p          — t iff all four scans returned empty
+  :clean-p          — t iff all five scans returned empty
   :root             — absolute directory that was audited
   :scope            — SCOPE value when supplied, else nil
   :audited-at       — ISO timestamp when the scan ran
@@ -817,9 +920,10 @@ details) and returns a plist:
 :SCOPE limits the source scanners (arglist-strip / missing-params /
 plist-return) to a single file or directory path.  When SCOPE names
 a regular file, only that file is audited; when it names a
-directory, files under it are audited.  The design-docs scanner is
-always run on the project tree — whole-tree doc state is cheap and
-independent of the scope in question."
+directory, files under it are audited.  The design-docs and
+issue-fix scanners are always run on the project tree — whole-tree
+doc state and full git history are cheap and independent of the
+scope in question."
   (interactive)
   (let* ((root (or project-dir (anvil-dev--audit-default-root)))
          (_    (unless (and root (file-directory-p root))
@@ -836,15 +940,18 @@ independent of the scope in question."
                           scanner-files))
          (plist-return   (anvil-dev--audit-scan-plist-return-in-files
                           scanner-files))
+         (issue-fix-no-test (anvil-dev--audit-scan-issue-fix-without-test root))
          (non-shipped    (anvil-dev--audit-scan-design-docs root))
          (clean-p        (and (null arglist-strip)
                               (null missing-params)
                               (null plist-return)
+                              (null issue-fix-no-test)
                               (null non-shipped)))
          (result
           (list :arglist-strip arglist-strip
                 :missing-params missing-params
                 :plist-return plist-return
+                :issue-fix-no-test issue-fix-no-test
                 :non-shipped-docs non-shipped
                 :clean-p clean-p
                 :root (file-name-as-directory (expand-file-name root))
@@ -871,6 +978,7 @@ return a one-line string."
   (let ((arglist (plist-get result :arglist-strip))
         (params  (plist-get result :missing-params))
         (plists  (plist-get result :plist-return))
+        (issue-fix (plist-get result :issue-fix-no-test))
         (docs    (plist-get result :non-shipped-docs))
         (clean-p (plist-get result :clean-p)))
     (concat
@@ -905,6 +1013,14 @@ return a one-line string."
                    (plist-get f :file)
                    (plist-get f :line)
                    (plist-get f :defun))))
+        (anvil-dev--audit-format-findings
+         "FAIL issue-fix shipped without a test change (Fixes / Closes /\n     Resolves #N but no file under `tests/' in the same commit)"
+         issue-fix
+         (lambda (f)
+           (format "%s  #%d  %s"
+                   (plist-get f :sha)
+                   (plist-get f :issue)
+                   (plist-get f :subject))))
         (anvil-dev--audit-format-findings
          "WARN design docs not yet SHIPPED (master-gate informational)"
          docs
@@ -967,13 +1083,15 @@ any real code lives in it."
    :id "anvil-release-audit"
    :server-id anvil-dev--server-id
    :description
-   "Scan the anvil tree for four pre-release hazard classes:
+   "Scan the anvil tree for five pre-release hazard classes:
 Emacs 30 `_arg' arglist-strip regressions in MCP tool wrappers,
 wrappers with real args but no `MCP Parameters:' docstring
 section, wrappers whose body ends with a `(list :K ...)' plist
 literal (MCP string-or-nil contract violation, unless the file
 opts out via `;;; anvil-audit: tools-wrapped-at-registration'),
-and docs/design/*.org files whose STATUS text lacks `SHIPPED'.
+issue-closing commits whose diff does not touch `tests/' (the
+37fcc52 pattern — ship a fix with no regression guard), and
+docs/design/*.org files whose STATUS text lacks `SHIPPED'.
 Returns a formatted report; `clean' when empty."
    :read-only t))
 

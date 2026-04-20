@@ -682,4 +682,102 @@ terminal check so the real plist return is visible."
             (should-not (plist-get r :clean-p))) )
       (delete-directory d t))))
 
+;;;; --- issue-fix-no-test scanner (37fcc52-class guard) ------------------
+
+(defun anvil-dev-test--audit-make-git-repo ()
+  "Return a fresh temp dir initialised as a git repo with an empty tests/ dir."
+  (let ((d (make-temp-file "anvil-dev-audit-git-" t)))
+    (make-directory (expand-file-name "docs/design" d) t)
+    (make-directory (expand-file-name "tests" d) t)
+    (let ((default-directory (file-name-as-directory d)))
+      (call-process "git" nil nil nil "init" "-q" "-b" "master")
+      (call-process "git" nil nil nil "config" "user.email" "t@example.com")
+      (call-process "git" nil nil nil "config" "user.name"  "Tester")
+      (call-process "git" nil nil nil "config" "commit.gpgsign" "false"))
+    d))
+
+(defun anvil-dev-test--audit-git-commit (d message &rest files)
+  "Create FILES with `path→content' pairs inside D and commit with MESSAGE."
+  (let ((default-directory (file-name-as-directory d)))
+    (while files
+      (let ((path (pop files))
+            (content (pop files)))
+        (let ((abs (expand-file-name path d)))
+          (make-directory (file-name-directory abs) t)
+          (with-temp-file abs (insert content)))))
+    (call-process "git" nil nil nil "add" "-A")
+    (call-process "git" nil nil nil "commit" "-q" "--allow-empty" "-m" message)))
+
+(ert-deftest anvil-dev-test-audit-issue-fix-without-test-flags-hit ()
+  "A commit `Fixes #N' that touches only source (not tests/) is flagged."
+  (let ((d (anvil-dev-test--audit-make-git-repo)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-git-commit
+           d "initial"
+           "anvil-foo.el" "(provide 'anvil-foo)\n")
+          (anvil-dev-test--audit-git-commit
+           d "fix(foo): guard against NPE\n\nFixes #42"
+           "anvil-foo.el" ";; edited\n(provide 'anvil-foo)\n")
+          (let* ((r (anvil-dev-release-audit d))
+                 (hits (plist-get r :issue-fix-no-test)))
+            (should (= 1 (length hits)))
+            (should (= 42 (plist-get (car hits) :issue)))
+            (should-not (plist-get r :clean-p))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-issue-fix-with-test-is-clean ()
+  "A commit `Fixes #N' that touches tests/ is NOT flagged."
+  (let ((d (anvil-dev-test--audit-make-git-repo)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-git-commit
+           d "initial" "anvil-foo.el" "(provide 'anvil-foo)\n")
+          (anvil-dev-test--audit-git-commit
+           d "fix(foo): guard against NPE\n\nFixes #42"
+           "anvil-foo.el" ";; fix\n(provide 'anvil-foo)\n"
+           "tests/anvil-foo-test.el"
+           "(require 'ert)\n(ert-deftest anvil-foo-guards-npe () (should t))\n")
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :issue-fix-no-test)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-issue-fix-ignores-regular-commits ()
+  "Commits without `Fixes|Closes|Resolves #N' are never flagged, even
+if they don't touch tests."
+  (let ((d (anvil-dev-test--audit-make-git-repo)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-git-commit
+           d "initial" "anvil-foo.el" "(provide 'anvil-foo)\n")
+          (anvil-dev-test--audit-git-commit
+           d "feat(foo): a feature without tests, not an issue fix"
+           "anvil-foo.el" ";; feature\n(provide 'anvil-foo)\n")
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :issue-fix-no-test)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-issue-fix-depth-0-disables-scan ()
+  "Setting `anvil-dev-audit-issue-fix-commit-depth' to 0 turns the scan off."
+  (let ((d (anvil-dev-test--audit-make-git-repo)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-git-commit
+           d "initial" "anvil-foo.el" "(provide 'anvil-foo)\n")
+          (anvil-dev-test--audit-git-commit
+           d "fix(foo): Fixes #7"
+           "anvil-foo.el" ";; fix\n(provide 'anvil-foo)\n")
+          (let ((anvil-dev-audit-issue-fix-commit-depth 0))
+            (let ((r (anvil-dev-release-audit d)))
+              (should (null (plist-get r :issue-fix-no-test))))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-issue-fix-non-git-root-is-safe ()
+  "A directory that is not a git worktree simply returns an empty list."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (let ((r (anvil-dev-release-audit d)))
+          (should (null (plist-get r :issue-fix-no-test))))
+      (delete-directory d t))))
+
 ;;; anvil-dev-test.el ends here
