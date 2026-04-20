@@ -170,25 +170,39 @@ context window が 30-50% 広く使えると期待できる。
 
 * Phases
 
-** Phase 0 — Actual-token ROI 実測 (~OPEN~, Review Q 4 先行条件)
+** Phase 0 — Actual-token ROI 実測 (~DONE~, 2026-04-20)
 
-Phase 1 を main session (Opus 1M) に適用するかどうかを決めるため、
-*実装前* に実測を走らせる。main daemon で:
+実測結果: =benchmarks/results/manifest-cost-2026-04-20.org=
 
-1. =anvil-server-advertised-tools= を数え、全 tool の JSON-Schema
-   を =json-encode= した合計 char 数を得る。
-2. =tiktoken= (外部) か Anthropic の token counter で実測。
-3. Main session の 1 turn あたり token 消費 (Claude Code の context
-   usage 報告値) と比較。
-4. ROI 判定:
-   - Opus 1M で manifest が 全 context の *1% 未満* なら main session
-     への =ultra= 適用は不採用、=full= 固定。
-   - Orchestrator child session (fresh、短命、多数並列) では毎回
-     manifest をフル送信する性質があるので、ROI は大きい想定。
-     ここに =ANVIL_PROFILE=ultra= を *限定適用* する方針に倒す。
+Running main daemon (=/run/user/1000/emacs/server=, server-id
+=emacs-eval=) に =anvil-manifest= を一時 load して測定。
 
-Phase 0 の実測結果は =benchmarks/results/manifest-cost-YYYY-MM-DD.org=
-に記録、Phase 1 本採用の gate にする。
+| Profile | Advertised | Tokens | vs full            |
+|---------+------------+--------+--------------------|
+| full    |         78 | 13 471 | —                  |
+| core    |         52 | 10 371 | -23%               |
+| nav     |         31 |  5 782 | -57%               |
+| ultra   |         13 |  2 099 | -84% (-11 372 tok) |
+| lean    |         52 | 10 371 | same as core       |
+
+Prompt cache 補正 (cache read = 10% input price):
+
+| Profile | Raw    | Per-turn cached | % of 1M context |
+|---------+--------+-----------------+-----------------|
+| full    | 13 471 |           1 347 | 0.13%           |
+| ultra   |  2 099 |             210 | 0.02%           |
+| delta   | 11 372 |           1 137 | 0.11%           |
+
+Main session 1% 閾値 (Review Q 4) 未到達。
+
+*判定:*
+- *Main session*: =full= 固定 (env 無指定の default) — 採用しない。
+- *Orchestrator worker*: =ANVIL_PROFILE=ultra= を env で強制 — 採用。
+  Child session は cold start、cross-job cache warm-up が効かない
+  想定。-11 k tok × 並列 × 短命性で ROI 大。
+
+Phase 1 は本採用、ただし注入先を orchestrator worker subprocess
+限定に絞る (=anvil-worker-init.el= で設定)。
 
 ** Phase 1 — static profile + manifest-cost (~Impl on feat branch~)
 
