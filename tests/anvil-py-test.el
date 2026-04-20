@@ -272,5 +272,171 @@ user-error whose message is a `read'-able grammar-missing plist."
          (should (eq 'grammar-missing (plist-get plist :kind)))
          (should (eq 'python (plist-get plist :lang))))))))
 
+;;;; --- edit primitives (Phase 2a) ----------------------------------------
+
+(defun anvil-py-test--temp-copy (path)
+  "Copy PATH to a fresh temp file and return the temp path.
+Tests that mutate the fixture use this so the in-tree fixture stays
+pristine across runs."
+  (let ((tmp (make-temp-file "anvil-py-edit-" nil ".py")))
+    (copy-file path tmp t)
+    tmp))
+
+(defmacro anvil-py-test--with-edit-copy (var &rest body)
+  "Bind VAR to a fresh temp copy of the fixture, run BODY, delete the copy."
+  (declare (indent 1))
+  `(let ((,var (anvil-py-test--temp-copy anvil-py-test--fixture)))
+     (unwind-protect (progn ,@body)
+       (ignore-errors (delete-file ,var)))))
+
+(ert-deftest anvil-py-test-add-import-from-merges-into-existing ()
+  "Adding a new name to an existing from-import merges in place,
+producing a single replacement op, and a double-apply is a no-op."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (let ((plan (anvil-py-add-import
+                   f '(:kind from :from "openpyxl" :names ("Cell")))))
+        (should (= 1 (length (plist-get plan :ops))))
+        (should (string-match-p "from openpyxl import .*Cell"
+                                (plist-get
+                                 (car (plist-get plan :ops)) :replacement))))
+      ;; Apply, then a second preview should be a no-op.
+      (anvil-py-add-import
+       f '(:kind from :from "openpyxl" :names ("Cell")) :apply t)
+      (let ((re-plan (anvil-py-add-import
+                      f '(:kind from :from "openpyxl" :names ("Cell")))))
+        (should (null (plist-get re-plan :ops)))
+        (should (string-match-p "no-op" (plist-get re-plan :summary)))))))
+
+(ert-deftest anvil-py-test-add-import-from-new-module ()
+  "Adding a from-import for a module not yet present inserts a new
+line after the existing import block."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (anvil-py-add-import
+       f '(:kind from :from "json" :names ("loads" "dumps")) :apply t)
+      (let ((text (with-temp-buffer
+                    (insert-file-contents f) (buffer-string))))
+        (should (string-match-p "^from json import loads, dumps$" text))
+        ;; Must not appear before other imports.
+        (should (string-match-p "from typing import" text))))))
+
+(ert-deftest anvil-py-test-add-import-bare-new ()
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (anvil-py-add-import f '(:kind import :module "subprocess") :apply t)
+      (let ((text (with-temp-buffer
+                    (insert-file-contents f) (buffer-string))))
+        (should (string-match-p "^import subprocess$" text))))))
+
+(ert-deftest anvil-py-test-add-import-bare-existing-is-noop ()
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (let ((plan (anvil-py-add-import f '(:kind import :module "os"))))
+        (should (null (plist-get plan :ops)))))))
+
+(ert-deftest anvil-py-test-add-import-alias ()
+  "`import X as Y' when module matches but alias differs is treated
+as distinct — adding `import json as j' when only `import json' exists
+adds a new statement."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (let ((plan (anvil-py-add-import
+                   f '(:kind import :module "sys" :alias "system"))))
+        ;; `import sys as system' is already in the fixture → no-op.
+        (should (null (plist-get plan :ops))))
+      (let ((plan (anvil-py-add-import
+                   f '(:kind import :module "sys"))))
+        ;; Bare `import sys' is NOT present — only the aliased form is.
+        (should (= 1 (length (plist-get plan :ops))))))))
+
+(ert-deftest anvil-py-test-add-import-errors-when-spec-incomplete ()
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (should-error
+       (anvil-py-add-import f '(:kind from :from "openpyxl"))
+       :type 'user-error)
+      (should-error
+       (anvil-py-add-import f '(:kind import))
+       :type 'user-error))))
+
+(ert-deftest anvil-py-test-remove-import-drops-single-name ()
+  "Removing one name from a multi-name from-import leaves the others.
+Assertions check imports via `anvil-py-list-imports' rather than
+string-matching the file text, because `load_workbook' is also used
+as an identifier in the fixture body."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (anvil-py-remove-import
+       f '(:kind from :from "openpyxl" :names ("load_workbook")) :apply t)
+      (let* ((ims (anvil-py-list-imports f))
+             (openpyxl (cl-find-if (lambda (i)
+                                     (string-match-p "openpyxl"
+                                                     (plist-get i :text)))
+                                   ims)))
+        (should openpyxl)
+        (should (string-match-p "Workbook" (plist-get openpyxl :text)))
+        (should-not (string-match-p "load_workbook" (plist-get openpyxl :text)))))))
+
+(ert-deftest anvil-py-test-remove-import-drops-last-name-deletes-statement ()
+  "Removing the last remaining name drops the whole statement including
+its trailing newline.  Asserts via `anvil-py-list-imports' so the
+fixture docstring mentioning \"openpyxl\" doesn't false-positive."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (anvil-py-remove-import
+       f '(:kind from :from "openpyxl"
+           :names ("Workbook" "load_workbook")) :apply t)
+      (let ((ims (anvil-py-list-imports f)))
+        (should-not (cl-find-if (lambda (i)
+                                  (string-match-p "openpyxl"
+                                                  (plist-get i :text)))
+                                ims))
+        ;; Sibling imports unaffected.
+        (should (cl-find-if (lambda (i)
+                              (string-match-p "pathlib"
+                                              (plist-get i :text)))
+                            ims))))))
+
+(ert-deftest anvil-py-test-remove-import-bare ()
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (anvil-py-remove-import f '(:kind import :module "os") :apply t)
+      (let ((text (with-temp-buffer
+                    (insert-file-contents f) (buffer-string))))
+        (should-not (string-match-p "^import os$" text))))))
+
+(ert-deftest anvil-py-test-remove-import-missing-is-noop ()
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (let ((plan (anvil-py-remove-import
+                   f '(:kind import :module "nonexistent"))))
+        (should (null (plist-get plan :ops)))))))
+
+(ert-deftest anvil-py-test-add-then-remove-round-trip ()
+  "Adding an import and then removing it returns the file to byte
+identity with the original fixture."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (let ((before (with-temp-buffer
+                      (insert-file-contents f) (buffer-string))))
+        (anvil-py-add-import
+         f '(:kind from :from "openpyxl" :names ("Cell")) :apply t)
+        (anvil-py-remove-import
+         f '(:kind from :from "openpyxl" :names ("Cell")) :apply t)
+        (let ((after (with-temp-buffer
+                       (insert-file-contents f) (buffer-string))))
+          (should (string= before after)))))))
+
+(ert-deftest anvil-py-test-edit-plan-has-diff-preview ()
+  "Non-noop plans carry a :diff-preview string suitable for display."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (let ((plan (anvil-py-add-import
+                   f '(:kind from :from "openpyxl" :names ("Cell")))))
+        (should (stringp (plist-get plan :diff-preview)))
+        (should (string-match-p "^---" (plist-get plan :diff-preview)))
+        (should (string-match-p "\\+from openpyxl" (plist-get plan :diff-preview)))))))
+
 (provide 'anvil-py-test)
 ;;; anvil-py-test.el ends here

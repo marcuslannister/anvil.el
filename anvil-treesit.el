@@ -183,6 +183,114 @@ Line numbers are 1-based.  Convenience shape for listing operations."
   "Return NODE's child under FIELD-NAME, or nil."
   (treesit-node-child-by-field-name node field-name))
 
+;;;; --- edit-plan primitives ------------------------------------------------
+
+;; Phase 2 of per-language tree-sitter editing (Doc 21) uses the same
+;; preview-default plan shape as anvil-sexp (Doc 12).  These helpers
+;; live here so anvil-py / anvil-ts / anvil-js can all share them —
+;; pulling the per-module copies into one audit point.
+
+(defun anvil-treesit-truthy (v)
+  "Return non-nil when V is a truthy MCP value.
+Accepts elisp nil, :json-false, :false, and the string forms
+\"false\" / \"nil\" / \"0\" / \"\" / \"no\" as falsy; anything else
+is truthy."
+  (not (or (null v)
+           (eq v :json-false)
+           (eq v :false)
+           (and (stringp v)
+                (member v '("" "nil" "false" "0" "no" "False" "NIL"))))))
+
+(defun anvil-treesit--unified-diff (file beg end replacement)
+  "Return a short unified-diff string for FILE, swapping [BEG,END) with REPLACEMENT."
+  (let* ((old (with-temp-buffer
+                (insert-file-contents file)
+                (buffer-substring-no-properties beg end)))
+         (base (file-name-nondirectory file))
+         (lines-old (split-string old "\n"))
+         (lines-new (split-string replacement "\n"))
+         (out (list (format "+++ %s (after)" base)
+                    (format "--- %s (before)" base))))
+    (dolist (l lines-old)
+      (push (concat "-" l) out))
+    (dolist (l lines-new)
+      (push (concat "+" l) out))
+    (mapconcat #'identity (nreverse out) "\n")))
+
+(defun anvil-treesit-make-plan (file beg end replacement reason)
+  "Build an edit plan for a single file / single range.
+Shape: (:ops (:file :range :replacement :reason) :summary :diff-preview).
+An empty BEG == END == REPLACEMENT is legal — callers synthesize
+no-op plans via `anvil-treesit-make-noop-plan'."
+  (list :ops (list (list :file file
+                         :range (cons beg end)
+                         :replacement replacement
+                         :reason reason))
+        :summary (format "%s: 1 op on %s" reason
+                         (file-name-nondirectory file))
+        :diff-preview (anvil-treesit--unified-diff file beg end replacement)))
+
+(defun anvil-treesit-make-noop-plan (file reason)
+  "Build an empty plan noting that REASON is already satisfied in FILE.
+Used by idempotent operations like `py-add-import' when a re-apply
+would not change the file."
+  (list :ops nil
+        :summary (format "%s: no-op (already satisfied) on %s"
+                         reason (file-name-nondirectory file))
+        :diff-preview ""))
+
+(defun anvil-treesit--assert-ops-non-overlapping (ops)
+  "Signal an error when any two OPS on the same file overlap.
+Ops that abut exactly (a-end == b-start) are allowed."
+  (let ((by-file (make-hash-table :test 'equal)))
+    (dolist (op ops)
+      (push op (gethash (plist-get op :file) by-file)))
+    (maphash
+     (lambda (file file-ops)
+       (let ((sorted (sort (copy-sequence file-ops)
+                           (lambda (a b)
+                             (< (car (plist-get a :range))
+                                (car (plist-get b :range)))))))
+         (cl-loop for (a b) on sorted while b do
+                  (let ((a-end (cdr (plist-get a :range)))
+                        (b-beg (car (plist-get b :range))))
+                    (when (> a-end b-beg)
+                      (error "anvil-treesit: overlapping ops in %s: %S vs %S"
+                             file (plist-get a :range)
+                             (plist-get b :range)))))))
+     by-file)))
+
+(defun anvil-treesit-apply-plan (plan)
+  "Write every op in PLAN to disk.  Return PLAN with :applied-at added.
+Ops on the same file are applied back-to-front so earlier ranges
+stay valid after later replacements shift text.  Refuses when any
+two ops on the same file overlap.  An empty :ops list returns
+PLAN unchanged with :applied-at set — a no-op write."
+  (let* ((ops (plist-get plan :ops))
+         (by-file (make-hash-table :test 'equal)))
+    (when ops
+      (anvil-treesit--assert-ops-non-overlapping ops)
+      (dolist (op ops)
+        (push op (gethash (plist-get op :file) by-file)))
+      (maphash
+       (lambda (file file-ops)
+         (let ((sorted (sort (copy-sequence file-ops)
+                             (lambda (a b)
+                               (> (car (plist-get a :range))
+                                  (car (plist-get b :range)))))))
+           (with-temp-buffer
+             (let ((coding-system-for-read 'utf-8-unix)
+                   (coding-system-for-write 'utf-8-unix))
+               (insert-file-contents file)
+               (dolist (op sorted)
+                 (let ((r (plist-get op :range)))
+                   (delete-region (car r) (cdr r))
+                   (goto-char (car r))
+                   (insert (plist-get op :replacement))))
+               (write-region (point-min) (point-max) file nil 'silent)))))
+       by-file))
+    (append plan (list :applied-at (format-time-string "%FT%T%z")))))
+
 ;;;; --- module lifecycle ---------------------------------------------------
 
 (defun anvil-treesit-enable ()

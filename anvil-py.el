@@ -318,6 +318,280 @@ Returns nil when POINT is outside any def / class.  Shape:
                    (> (plist-get (plist-get a :bounds) :start)
                       (plist-get (plist-get b :bounds) :start))))))))
 
+;;;; --- edit helpers (Phase 2a) --------------------------------------------
+
+(defun anvil-py--import-insertion-point (root)
+  "Return the 1-based point after which new imports should be inserted.
+Picks the end of the last existing import statement, or the start
+of the first non-docstring / non-future-import statement if no
+regular imports are present."
+  (let ((last-import-end nil)
+        (first-non-import-start nil)
+        (c (treesit-node-child root 0)))
+    (while c
+      (let ((type (treesit-node-type c)))
+        (pcase type
+          ((or "import_statement" "import_from_statement" "future_import_statement")
+           (setq last-import-end (treesit-node-end c)))
+          ("expression_statement"
+           ;; Module docstring is an expression_statement with a string
+           ;; child — skip it if it's the very first node.
+           (unless (or last-import-end first-non-import-start)
+             (let ((inner (treesit-node-child c 0)))
+               (unless (and inner
+                            (string= (treesit-node-type inner) "string"))
+                 (setq first-non-import-start (treesit-node-start c))))))
+          (_ (unless first-non-import-start
+               (setq first-non-import-start (treesit-node-start c))))))
+      (setq c (treesit-node-next-sibling c)))
+    (or last-import-end
+        first-non-import-start
+        ;; Empty file.
+        (point-min))))
+
+(defun anvil-py--from-import-names (node)
+  "Return the list of imported names in a `from X import ...' NODE.
+Each entry is the raw source text of a `dotted_name' / `aliased_import'
+child — aliases such as \"Workbook as W\" are preserved intact.  The
+module's own `dotted_name' (reached via the `module_name' field) is
+filtered out by start-position comparison, which works even when the
+tree-sitter node wrapper produces a fresh object per field lookup."
+  (let* ((mod-node (treesit-node-child-by-field-name node "module_name"))
+         (mod-start (and mod-node (treesit-node-start mod-node)))
+         names)
+    (dolist (c (treesit-node-children node t))
+      (let ((type (treesit-node-type c)))
+        (when (and (member type '("dotted_name" "aliased_import"))
+                   (not (and mod-start
+                             (= (treesit-node-start c) mod-start))))
+          (push (anvil-treesit-node-text c) names))))
+    (nreverse names)))
+
+(defun anvil-py--from-import-module (node)
+  "Return the module name of a `from X import ...' NODE as a string."
+  (let ((m (treesit-node-child-by-field-name node "module_name")))
+    (and m (anvil-treesit-node-text m))))
+
+(defun anvil-py--find-from-import (root module)
+  "Return the first `from MODULE import ...' node in ROOT, or nil."
+  (let ((q (anvil-py--query 'imports))
+        found)
+    (dolist (cap (treesit-query-capture root q))
+      (unless found
+        (let ((n (cdr cap)))
+          (when (and (string= (treesit-node-type n) "import_from_statement")
+                     (string= (anvil-py--from-import-module n) module))
+            (setq found n)))))
+    found))
+
+(defun anvil-py--find-import (root module &optional alias)
+  "Return the first `import MODULE[ as ALIAS]' node in ROOT, or nil."
+  (let ((q (anvil-py--query 'imports))
+        found)
+    (dolist (cap (treesit-query-capture root q))
+      (unless found
+        (let ((n (cdr cap)))
+          (when (string= (treesit-node-type n) "import_statement")
+            (dolist (c (treesit-node-children n t))
+              (let ((type (treesit-node-type c)))
+                (cond
+                 ((and (null alias)
+                       (string= type "dotted_name")
+                       (string= (anvil-treesit-node-text c) module))
+                  (setq found n))
+                 ((and alias
+                       (string= type "aliased_import"))
+                  (let* ((name-node (treesit-node-child-by-field-name
+                                     c "name"))
+                         (alias-node (treesit-node-child-by-field-name
+                                      c "alias")))
+                    (when (and name-node alias-node
+                               (string= (anvil-treesit-node-text name-node)
+                                        module)
+                               (string= (anvil-treesit-node-text alias-node)
+                                        alias))
+                      (setq found n)))))))))))
+    found))
+
+(defun anvil-py--render-from-import (module names)
+  "Render `from MODULE import NAME, NAME, ...' for NAMES (list of strings).
+NAMES is used in the order given — callers decide sort."
+  (format "from %s import %s" module
+          (mapconcat #'identity names ", ")))
+
+(defun anvil-py--render-import (module &optional alias)
+  "Render `import MODULE' or `import MODULE as ALIAS'."
+  (if alias
+      (format "import %s as %s" module alias)
+    (format "import %s" module)))
+
+(defun anvil-py--spec-kind (spec)
+  "Return the :kind of SPEC, defaulting to `import' when omitted."
+  (or (plist-get spec :kind) 'import))
+
+(cl-defun anvil-py--plan-add-import (file spec)
+  "Build an edit plan adding SPEC to FILE.
+Returns a plan plist (see `anvil-treesit-make-plan').  When SPEC is
+already satisfied (bare import present, or every requested
+from-import name already present), returns a no-op plan."
+  (anvil-treesit-with-root file anvil-py--lang root
+    (pcase (anvil-py--spec-kind spec)
+      ('from
+       (let* ((module (plist-get spec :from))
+              (wanted (plist-get spec :names))
+              (existing (anvil-py--find-from-import root module)))
+         (unless (and module wanted)
+           (user-error "anvil-py-add-import: :from and :names required for from-import"))
+         (if existing
+             (let* ((current (anvil-py--from-import-names existing))
+                    (current-bare (mapcar (lambda (n)
+                                            (car (split-string n " as ")))
+                                          current))
+                    (missing (cl-remove-if
+                              (lambda (w)
+                                (member (car (split-string w " as "))
+                                        current-bare))
+                              wanted)))
+               (if (null missing)
+                   (anvil-treesit-make-noop-plan
+                    file (format "add-import from %s" module))
+                 (let* ((merged (append current missing))
+                        (new-text (anvil-py--render-from-import
+                                   module merged))
+                        (beg (treesit-node-start existing))
+                        (end (treesit-node-end existing)))
+                   (anvil-treesit-make-plan
+                    file beg end new-text
+                    (format "add-import from %s (merge %d name%s)"
+                            module (length missing)
+                            (if (= 1 (length missing)) "" "s"))))))
+           ;; No existing from-import for this module — insert a new one.
+           (let* ((ins (anvil-py--import-insertion-point root))
+                  (new-line (concat (if (> ins (point-min)) "\n" "")
+                                    (anvil-py--render-from-import
+                                     module wanted)
+                                    (if (= ins (point-min)) "\n" ""))))
+             (anvil-treesit-make-plan
+              file ins ins new-line
+              (format "add-import from %s (new)" module))))))
+      ('import
+       (let* ((module (plist-get spec :module))
+              (alias (plist-get spec :alias))
+              (existing (anvil-py--find-import root module alias)))
+         (unless module
+           (user-error "anvil-py-add-import: :module required for import"))
+         (if existing
+             (anvil-treesit-make-noop-plan
+              file (format "add-import import %s" module))
+           (let* ((ins (anvil-py--import-insertion-point root))
+                  (new-line (concat (if (> ins (point-min)) "\n" "")
+                                    (anvil-py--render-import module alias)
+                                    (if (= ins (point-min)) "\n" ""))))
+             (anvil-treesit-make-plan
+              file ins ins new-line
+              (format "add-import import %s" module)))))))))
+
+(cl-defun anvil-py--plan-remove-import (file spec)
+  "Build an edit plan removing SPEC from FILE.
+For `:kind 'from', removes only the requested names; if that leaves
+the statement empty, the whole statement is deleted.  For `:kind
+'import', removes the whole statement when module (and alias, if
+specified) matches.  No-op when the import is already absent."
+  (anvil-treesit-with-root file anvil-py--lang root
+    (pcase (anvil-py--spec-kind spec)
+      ('from
+       (let* ((module (plist-get spec :from))
+              (wanted (plist-get spec :names))
+              (existing (anvil-py--find-from-import root module)))
+         (unless (and module wanted)
+           (user-error "anvil-py-remove-import: :from and :names required"))
+         (if (null existing)
+             (anvil-treesit-make-noop-plan
+              file (format "remove-import from %s" module))
+           (let* ((current (anvil-py--from-import-names existing))
+                  (kept (cl-remove-if
+                         (lambda (n)
+                           (member (car (split-string n " as "))
+                                   wanted))
+                         current))
+                  (beg (treesit-node-start existing))
+                  (end (treesit-node-end existing)))
+             (cond
+              ((equal current kept)
+               (anvil-treesit-make-noop-plan
+                file (format "remove-import from %s" module)))
+              ((null kept)
+               ;; Drop the whole statement — also eat the trailing newline.
+               (let ((end+1 (with-temp-buffer
+                              (insert-file-contents file)
+                              (goto-char end)
+                              (if (eq (char-after) ?\n) (1+ end) end))))
+                 (anvil-treesit-make-plan
+                  file beg end+1 ""
+                  (format "remove-import from %s (drop whole statement)"
+                          module))))
+              (t
+               (anvil-treesit-make-plan
+                file beg end
+                (anvil-py--render-from-import module kept)
+                (format "remove-import from %s (drop %d name%s)"
+                        module
+                        (- (length current) (length kept))
+                        (if (= 1 (- (length current) (length kept)))
+                            "" "s")))))))))
+      ('import
+       (let* ((module (plist-get spec :module))
+              (alias (plist-get spec :alias))
+              (existing (anvil-py--find-import root module alias)))
+         (unless module
+           (user-error "anvil-py-remove-import: :module required"))
+         (if (null existing)
+             (anvil-treesit-make-noop-plan
+              file (format "remove-import import %s" module))
+           (let* ((beg (treesit-node-start existing))
+                  (end (treesit-node-end existing))
+                  (end+1 (with-temp-buffer
+                           (insert-file-contents file)
+                           (goto-char end)
+                           (if (eq (char-after) ?\n) (1+ end) end))))
+             (anvil-treesit-make-plan
+              file beg end+1 ""
+              (format "remove-import import %s" module)))))))))
+
+;;;; --- public edit API (Phase 2a) -----------------------------------------
+
+(cl-defun anvil-py-add-import (file spec &key apply)
+  "Add the import specified by SPEC to FILE.
+SPEC is a plist:
+  (:kind 'from :from MODULE :names (NAME ...))  — `from X import Y, Z'
+  (:kind 'import :module MODULE [:alias NAME]) — `import X [as Y]'
+
+Idempotent: if SPEC is already satisfied, returns a no-op plan.
+Merges into an existing `from X import ...' when :kind is `from' and
+MODULE already has a statement — the new NAMES are appended, de-duped
+by bare name (so `X' and `X as Y' both count as having `X').
+
+Returns the edit plan unless APPLY is truthy, in which case the plan
+is applied via `anvil-treesit-apply-plan' and the plan with
+:applied-at is returned."
+  (let ((plan (anvil-py--plan-add-import file spec)))
+    (if (anvil-treesit-truthy apply)
+        (anvil-treesit-apply-plan plan)
+      plan)))
+
+(cl-defun anvil-py-remove-import (file spec &key apply)
+  "Remove the import specified by SPEC from FILE.
+SPEC shape matches `anvil-py-add-import'.  For `from'-imports,
+only the requested NAMES are removed; if the statement becomes
+empty, the whole statement is deleted (including its newline).
+Idempotent: a missing import returns a no-op plan.
+
+Returns the plan unless APPLY is truthy."
+  (let ((plan (anvil-py--plan-remove-import file spec)))
+    (if (anvil-treesit-truthy apply)
+        (anvil-treesit-apply-plan plan)
+      plan)))
+
 ;;;; --- MCP handlers -------------------------------------------------------
 
 (defun anvil-py--tool-list-imports (file)
@@ -371,6 +645,55 @@ MCP Parameters:
    (or (anvil-py-find-definition file name)
        (list :found nil :name name))))
 
+(defun anvil-py--coerce-spec (spec)
+  "Normalize an MCP-bridge SPEC into the elisp plist shape.
+MCP tool calls can arrive with string-valued :kind (\"from\" vs 'from)
+and string-encoded name lists.  Return a plist whose values are ready
+for the elisp planners."
+  (let* ((s (cond ((and spec (listp spec)) (copy-sequence spec))
+                  ((hash-table-p spec)
+                   (let (out)
+                     (maphash (lambda (k v)
+                                (push v out)
+                                (push (intern
+                                       (concat ":"
+                                               (if (keywordp k)
+                                                   (substring
+                                                    (symbol-name k) 1)
+                                                 (format "%s" k))))
+                                      out))
+                              spec)
+                     out))
+                  (t nil)))
+         (kind (plist-get s :kind)))
+    (when (stringp kind)
+      (setq s (plist-put s :kind (intern kind))))
+    (when (stringp (plist-get s :names))
+      (setq s (plist-put s :names
+                         (split-string (plist-get s :names)
+                                       "[ ,]+" t))))
+    s))
+
+(defun anvil-py--tool-add-import (file spec apply)
+  "MCP wrapper — add an import.
+
+MCP Parameters:
+  file  - absolute path to the .py file to edit
+  spec  - plist describing the import (see `anvil-py-add-import')
+  apply - truthy to write; default returns a preview plan"
+  (anvil-server-with-error-handling
+   (anvil-py-add-import file (anvil-py--coerce-spec spec) :apply apply)))
+
+(defun anvil-py--tool-remove-import (file spec apply)
+  "MCP wrapper — remove an import.
+
+MCP Parameters:
+  file  - absolute path to the .py file to edit
+  spec  - plist describing the import (see `anvil-py-remove-import')
+  apply - truthy to write; default returns a preview plan"
+  (anvil-server-with-error-handling
+   (anvil-py-remove-import file (anvil-py--coerce-spec spec) :apply apply)))
+
 (defun anvil-py--tool-surrounding-form (file point kind)
   "MCP wrapper — return the def / class enclosing POINT.
 
@@ -400,7 +723,9 @@ MCP Parameters:
     "py-list-methods"
     "py-list-decorators"
     "py-find-definition"
-    "py-surrounding-form")
+    "py-surrounding-form"
+    "py-add-import"
+    "py-remove-import")
   "Stable list of MCP tool ids registered by `anvil-py-enable'.")
 
 (defun anvil-py--register-tools ()
@@ -466,7 +791,28 @@ exhaustive results."
    :description "Return the innermost function or class whose source
 range contains the 1-based buffer POINT.  KIND restricts the match to
 `function' or `class'; empty / nil matches either."
-   :read-only t))
+   :read-only t)
+
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-py--tool-add-import)
+   :id "py-add-import"
+   :server-id anvil-py--server-id
+   :description "Add an import to a Python file.  SPEC is a plist:
+(:kind 'from :from MODULE :names (NAME ...)) for `from X import ...',
+or (:kind 'import :module MODULE [:alias NAME]) for `import X'.
+Idempotent — merges into an existing `from X import ...' for the same
+module, and returns a no-op plan when SPEC is already satisfied.
+Preview-default; pass :apply t to write via file-batch-across.")
+
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-py--tool-remove-import)
+   :id "py-remove-import"
+   :server-id anvil-py--server-id
+   :description "Remove an import from a Python file.  SPEC shape
+matches `py-add-import'.  For `from'-imports, only the requested
+names are removed; if the statement is left empty, the whole line
+is dropped.  Idempotent: a missing import returns a no-op plan.
+Preview-default; pass :apply t to write via file-batch-across."))
 
 (defun anvil-py-enable ()
   "Enable the Phase 1a py-* MCP tools."

@@ -9,9 +9,12 @@
   :ID:       d157a927-ac3a-4d51-b3d2-f132810ac087
   :END:
 Phase 1a ~SHIPPED~ 2026-04-20 (shared core + Python locators,
-20 tests against =tests/fixtures/py-sample/app.py=).  Phase 1b
-(TS/JS locators), Phase 2 (structural edits), Phase 3 (cross-file
-rename), Phase 4 (extract/inline) still ~DRAFT~.
+23 tests against =tests/fixtures/py-sample/app.py=).  Phase 2a
+~SHIPPED~ 2026-04-20 (py-add-import + py-remove-import with
+idempotent merge-into-existing and preview-default plan shape,
++12 tests).  Phase 1b (TS/JS locators), Phase 2b (replace-function,
+wrap-expr, rename-import), Phase 3 (cross-file rename), Phase 4
+(extract/inline) still ~DRAFT~.
 
 Sibling of Doc 12 (anvil-sexp, elisp).  Provides tree-sitter-backed
 structural editing for brace-and-keyword languages, with a shared
