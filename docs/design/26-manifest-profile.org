@@ -217,7 +217,83 @@ Phase 1 は本採用、ただし注入先を orchestrator worker subprocess
    filter hook / manifest-cost / snapshot regression)。
 
 実装は feat/doc-26-manifest-profile branch 上 (cherry-pick 後 opt-in
-修正済)。self-PR → squash merge で develop へ。
+修正済)。user が手 merge で develop へ統合。
+
+** Phase 1a — per-server-id profile + alias resolution (~Impl~)
+
+Phase 0 の判定で「orchestrator worker 限定 ultra 適用」に倒したが、
+単純な env 注入では効かないことが判明:
+
+- =ANVIL_PROFILE= env は subprocess が継承するだけで、anvil-stdio.sh
+  経由の emacsclient では server (main daemon) の状態に影響しない。
+- Server 側 filter は *全 client 共通* のため、main session と
+  orchestrator child で別 profile を返すには *server-id 別の
+  filter 判定* が必要。
+
+実装アプローチ (採用):
+
+1. *Server-id alias 解決*: =anvil-server.el= に
+   =anvil-server-id-aliases= defvar + =anvil-server--resolve-id=
+   追加。virtual server-id (=emacs-eval-ultra= 等) を real id
+   (=emacs-eval=) に解決して tool table を lookup。5 handler
+   (initialize / tools-list / tools-call / resources-list /
+   resources-templates-list / resources-read) で alias 解決を適用。
+2. *Filter シグネチャ拡張*: =anvil-server-tool-filter-function= を
+   =(tool-id tool-plist server-id)= に。server-id は *解決前の
+   virtual id* を渡し、filter 側で profile を切り分けられるように。
+3. *Per-server-id profile map*: =anvil-manifest.el= に
+   =anvil-manifest-server-profiles= defcustom。既定:
+   #+begin_src elisp
+   '(("emacs-eval-ultra" . ultra)
+     ("emacs-eval-nav"   . nav)
+     ("emacs-eval-core"  . core))
+   #+end_src
+   =anvil-manifest-enable= で =anvil-server-id-aliases= に既定
+   alias を追加 (=emacs-eval-ultra= 等を =emacs-eval= にマップ)。
+4. *Back-compat*: filter signature に optional arg を追加した形なので
+   legacy 2-arg 呼び出しも通る。
+
+*Claude Code config 例* (orchestrator subprocess 用):
+
+#+begin_src json
+{
+  "mcpServers": {
+    "emacs-eval-ultra": {
+      "type": "stdio",
+      "command": "/home/<user>/.emacs.d/anvil-stdio.sh",
+      "args": [
+        "--server-id=emacs-eval-ultra",
+        "--init-function=anvil-enable"
+      ],
+      "env": {}
+    }
+  }
+}
+#+end_src
+
+Orchestrator worker (=anvil-orchestrator.el= の =spawn=) がこの
+config を持つ claude-cli / codex-cli を起動すれば、child session の
+=tools/list= は自動的に ultra profile に絞られる。Main session の
+=emacs-eval= は変更なしで =full= 表示を維持。
+
+テスト: =tests/anvil-manifest-test.el= に 8 ERT 追加 (alias 解決 /
+per-server-id profile / enable/disable で alias install/uninstall /
+end-to-end で emacs-eval-ultra が ultra 絞り込み反映)。全 24 ERT pass。
+
+** Phase 1b — orchestrator subprocess env 自動注入 (~DRAFT~)
+
+現状 Phase 1a は *Claude Code config 側で手動に* virtual server-id
+を指定する必要がある。Phase 1b では =anvil-orchestrator.el= の
+=anvil-orchestrator--spawn= で、provider が claude-cli / codex 等
+の場合に自動で =--mcp-server emacs-eval-ultra= 相当の設定を差し込む:
+
+- Provider の =build-cmd= で claude-cli の =--mcp-config= に ultra 版
+  を組み込み。
+- 既存 user config と衝突しないよう temp file or env で分離。
+- Opt-out: task plist に =:no-manifest-override t= があれば無効化。
+
+Phase 1a 経過観察 (orchestrator 実戦での token 削減実測) 後に
+Phase 1b 着手。
 
 ** Phase 2 — lazy discovery (=ultra= + meta-tool)
 

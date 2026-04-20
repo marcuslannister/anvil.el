@@ -51,14 +51,43 @@
     (if (and env (not (string-empty-p env)))
         (intern env)
       'full))
-  "Active manifest profile.
-Selects which registered tools are advertised via tools/list.
+  "Active manifest profile (global default).
+Selects which registered tools are advertised via tools/list when
+the incoming server-id has no entry in `anvil-manifest-server-profiles'.
 Set via `ANVIL_PROFILE' env var or Lisp before calling
 `anvil-manifest-enable'.  Handlers remain live regardless of profile,
 so hidden tools stay callable via explicit tools/call."
   :type '(choice (const full) (const core) (const nav)
                  (const ultra) (const lean))
   :group 'anvil-manifest)
+
+(defcustom anvil-manifest-server-profiles
+  '(("emacs-eval-ultra" . ultra)
+    ("emacs-eval-nav"   . nav)
+    ("emacs-eval-core"  . core))
+  "Alist of (SERVER-ID . PROFILE) overriding `anvil-manifest-profile'.
+Lets one MCP daemon advertise different tool subsets to different
+clients when each client connects under a distinct (virtual) server-id.
+
+The default set assumes `anvil-server-id-aliases' aliases each
+virtual id back to the real `emacs-eval' — see
+`anvil-manifest--default-aliases'.  To apply `ultra' to an
+orchestrator subprocess, point its MCP config's `--server-id=' at
+`emacs-eval-ultra'.
+
+Setting a profile to `full' for a given server-id explicitly restores
+the unfiltered default for that connection."
+  :type '(alist :key-type string :value-type symbol)
+  :group 'anvil-manifest)
+
+(defconst anvil-manifest--default-aliases
+  '(("emacs-eval-ultra" . "emacs-eval")
+    ("emacs-eval-nav"   . "emacs-eval")
+    ("emacs-eval-core"  . "emacs-eval"))
+  "Default `anvil-server-id-aliases' entries installed by
+`anvil-manifest-enable'.  Each alias routes a virtual server-id at
+the anvil-server tool table for `emacs-eval', so the filter can apply
+a per-connection profile without duplicating registrations.")
 
 ;;; Profile definitions
 
@@ -149,11 +178,20 @@ here to keep the `learning workload' path slim.")
     ('lean anvil-manifest-profile-lean)
     (_ (user-error "anvil-manifest: unknown profile %S" profile))))
 
-(defun anvil-manifest--tool-visible-p (tool-id _tool-plist)
-  "Return non-nil if TOOL-ID should appear in tools/list.
+(defun anvil-manifest--profile-for-server-id (server-id)
+  "Return the profile symbol that applies to SERVER-ID.
+Falls back to the global `anvil-manifest-profile' when the incoming
+server-id is absent from `anvil-manifest-server-profiles'."
+  (or (cdr (assoc server-id anvil-manifest-server-profiles))
+      anvil-manifest-profile))
+
+(defun anvil-manifest--tool-visible-p (tool-id _tool-plist &optional server-id)
+  "Return non-nil if TOOL-ID should appear in tools/list for SERVER-ID.
 Used as `anvil-server-tool-filter-function' when the module is
-enabled."
-  (let ((set (anvil-manifest--profile-toolset anvil-manifest-profile)))
+enabled.  When called without SERVER-ID (legacy two-argument callers),
+the global `anvil-manifest-profile' applies."
+  (let* ((profile (anvil-manifest--profile-for-server-id server-id))
+         (set (anvil-manifest--profile-toolset profile)))
     (or (eq set :all)
         (member tool-id set))))
 
@@ -214,18 +252,30 @@ MCP Parameters: (none)"
 
 ;;;###autoload
 (defun anvil-manifest-enable ()
-  "Activate the tools/list profile filter and register manifest-cost."
+  "Activate the tools/list profile filter and register manifest-cost.
+Installs `anvil-manifest--default-aliases' into
+`anvil-server-id-aliases' so orchestrator subprocesses can connect
+as `emacs-eval-ultra' / `emacs-eval-nav' / `emacs-eval-core' and
+receive the matching filtered manifest without duplicating tool
+registrations."
   (interactive)
   (setq anvil-server-tool-filter-function
         #'anvil-manifest--tool-visible-p)
+  (dolist (alias anvil-manifest--default-aliases)
+    (cl-pushnew alias anvil-server-id-aliases :test #'equal))
   (anvil-server-register-tools "default" anvil-manifest--tool-specs))
 
 (defun anvil-manifest-disable ()
-  "Deactivate the profile filter and unregister manifest-cost."
+  "Deactivate the profile filter and unregister manifest-cost.
+Also removes `anvil-manifest--default-aliases' from
+`anvil-server-id-aliases'."
   (interactive)
   (when (eq anvil-server-tool-filter-function
             #'anvil-manifest--tool-visible-p)
     (setq anvil-server-tool-filter-function nil))
+  (dolist (alias anvil-manifest--default-aliases)
+    (setq anvil-server-id-aliases
+          (delete alias anvil-server-id-aliases)))
   (anvil-server-unregister-tools "default" anvil-manifest--tool-specs))
 
 (provide 'anvil-manifest)
