@@ -124,7 +124,12 @@ These are not loaded by default.  Available modules:
                 for orchestrator child sessions where per-session
                 manifest cost dominates (Doc 26 Phase 1).  Add
                 `manifest' last in the module list so it sees every
-                earlier registration."
+                earlier registration.
+- `disclosure' — Layer-1 (slim index) + disclosure-help tools that
+                formalise the 3-layer read contract documented in
+                docs/design/28-progressive-disclosure.org.  Depends on
+                `anvil-org-index' for the org-index-index handler
+                (Doc 28 Phase 1)"
   :type '(repeat symbol)
   :group 'anvil)
 
