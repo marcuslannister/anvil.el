@@ -407,6 +407,661 @@ candidates (see `anvil-ts--find-definition-lang')."
                    (> (plist-get (plist-get a :bounds) :start)
                       (plist-get (plist-get b :bounds) :start))))))))
 
+;;;; --- import edit helpers (Phase 2) --------------------------------------
+
+(defun anvil-ts--import-module-of (node)
+  "Return the module string (no quotes) of an `import_statement' NODE."
+  (let (mod)
+    (dolist (c (treesit-node-children node t))
+      (when (and (null mod)
+                 (string= (treesit-node-type c) "string"))
+        ;; Find the string_fragment child; falls back to the node's
+        ;; raw text with quotes trimmed when the grammar omits it.
+        (let ((frag (cl-find-if (lambda (cc)
+                                  (string= (treesit-node-type cc)
+                                           "string_fragment"))
+                                (treesit-node-children c t))))
+          (setq mod (if frag
+                        (anvil-treesit-node-text frag)
+                      (let ((raw (anvil-treesit-node-text c)))
+                        (if (and (> (length raw) 1)
+                                 (memq (aref raw 0) '(?\" ?\')))
+                            (substring raw 1 -1)
+                          raw)))))))
+    mod))
+
+(defun anvil-ts--import-type-only-p (node)
+  "Return non-nil when NODE is an `import type { ... }' statement.
+Detected by an anonymous `type' keyword child of `import_statement'
+\\(the grammar does not elevate it to a named node)."
+  (cl-some (lambda (c)
+             (and (not (treesit-node-check c 'named))
+                  (string= (treesit-node-text c t) "type")))
+           (treesit-node-children node nil)))
+
+(defun anvil-ts--import-clause (node)
+  "Return the direct `import_clause' child of NODE, or nil."
+  (cl-find "import_clause"
+           (treesit-node-children node t)
+           :key #'treesit-node-type
+           :test #'string=))
+
+(defun anvil-ts--import-default-of (node)
+  "Return the default specifier's identifier as a string, or nil."
+  (let ((clause (anvil-ts--import-clause node)))
+    (when clause
+      (let ((ident (cl-find-if
+                    (lambda (c)
+                      (string= (treesit-node-type c) "identifier"))
+                    (treesit-node-children clause t))))
+        (and ident (anvil-treesit-node-text ident))))))
+
+(defun anvil-ts--import-namespace-of (node)
+  "Return the namespace-import name (`* as X' → \"X\") or nil."
+  (let ((clause (anvil-ts--import-clause node)))
+    (when clause
+      (let ((ns (cl-find-if
+                 (lambda (c)
+                   (string= (treesit-node-type c) "namespace_import"))
+                 (treesit-node-children clause t))))
+        (when ns
+          (let ((ident (cl-find-if
+                        (lambda (c)
+                          (string= (treesit-node-type c) "identifier"))
+                        (treesit-node-children ns t))))
+            (and ident (anvil-treesit-node-text ident))))))))
+
+(defun anvil-ts--named-imports-node (node)
+  "Return the `named_imports' node under NODE's import_clause, or nil."
+  (let ((clause (anvil-ts--import-clause node)))
+    (when clause
+      (cl-find "named_imports"
+               (treesit-node-children clause t)
+               :key #'treesit-node-type
+               :test #'string=))))
+
+(defun anvil-ts--import-specifier-parts (spec-node)
+  "Return (:name STR :alias STR-OR-NIL :type-only BOOL) for SPEC-NODE.
+SPEC-NODE is an `import_specifier' — e.g. `a', `a as b', `type a',
+`type a as b'."
+  (let ((type-only nil)
+        (idents '())
+        saw-as)
+    (dolist (c (treesit-node-children spec-node nil))
+      (pcase (treesit-node-type c)
+        ("type" (setq type-only t))
+        ("as"   (setq saw-as t))
+        ("identifier"
+         (push (anvil-treesit-node-text c) idents))))
+    (let* ((idents (nreverse idents))
+           (name (car idents))
+           (alias (and saw-as (cadr idents))))
+      (list :name name :alias alias :type-only (and type-only t)))))
+
+(defun anvil-ts--import-named-of (node)
+  "Return the named-import specifier list for NODE.
+Each entry: (:name STR :alias STR-OR-NIL :type-only BOOL)."
+  (let ((ni (anvil-ts--named-imports-node node)))
+    (when ni
+      (let (out)
+        (dolist (c (treesit-node-children ni t))
+          (when (string= (treesit-node-type c) "import_specifier")
+            (push (anvil-ts--import-specifier-parts c) out)))
+        (nreverse out)))))
+
+(defun anvil-ts--find-import-by-module (root module)
+  "Return the first `import ... from MODULE' statement in ROOT, or nil."
+  (let (found)
+    (dolist (cap (treesit-query-capture
+                  root (anvil-ts--query
+                        (treesit-node-language root) 'imports)))
+      (unless found
+        (let ((n (cdr cap)))
+          (when (string= (anvil-ts--import-module-of n) module)
+            (setq found n)))))
+    found))
+
+(defun anvil-ts--render-named-specifier (entry)
+  "Render a single `import_specifier' source from ENTRY plist."
+  (let ((prefix (if (plist-get entry :type-only) "type " "")))
+    (if (plist-get entry :alias)
+        (format "%s%s as %s"
+                prefix
+                (plist-get entry :name)
+                (plist-get entry :alias))
+      (format "%s%s" prefix (plist-get entry :name)))))
+
+(defun anvil-ts--render-named-clause (entries)
+  "Render `{ a, b as c }' from an ENTRIES list of specifier plists."
+  (concat "{ "
+          (mapconcat #'anvil-ts--render-named-specifier entries ", ")
+          " }"))
+
+(defun anvil-ts--render-import-statement (spec)
+  "Render a full `import ...' statement from SPEC plist.
+SPEC keys: :from, :default, :named (list of plists or strings),
+:namespace, :type-only.  :named entries may be plain strings (no
+alias) or plists (:name :alias :type-only).  A :namespace and
+:named are mutually exclusive — the renderer emits :namespace and
+drops :named."
+  (let* ((from (plist-get spec :from))
+         (default (plist-get spec :default))
+         (namespace (plist-get spec :namespace))
+         (named (plist-get spec :named))
+         (type-only (plist-get spec :type-only))
+         (normalized
+          (mapcar (lambda (e)
+                    (cond
+                     ((stringp e) (list :name e :alias nil :type-only nil))
+                     ((and (consp e) (not (plistp e)))
+                      (list :name (car e) :alias (cdr e) :type-only nil))
+                     (t e)))
+                  named))
+         (pieces '())
+         (header (if type-only "import type " "import ")))
+    (unless from
+      (user-error "anvil-ts: :from required in SPEC"))
+    (cond
+     ((and (null default) (null namespace) (null normalized))
+      ;; Side-effect import.
+      (format "import \"%s\";" from))
+     (t
+      (when default (push default pieces))
+      (cond
+       (namespace (push (format "* as %s" namespace) pieces))
+       (normalized (push (anvil-ts--render-named-clause normalized) pieces)))
+      (format "%s%s from \"%s\";"
+              header
+              (mapconcat #'identity (nreverse pieces) ", ")
+              from)))))
+
+(defun anvil-ts--import-insertion-point (root)
+  "Return the 1-based point after which new imports should be inserted.
+Picks the end of the last existing top-level import statement, or
+the start of the first non-import top-level statement."
+  (let ((last-import-end nil)
+        (first-non-import-start nil)
+        (c (treesit-node-child root 0)))
+    (while c
+      (pcase (treesit-node-type c)
+        ("import_statement"
+         (setq last-import-end (treesit-node-end c)))
+        (_ (unless first-non-import-start
+             (setq first-non-import-start (treesit-node-start c)))))
+      (setq c (treesit-node-next-sibling c)))
+    (or last-import-end
+        first-non-import-start
+        (point-min))))
+
+(defun anvil-ts--normalize-spec-entries (spec)
+  "Return a fresh plist with :named normalized to list of plists.
+Every :named string / cons is promoted to a (:name :alias :type-only)
+plist so downstream comparisons don't need to handle both shapes."
+  (let* ((named (plist-get spec :named))
+         (norm (mapcar
+                (lambda (e)
+                  (cond
+                   ((stringp e) (list :name e :alias nil :type-only nil))
+                   ((and (consp e) (not (plistp e)))
+                    (list :name (car e) :alias (cdr e) :type-only nil))
+                   (t e)))
+                named))
+         (copy (copy-sequence spec)))
+    (plist-put copy :named norm)))
+
+(defun anvil-ts--specifier-key (entry)
+  "Return a cons key (name . alias) uniquely identifying an ENTRY.
+Used to de-duplicate named specifiers when merging."
+  (cons (plist-get entry :name)
+        (plist-get entry :alias)))
+
+(cl-defun anvil-ts--plan-add-import (lang file spec)
+  "Build an edit plan adding SPEC to FILE parsed under LANG.
+SPEC keys: :from (required), :default, :named, :type-only.
+Merges into an existing `import ... from :from' when type-only
+flags match; otherwise appends a new statement at the import
+block's tail.  Returns a no-op plan when every requested specifier
+is already present and the type-only flag matches."
+  (let* ((spec (anvil-ts--normalize-spec-entries spec))
+         (module (plist-get spec :from))
+         (type-only (and (plist-get spec :type-only) t)))
+    (unless module
+      (user-error "anvil-ts-add-import: :from required"))
+    (anvil-treesit-with-root file lang root
+      (let* ((existing (anvil-ts--find-import-by-module root module))
+             (ex-type-only (and existing
+                                (anvil-ts--import-type-only-p existing))))
+        (cond
+         ;; No existing — emit a brand-new statement.
+         ((null existing)
+          (let* ((ins (anvil-ts--import-insertion-point root))
+                 (rendered (anvil-ts--render-import-statement spec))
+                 (new-text (if (> ins (point-min))
+                               (concat "\n" rendered)
+                             (concat rendered "\n"))))
+            (anvil-treesit-make-plan
+             file ins ins new-text
+             (format "add-import from \"%s\" (new)" module))))
+         ;; Existing with mismatching type-only flag — append new stmt.
+         ((not (eq ex-type-only type-only))
+          (let* ((ins (treesit-node-end existing))
+                 (rendered (anvil-ts--render-import-statement spec))
+                 (new-text (concat "\n" rendered)))
+            (anvil-treesit-make-plan
+             file ins ins new-text
+             (format "add-import from \"%s\" (split %s)"
+                     module (if type-only "type" "value")))))
+         ;; Existing match — merge specifiers in place.
+         (t
+          (let* ((cur-default (anvil-ts--import-default-of existing))
+                 (cur-namespace (anvil-ts--import-namespace-of existing))
+                 (cur-named (anvil-ts--import-named-of existing))
+                 (want-default (plist-get spec :default))
+                 (want-named (plist-get spec :named))
+                 (want-namespace (plist-get spec :namespace))
+                 (new-default (or cur-default want-default))
+                 (current-keys (mapcar #'anvil-ts--specifier-key cur-named))
+                 (missing (cl-remove-if
+                           (lambda (e)
+                             (member (anvil-ts--specifier-key e) current-keys))
+                           want-named))
+                 (merged (append cur-named missing))
+                 (default-differs (and want-default cur-default
+                                       (not (string= cur-default want-default))))
+                 (namespace-differs (and want-namespace
+                                         (not (equal cur-namespace
+                                                     want-namespace)))))
+            (when default-differs
+              (user-error "anvil-ts-add-import: \"%s\" already has default %S, refusing to overwrite with %S"
+                          module cur-default want-default))
+            (when namespace-differs
+              (user-error "anvil-ts-add-import: \"%s\" already has namespace %S, refusing to overwrite with %S"
+                          module cur-namespace want-namespace))
+            (cond
+             ((and (null missing)
+                   (or (null want-default)
+                       (and cur-default (string= cur-default want-default)))
+                   (or (null want-namespace)
+                       (and cur-namespace (string= cur-namespace want-namespace))))
+              (anvil-treesit-make-noop-plan
+               file (format "add-import from \"%s\"" module)))
+             (t
+              (let* ((rendered
+                      (anvil-ts--render-import-statement
+                       (list :from module
+                             :type-only type-only
+                             :default new-default
+                             :namespace (or cur-namespace want-namespace)
+                             :named merged)))
+                     (beg (treesit-node-start existing))
+                     (end (treesit-node-end existing)))
+                (anvil-treesit-make-plan
+                 file beg end rendered
+                 (format "add-import from \"%s\" (merge %d name%s)"
+                         module (length missing)
+                         (if (= 1 (length missing)) "" "s")))))))))))))
+
+(cl-defun anvil-ts--plan-remove-import (lang file spec)
+  "Build an edit plan removing SPEC from FILE parsed under LANG.
+SPEC keys match `anvil-ts--plan-add-import'.  :named entries are
+removed from the existing statement; :default (when non-nil) drops
+the default specifier.  When the resulting statement has no
+specifiers left, the whole statement is removed (including its
+trailing newline).  No-op when SPEC is already absent."
+  (let* ((spec (anvil-ts--normalize-spec-entries spec))
+         (module (plist-get spec :from))
+         (drop-default (plist-get spec :default))
+         (drop-named (plist-get spec :named)))
+    (unless module
+      (user-error "anvil-ts-remove-import: :from required"))
+    (anvil-treesit-with-root file lang root
+      (let ((existing (anvil-ts--find-import-by-module root module)))
+        (if (null existing)
+            (anvil-treesit-make-noop-plan
+             file (format "remove-import from \"%s\"" module))
+          (let* ((cur-type-only (anvil-ts--import-type-only-p existing))
+                 (cur-default (anvil-ts--import-default-of existing))
+                 (cur-namespace (anvil-ts--import-namespace-of existing))
+                 (cur-named (anvil-ts--import-named-of existing))
+                 (drop-keys (mapcar #'anvil-ts--specifier-key drop-named))
+                 (kept-named (cl-remove-if
+                              (lambda (e)
+                                (member (anvil-ts--specifier-key e) drop-keys))
+                              cur-named))
+                 (new-default (if (and drop-default cur-default
+                                       (string= drop-default cur-default))
+                                  nil
+                                cur-default))
+                 (changed (or (and drop-default cur-default
+                                   (string= drop-default cur-default))
+                              (/= (length kept-named) (length cur-named)))))
+            (cond
+             ((not changed)
+              (anvil-treesit-make-noop-plan
+               file (format "remove-import from \"%s\"" module)))
+             ;; Nothing left — drop whole statement + trailing newline.
+             ((and (null new-default)
+                   (null cur-namespace)
+                   (null kept-named))
+              (let* ((beg (treesit-node-start existing))
+                     (end (treesit-node-end existing))
+                     (end+1 (with-temp-buffer
+                              (insert-file-contents file)
+                              (goto-char end)
+                              (if (eq (char-after) ?\n) (1+ end) end))))
+                (anvil-treesit-make-plan
+                 file beg end+1 ""
+                 (format "remove-import from \"%s\" (drop whole)" module))))
+             (t
+              (let* ((rendered
+                      (anvil-ts--render-import-statement
+                       (list :from module
+                             :type-only cur-type-only
+                             :default new-default
+                             :namespace cur-namespace
+                             :named kept-named)))
+                     (beg (treesit-node-start existing))
+                     (end (treesit-node-end existing)))
+                (anvil-treesit-make-plan
+                 file beg end rendered
+                 (format "remove-import from \"%s\"" module)))))))))))
+
+(defun anvil-ts--bound-name-of-specifier (spec)
+  "Return the binding name an import specifier SPEC brings into scope.
+An alias wins over the raw name — `import { a as b }' binds `b'."
+  (or (plist-get spec :alias) (plist-get spec :name)))
+
+(cl-defun anvil-ts--plan-rename-import (lang file old new)
+  "Build an edit plan renaming the OLD binding to NEW in FILE.
+Walks every `import_statement', finds the unique specifier whose
+visible binding name is OLD (default / named / named-alias /
+namespace), and rewrites only that specifier.  Signals a
+`user-error' when:
+ - OLD is absent from any import.
+ - OLD matches multiple specifiers across imports (ambiguous).
+
+Reference use sites are not touched — that is Phase 3 territory."
+  (unless (and (stringp old) (stringp new) (not (string-empty-p old))
+               (not (string-empty-p new)))
+    (user-error "anvil-ts-rename-import: OLD and NEW must be non-empty strings"))
+  (anvil-treesit-with-root file lang root
+    (let* ((q (anvil-ts--query lang 'imports))
+           (matches '()))
+      (dolist (cap (treesit-query-capture root q))
+        (let* ((node (cdr cap))
+               (default (anvil-ts--import-default-of node))
+               (namespace (anvil-ts--import-namespace-of node))
+               (named (anvil-ts--import-named-of node)))
+          (when (and default (string= default old))
+            (push (list :node node :kind 'default) matches))
+          (when (and namespace (string= namespace old))
+            (push (list :node node :kind 'namespace) matches))
+          (dolist (s named)
+            (when (string= (anvil-ts--bound-name-of-specifier s) old)
+              (push (list :node node :kind 'named :spec s) matches)))))
+      (cond
+       ((null matches)
+        (user-error "anvil-ts-rename-import: `%s' is not bound by any import in %s"
+                    old (file-name-nondirectory file)))
+       ((> (length matches) 1)
+        (user-error "anvil-ts-rename-import: `%s' matches %d specifiers (ambiguous)"
+                    old (length matches)))
+       (t
+        (let* ((m (car matches))
+               (node (plist-get m :node))
+               (module (anvil-ts--import-module-of node))
+               (cur-type-only (anvil-ts--import-type-only-p node))
+               (cur-default (anvil-ts--import-default-of node))
+               (cur-namespace (anvil-ts--import-namespace-of node))
+               (cur-named (anvil-ts--import-named-of node))
+               (new-default cur-default)
+               (new-namespace cur-namespace)
+               (new-named cur-named))
+          (pcase (plist-get m :kind)
+            ('default (setq new-default new))
+            ('namespace (setq new-namespace new))
+            ('named
+             (let ((hit (plist-get m :spec)))
+               (setq new-named
+                     (mapcar
+                      (lambda (e)
+                        (if (and (equal (plist-get e :name) (plist-get hit :name))
+                                 (equal (plist-get e :alias) (plist-get hit :alias)))
+                            ;; Attach an alias if the name itself was the
+                            ;; binding (no existing alias); otherwise just
+                            ;; rewrite the alias.
+                            (let ((had-alias (plist-get e :alias)))
+                              (if had-alias
+                                  (list :name (plist-get e :name)
+                                        :alias new
+                                        :type-only (plist-get e :type-only))
+                                (list :name (plist-get e :name)
+                                      :alias (and (not (string= (plist-get e :name) new))
+                                                  new)
+                                      :type-only (plist-get e :type-only))))
+                          e))
+                      cur-named)))))
+          (let* ((rendered
+                  (anvil-ts--render-import-statement
+                   (list :from module
+                         :type-only cur-type-only
+                         :default new-default
+                         :namespace new-namespace
+                         :named new-named)))
+                 (beg (treesit-node-start node))
+                 (end (treesit-node-end node))
+                 (current (treesit-node-text node)))
+            (if (string= current rendered)
+                (anvil-treesit-make-noop-plan
+                 file (format "rename-import %s → %s" old new))
+              (anvil-treesit-make-plan
+               file beg end rendered
+               (format "rename-import %s → %s" old new))))))))))
+
+;;;; --- replace-function helpers (Phase 2) ---------------------------------
+
+(defun anvil-ts--line-beginning-at (point)
+  "Return the 1-based point of the line start containing POINT."
+  (save-excursion (goto-char point) (line-beginning-position)))
+
+(defun anvil-ts--common-leading-whitespace (lines)
+  "Longest whitespace prefix common to every non-empty LINES entry."
+  (let ((candidates (cl-remove-if
+                     (lambda (l) (string-empty-p (string-trim l)))
+                     lines)))
+    (if (null candidates)
+        ""
+      (cl-reduce
+       (lambda (a b)
+         (let ((i 0) (len (min (length a) (length b))))
+           (while (and (< i len) (eq (aref a i) (aref b i)))
+             (cl-incf i))
+           (substring a 0 i)))
+       (mapcar (lambda (l)
+                 (if (string-match "\\`[ \t]*" l)
+                     (match-string 0 l)
+                   ""))
+               candidates)))))
+
+(defun anvil-ts--dedent (text)
+  "Strip common leading whitespace from every line of TEXT."
+  (let* ((lines (split-string text "\n"))
+         (common (anvil-ts--common-leading-whitespace lines)))
+    (if (string-empty-p common)
+        text
+      (mapconcat (lambda (l)
+                   (if (string-prefix-p common l)
+                       (substring l (length common))
+                     l))
+                 lines "\n"))))
+
+(defun anvil-ts--reindent (text indent)
+  "Prepend INDENT to every non-empty line of TEXT."
+  (if (string-empty-p indent)
+      text
+    (mapconcat (lambda (l)
+                 (if (string-empty-p (string-trim l))
+                     l
+                   (concat indent l)))
+               (split-string text "\n")
+               "\n")))
+
+(defun anvil-ts--reindent-except-first (text indent)
+  "Like `anvil-ts--reindent' but leave the first line untouched.
+Used by `replace-function' where the first line sits after an
+existing prefix (`export' / `async' / access modifier) and should
+not be re-indented; every subsequent line of TEXT gets INDENT
+prepended so the swapped block keeps the original column."
+  (if (string-empty-p indent)
+      text
+    (let* ((lines (split-string text "\n"))
+           (idx -1))
+      (mapconcat
+       (lambda (l)
+         (cl-incf idx)
+         (cond
+          ((= idx 0) l)
+          ((string-empty-p (string-trim l)) l)
+          (t (concat indent l))))
+       lines "\n"))))
+
+(defun anvil-ts--find-replace-target (lang root name class-filter)
+  "Return the (function_declaration | method_definition) for NAME.
+CLASS-FILTER restricts to methods of a named class.  Signals a
+`user-error' on ambiguity (without CLASS-FILTER) or miss."
+  (let (candidates)
+    (dolist (cap (treesit-query-capture root (anvil-ts--query lang 'functions)))
+      (when (eq (car cap) 'fn)
+        (let ((n (cdr cap)))
+          (when (string= (anvil-ts--node-name n) name)
+            (push (cons nil n) candidates)))))
+    (dolist (cap (treesit-query-capture root (anvil-ts--query lang 'methods)))
+      (when (eq (car cap) 'method)
+        (let* ((n (cdr cap))
+               (cls (anvil-ts--enclosing-class-name n)))
+          (when (and cls (string= (anvil-ts--node-name n) name)
+                     (or (null class-filter)
+                         (string= cls class-filter)))
+            (push (cons cls n) candidates)))))
+    (cond
+     ((null candidates)
+      (user-error "anvil-ts-replace-function: no def named %S%s"
+                  name
+                  (if class-filter (format " in class %S" class-filter) "")))
+     ((and (null class-filter) (> (length candidates) 1))
+      (user-error "anvil-ts-replace-function: ambiguous %S (matches %s); pass :class"
+                  name
+                  (mapconcat (lambda (c)
+                               (format "%s" (or (car c) "<top-level>")))
+                             candidates ", ")))
+     (t (cdr (car candidates))))))
+
+(defun anvil-ts--leading-whitespace-at (point)
+  "Return the leading whitespace string of the line containing POINT.
+Used by `replace-function' as the re-indent prefix so body lines
+of the replacement match the enclosing context.  Counting the
+whitespace from line-beg — rather than the width from line-beg to
+fn-start — means a top-level `export function foo' gets indent=\"\"
+while a method `  greet()' gets indent=\"  \", both correct."
+  (save-excursion
+    (goto-char point)
+    (beginning-of-line)
+    (let ((start (point)))
+      (skip-chars-forward " \t")
+      (buffer-substring-no-properties start (point)))))
+
+(cl-defun anvil-ts--plan-replace-function (lang file name new-source class-filter)
+  "Build an edit plan replacing def NAME with NEW-SOURCE in FILE.
+NEW-SOURCE is column-0 source; it is dedented and reindented to
+match the existing def's column so the same input works for
+top-level functions and for methods.  Any prefix on the def line
+\(`export', `async', `static', access modifiers, decorator
+pragma `@deco') is preserved — the swap covers only the
+function_declaration / method_definition node itself.  Double-
+apply with identical NEW-SOURCE is a no-op."
+  (anvil-treesit-with-root file lang root
+    (let* ((fn (anvil-ts--find-replace-target lang root name class-filter))
+           (fn-start (treesit-node-start fn))
+           (fn-end (treesit-node-end fn))
+           (indent (anvil-ts--leading-whitespace-at fn-start))
+           (dedented (anvil-ts--dedent new-source))
+           (replacement (anvil-ts--reindent-except-first dedented indent))
+           (current (with-temp-buffer
+                      (insert-file-contents file)
+                      (buffer-substring-no-properties fn-start fn-end)))
+           (reason (format "replace-function %s%s" name
+                           (if class-filter
+                               (format " (class %s)" class-filter)
+                             ""))))
+      (if (string= current replacement)
+          (anvil-treesit-make-noop-plan file reason)
+        (anvil-treesit-make-plan file fn-start fn-end replacement reason)))))
+
+;;;; --- wrap-expr helpers (Phase 2) ----------------------------------------
+
+(defconst anvil-ts-wrap-placeholder "|anvil-hole|"
+  "Token replaced with the wrapped text inside a `ts-wrap-expr' wrapper.")
+
+(defun anvil-ts--count-substring (needle haystack)
+  "Return non-overlapping occurrences of NEEDLE in HAYSTACK."
+  (if (string-empty-p needle)
+      0
+    (let ((i 0) (n 0) (len (length needle)))
+      (while (and (< i (length haystack))
+                  (setq i (string-match-p (regexp-quote needle) haystack i)))
+        (cl-incf n)
+        (setq i (+ i len)))
+      n)))
+
+(defun anvil-ts--validate-wrapper (wrapper)
+  "Signal a user-error unless WRAPPER has exactly one placeholder."
+  (let ((n (anvil-ts--count-substring anvil-ts-wrap-placeholder wrapper)))
+    (cond
+     ((= n 0)
+      (user-error "anvil-ts-wrap-expr: wrapper missing `%s' placeholder"
+                  anvil-ts-wrap-placeholder))
+     ((> n 1)
+      (user-error
+       "anvil-ts-wrap-expr: wrapper has %d `%s' placeholders (want 1)"
+       n anvil-ts-wrap-placeholder)))
+    wrapper))
+
+(defun anvil-ts--node-at-exact-range (lang start end)
+  "Return the tree-sitter node whose range is exactly [START, END)."
+  (let ((n (treesit-node-on start end lang)))
+    (catch 'found
+      (while n
+        (when (and (= (treesit-node-start n) start)
+                   (= (treesit-node-end n) end))
+          (throw 'found n))
+        (setq n (treesit-node-parent n)))
+      nil)))
+
+(cl-defun anvil-ts--plan-wrap-expr (lang file start end wrapper)
+  "Build an edit plan wrapping [START, END) of FILE with WRAPPER.
+Requires the range to align with a tree-sitter node; misaligned
+ranges signal a `user-error' rather than produce invalid source."
+  (anvil-ts--validate-wrapper wrapper)
+  (unless (and (integerp start) (integerp end) (< start end))
+    (user-error "anvil-ts-wrap-expr: invalid range (%S . %S)" start end))
+  (anvil-treesit-with-root file lang _root
+    (let* ((node (anvil-ts--node-at-exact-range lang start end))
+           (original (buffer-substring-no-properties start end))
+           (replacement (replace-regexp-in-string
+                         (regexp-quote anvil-ts-wrap-placeholder)
+                         original wrapper t t))
+           (reason (format "wrap-expr [%d,%d)%s" start end
+                           (if node
+                               (format " (%s)" (treesit-node-type node))
+                             " (unaligned!)"))))
+      (unless node
+        (user-error
+         "anvil-ts-wrap-expr: range %d-%d does not align with a tree-sitter node"
+         start end))
+      (if (string= original replacement)
+          (anvil-treesit-make-noop-plan file reason)
+        (anvil-treesit-make-plan file start end replacement reason)))))
+
 ;;;; --- public TS surface --------------------------------------------------
 
 (defun anvil-ts-list-imports (file)
@@ -449,6 +1104,89 @@ KIND optionally filters to `function' / `arrow' / `class' /
 `interface' / `type'."
   (anvil-ts--surrounding-form-lang
    file (anvil-ts--lang-for-file file) point kind t))
+
+;;;; --- public edit API (Phase 2) ------------------------------------------
+
+(cl-defun anvil-ts-add-import (file spec &key apply)
+  "Add the import specified by SPEC to FILE.
+SPEC keys: :from MODULE (required), :default NAME, :named LIST,
+:type-only BOOL.  :named entries are either a plain NAME string,
+a (NAME . ALIAS) cons, or a (:name :alias :type-only) plist.
+
+Idempotent: re-adding the same specifiers is a no-op.  Merges
+into an existing `import ... from MODULE' whose type-only flag
+matches; splits into a second statement when the flag differs.
+
+Returns the edit plan unless APPLY is truthy."
+  (let ((plan (anvil-ts--plan-add-import
+               (anvil-ts--lang-for-file file) file spec)))
+    (if (anvil-treesit-truthy apply)
+        (anvil-treesit-apply-plan plan)
+      plan)))
+
+(cl-defun anvil-ts-remove-import (file spec &key apply)
+  "Remove the import specified by SPEC from FILE.
+SPEC keys match `anvil-ts-add-import'.  :named entries are
+removed from the existing statement; :default (when non-nil and
+matching the current default) drops the default clause.  When
+nothing remains, the statement is deleted entirely (including its
+trailing newline).  No-op when SPEC is already absent.
+
+Returns the edit plan unless APPLY is truthy."
+  (let ((plan (anvil-ts--plan-remove-import
+               (anvil-ts--lang-for-file file) file spec)))
+    (if (anvil-treesit-truthy apply)
+        (anvil-treesit-apply-plan plan)
+      plan)))
+
+(cl-defun anvil-ts-rename-import (file old new &key apply)
+  "Rename the binding OLD to NEW across imports in FILE.
+Walks every `import_statement' and rewrites the unique specifier
+whose visible binding name is OLD — default, namespace, or named
+(alias wins over raw name).  Signals a `user-error' when OLD is
+absent or matches multiple specifiers.  Reference use sites are
+not touched (Phase 3 territory).
+
+Returns the edit plan unless APPLY is truthy."
+  (let ((plan (anvil-ts--plan-rename-import
+               (anvil-ts--lang-for-file file) file old new)))
+    (if (anvil-treesit-truthy apply)
+        (anvil-treesit-apply-plan plan)
+      plan)))
+
+(cl-defun anvil-ts-replace-function (file name new-source &key class apply)
+  "Replace the def named NAME in FILE with NEW-SOURCE.
+NEW-SOURCE is the full `function foo() { ... }' / `methodName() {
+... }' source at column 0; it is dedented and reindented to match
+the existing def's column so the same input works for top-level
+functions and for methods.
+
+CLASS (keyword) disambiguates when multiple methods share a name.
+Without CLASS, an ambiguous NAME errors with the candidate list.
+
+Double-apply with identical NEW-SOURCE is a no-op.  Returns the
+edit plan unless APPLY is truthy."
+  (let ((plan (anvil-ts--plan-replace-function
+               (anvil-ts--lang-for-file file)
+               file name new-source
+               (and class (if (symbolp class) (symbol-name class) class)))))
+    (if (anvil-treesit-truthy apply)
+        (anvil-treesit-apply-plan plan)
+      plan)))
+
+(cl-defun anvil-ts-wrap-expr (file start end wrapper &key apply)
+  "Wrap the expression [START, END) of FILE with WRAPPER.
+WRAPPER is a source template containing `anvil-ts-wrap-placeholder'
+\\(the literal string \"|anvil-hole|\") exactly once — that token
+is replaced with the original expression text.  The range must
+align with a tree-sitter node or the tool errors rather than
+produce invalid source.  Returns the edit plan unless APPLY is
+truthy."
+  (let ((plan (anvil-ts--plan-wrap-expr
+               (anvil-ts--lang-for-file file) file start end wrapper)))
+    (if (anvil-treesit-truthy apply)
+        (anvil-treesit-apply-plan plan)
+      plan)))
 
 ;;;; --- MCP handlers -------------------------------------------------------
 
@@ -540,6 +1278,94 @@ MCP Parameters:
      (or (anvil-ts-surrounding-form file p :kind k)
          (list :found nil :point p)))))
 
+(defun anvil-ts--coerce-spec (spec)
+  "Normalize an MCP-bridge SPEC into the elisp plist shape.
+MCP tool calls arrive with string-encoded values and hash-table
+shapes; this helper promotes them to a plist with :named entries
+expanded into plain plists."
+  (let* ((s (cond ((and spec (listp spec)) (copy-sequence spec))
+                  ((hash-table-p spec)
+                   (let (out)
+                     (maphash (lambda (k v)
+                                (push v out)
+                                (push (intern
+                                       (concat ":"
+                                               (if (keywordp k)
+                                                   (substring
+                                                    (symbol-name k) 1)
+                                                 (format "%s" k))))
+                                      out))
+                              spec)
+                     out))
+                  (t nil)))
+         (named (plist-get s :named)))
+    (when (stringp named)
+      (setq s (plist-put s :named
+                         (mapcar #'string-trim
+                                 (split-string named "[ ,]+" t)))))
+    s))
+
+(defun anvil-ts--tool-add-import (file spec apply)
+  "MCP wrapper — add an import.
+
+MCP Parameters:
+  file  - absolute path to the .ts or .tsx file to edit
+  spec  - plist (:from MODULE :default NAME :named LIST :type-only BOOL)
+  apply - truthy to write; default returns a preview plan"
+  (anvil-server-with-error-handling
+   (anvil-ts-add-import file (anvil-ts--coerce-spec spec) :apply apply)))
+
+(defun anvil-ts--tool-remove-import (file spec apply)
+  "MCP wrapper — remove an import.
+
+MCP Parameters:
+  file  - absolute path to the .ts or .tsx file to edit
+  spec  - plist (:from MODULE :default NAME :named LIST)
+  apply - truthy to write; default returns a preview plan"
+  (anvil-server-with-error-handling
+   (anvil-ts-remove-import file (anvil-ts--coerce-spec spec) :apply apply)))
+
+(defun anvil-ts--tool-rename-import (file old new apply)
+  "MCP wrapper — rename an imported binding alias.
+
+MCP Parameters:
+  file  - absolute path to the .ts or .tsx file to edit
+  old   - current binding name (alias if present, raw name otherwise)
+  new   - new binding name
+  apply - truthy to write; default returns a preview plan"
+  (anvil-server-with-error-handling
+   (anvil-ts-rename-import file old new :apply apply)))
+
+(defun anvil-ts--tool-replace-function (file name new-source class apply)
+  "MCP wrapper — replace a TS / TSX function or method body.
+
+MCP Parameters:
+  file       - absolute path to the .ts or .tsx file to edit
+  name       - identifier of the function / method to replace
+  new-source - full replacement source (e.g. \\\"function foo() { ... }\\\")
+  class      - optional enclosing class name; empty / nil means any class
+  apply      - truthy to write; default returns a preview plan"
+  (anvil-server-with-error-handling
+   (let ((cls (cond ((null class) nil)
+                    ((and (stringp class) (string-empty-p class)) nil)
+                    (t class))))
+     (anvil-ts-replace-function file name new-source
+                                :class cls :apply apply))))
+
+(defun anvil-ts--tool-wrap-expr (file start end wrapper apply)
+  "MCP wrapper — wrap a TS / TSX expression.
+
+MCP Parameters:
+  file    - absolute path to the .ts or .tsx file to edit
+  start   - 1-based buffer point at the start of the expression
+  end     - 1-based buffer point at the end of the expression
+  wrapper - source template containing `|anvil-hole|' exactly once
+  apply   - truthy to write; default returns a preview plan"
+  (anvil-server-with-error-handling
+   (let ((s (if (stringp start) (string-to-number start) start))
+         (e (if (stringp end) (string-to-number end) end)))
+     (anvil-ts-wrap-expr file s e wrapper :apply apply))))
+
 ;;;; --- module lifecycle ---------------------------------------------------
 
 (defconst anvil-ts--tool-ids
@@ -551,11 +1377,16 @@ MCP Parameters:
     "ts-list-interfaces"
     "ts-list-type-aliases"
     "ts-find-definition"
-    "ts-surrounding-form")
+    "ts-surrounding-form"
+    "ts-add-import"
+    "ts-remove-import"
+    "ts-rename-import"
+    "ts-replace-function"
+    "ts-wrap-expr")
   "Stable list of MCP tool ids registered by `anvil-ts-enable'.")
 
 (defun anvil-ts--register-tools ()
-  "Register the Phase 1b ts-* MCP tools on `anvil-ts--server-id'."
+  "Register the Phase 1b + 2 ts-* MCP tools on `anvil-ts--server-id'."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-ts--tool-list-imports)
    :id "ts-list-imports"
@@ -662,7 +1493,72 @@ results."
 type whose source range contains the 1-based buffer POINT.  KIND
 restricts the match (`function' / `arrow' / `class' / `interface' /
 `type'); empty / nil matches any."
-   :read-only t))
+   :read-only t)
+
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-ts--tool-add-import)
+   :id "ts-add-import"
+   :intent '(ts-edit structure)
+   :layer 'core
+   :server-id anvil-ts--server-id
+   :description "Add an import to a TypeScript / TSX file.  SPEC is
+a plist: (:from MODULE :default NAME :named LIST :type-only BOOL).
+:named entries may be plain NAME strings, (NAME . ALIAS) cons
+cells, or (:name :alias :type-only) plists.  Idempotent — merges
+into an existing `import ... from MODULE' whose type-only flag
+matches; splits into a separate statement when the flag differs.
+Preview-default; pass :apply t to write.")
+
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-ts--tool-remove-import)
+   :id "ts-remove-import"
+   :intent '(ts-edit structure)
+   :layer 'core
+   :server-id anvil-ts--server-id
+   :description "Remove an import from a TypeScript / TSX file.
+SPEC shape matches `ts-add-import'.  :named entries are removed
+from the existing statement; :default drops the default specifier
+when it matches.  When nothing remains the statement is deleted
+including its trailing newline.  Idempotent.  Preview-default.")
+
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-ts--tool-rename-import)
+   :id "ts-rename-import"
+   :intent '(ts-edit structure)
+   :layer 'core
+   :server-id anvil-ts--server-id
+   :description "Rename the binding OLD to NEW across TypeScript /
+TSX imports.  Walks every `import_statement' and rewrites the
+unique specifier (default / named / named-alias / namespace)
+whose visible binding is OLD.  Errors on ambiguity or absence.
+Reference use sites in the code body are not touched — Phase 3
+territory.  Preview-default.")
+
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-ts--tool-replace-function)
+   :id "ts-replace-function"
+   :intent '(ts-edit structure)
+   :layer 'core
+   :server-id anvil-ts--server-id
+   :description "Replace a TypeScript / TSX function or method
+body with NEW-SOURCE.  NEW-SOURCE is the full def at column 0; it
+is auto-dedented and reindented to the existing def's column, so
+the same input works for top-level functions and for methods.
+CLASS disambiguates methods with the same name across classes.
+Double-apply with identical NEW-SOURCE is a no-op.  Preview-default.")
+
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-ts--tool-wrap-expr)
+   :id "ts-wrap-expr"
+   :intent '(ts-edit structure)
+   :layer 'core
+   :server-id anvil-ts--server-id
+   :description "Wrap the expression at [START, END) with WRAPPER.
+WRAPPER is a source template containing `|anvil-hole|' exactly
+once — that token is replaced with the original expression text
+from the file.  The range must align to an exact tree-sitter node
+boundary, or the tool errors rather than produce invalid source.
+Preview-default."))
 
 (defun anvil-ts-enable ()
   "Enable the Phase 1b ts-* MCP tools."

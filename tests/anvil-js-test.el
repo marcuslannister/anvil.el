@@ -159,5 +159,141 @@ preserved."
 (ert-deftest anvil-js-test-list-imports-errors-on-nil-file ()
   (should-error (anvil-js-list-imports nil) :type 'user-error))
 
+;;;; --- Phase 2: edit helpers ---------------------------------------------
+
+(defun anvil-js-test--temp-copy (src ext)
+  "Copy SRC to a fresh tempfile with extension EXT and return its path."
+  (let ((dst (make-temp-file "anvil-js-phase2-" nil (concat "." ext))))
+    (with-temp-file dst
+      (insert-file-contents src))
+    dst))
+
+(defun anvil-js-test--contents (path)
+  (with-temp-buffer
+    (insert-file-contents path)
+    (buffer-substring-no-properties (point-min) (point-max))))
+
+(ert-deftest anvil-js-test-add-import-merge ()
+  (anvil-js-test--requires-grammar
+    (let ((f (anvil-js-test--temp-copy anvil-js-test--js-fixture "js")))
+      (unwind-protect
+          (progn
+            (anvil-js-add-import
+             f (list :from "node:fs/promises"
+                     :named (list "writeFile"))
+             :apply t)
+            (should (string-match-p
+                     "import { readFile, writeFile } from \"node:fs/promises\";"
+                     (anvil-js-test--contents f))))
+        (delete-file f)))))
+
+(ert-deftest anvil-js-test-add-import-idempotent ()
+  (anvil-js-test--requires-grammar
+    (let ((f (anvil-js-test--temp-copy anvil-js-test--js-fixture "js")))
+      (unwind-protect
+          (let ((plan (anvil-js-add-import
+                       f (list :from "node:fs/promises"
+                               :named (list "readFile")))))
+            (should (null (plist-get plan :ops))))
+        (delete-file f)))))
+
+(ert-deftest anvil-js-test-add-import-ignores-type-only ()
+  "JS has no type-only imports; the flag is silently dropped so a
+fresh `import type { ... }' is never emitted into a .js file."
+  (anvil-js-test--requires-grammar
+    (let ((f (anvil-js-test--temp-copy anvil-js-test--js-fixture "js")))
+      (unwind-protect
+          (progn
+            (anvil-js-add-import
+             f (list :from "brand-new" :type-only t
+                     :named (list "x"))
+             :apply t)
+            (should (string-match-p
+                     "import { x } from \"brand-new\";"
+                     (anvil-js-test--contents f)))
+            (should-not (string-match-p
+                         "import type" (anvil-js-test--contents f))))
+        (delete-file f)))))
+
+(ert-deftest anvil-js-test-remove-import-drops-statement ()
+  (anvil-js-test--requires-grammar
+    (let ((f (anvil-js-test--temp-copy anvil-js-test--js-fixture "js")))
+      (unwind-protect
+          (progn
+            (anvil-js-remove-import
+             f (list :from "express" :default "express")
+             :apply t)
+            (should-not (string-match-p
+                         "from \"express\""
+                         (anvil-js-test--contents f))))
+        (delete-file f)))))
+
+(ert-deftest anvil-js-test-rename-import ()
+  (anvil-js-test--requires-grammar
+    (let ((f (anvil-js-test--temp-copy anvil-js-test--js-fixture "js")))
+      (unwind-protect
+          (progn
+            (anvil-js-rename-import f "express" "ex" :apply t)
+            (should (string-match-p
+                     "import ex from \"express\";"
+                     (anvil-js-test--contents f))))
+        (delete-file f)))))
+
+(ert-deftest anvil-js-test-replace-function-preserves-export ()
+  (anvil-js-test--requires-grammar
+    (let ((f (anvil-js-test--temp-copy anvil-js-test--js-fixture "js")))
+      (unwind-protect
+          (progn
+            (anvil-js-replace-function
+             f "plainFunc"
+             "function plainFunc(x) {\n  return x + 42;\n}"
+             :apply t)
+            (let ((body (anvil-js-test--contents f)))
+              (should (string-match-p
+                       "export function plainFunc(x) {" body))
+              (should (string-match-p "  return x \\+ 42;" body))))
+        (delete-file f)))))
+
+(ert-deftest anvil-js-test-replace-function-method ()
+  (anvil-js-test--requires-grammar
+    (let ((f (anvil-js-test--temp-copy anvil-js-test--js-fixture "js")))
+      (unwind-protect
+          (progn
+            (anvil-js-replace-function
+             f "write"
+             "write(rows) {\n  console.log(rows.length);\n}"
+             :class "ReportWriter" :apply t)
+            (should (string-match-p
+                     "  write(rows) {"
+                     (anvil-js-test--contents f))))
+        (delete-file f)))))
+
+(ert-deftest anvil-js-test-wrap-expr ()
+  (anvil-js-test--requires-grammar
+    (let ((f (anvil-js-test--temp-copy anvil-js-test--js-fixture "js")))
+      (unwind-protect
+          (let (beg end)
+            (with-temp-buffer
+              (insert-file-contents f)
+              (goto-char (point-min))
+              (re-search-forward "(x) => \\(x \\* 2\\);")
+              (setq beg (match-beginning 1) end (match-end 1)))
+            (anvil-js-wrap-expr f beg end "cached(|anvil-hole|)"
+                                :apply t)
+            (should (string-match-p "cached(x \\* 2)"
+                                    (anvil-js-test--contents f))))
+        (delete-file f)))))
+
+(ert-deftest anvil-js-test-preview-default-does-not-touch-disk ()
+  (anvil-js-test--requires-grammar
+    (let* ((f (anvil-js-test--temp-copy anvil-js-test--js-fixture "js"))
+           (before (anvil-js-test--contents f)))
+      (unwind-protect
+          (progn
+            (anvil-js-add-import
+             f (list :from "brand-new" :named (list "foo")))
+            (should (string= before (anvil-js-test--contents f))))
+        (delete-file f)))))
+
 (provide 'anvil-js-test)
 ;;; anvil-js-test.el ends here
