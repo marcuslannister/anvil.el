@@ -102,6 +102,27 @@ not explicitly opted in, matching the Doc 17 safety-rail design."
   :type 'boolean
   :group 'anvil-session)
 
+(defcustom anvil-session-hook-script
+  (expand-file-name "scripts/anvil-hook"
+                    (or (and load-file-name
+                             (file-name-directory load-file-name))
+                        default-directory))
+  "Absolute path to the `anvil-hook' shell wrapper.
+Used by `anvil-hook-install-settings' to emit the command line that
+binds to each Claude Code lifecycle event.  On Windows swap this to
+the `.bat' sibling."
+  :type 'file
+  :group 'anvil-session)
+
+(defcustom anvil-session-claude-settings-path
+  (expand-file-name "~/.claude/settings.json")
+  "Path to the Claude Code user-settings JSON file.
+`anvil-hook-install-settings' deep-merges an `hooks' block into this
+file, preserving every other top-level key.  Override per-machine
+(e.g. `project/.claude/settings.json' for per-project hooks)."
+  :type 'file
+  :group 'anvil-session)
+
 
 ;;;; --- Phase 1: snapshot primitives ---------------------------------------
 
@@ -428,6 +449,155 @@ the shell wrapper does not crash the Claude hook pipeline."
       (_ (list :error
                (format "anvil-session-hook-dispatch: unknown event %S"
                        event))))))
+
+
+;;;; --- Phase 4: install-settings command ----------------------------------
+
+(defconst anvil-session--hook-events
+  '(("PreCompact"       . "pre-compact")
+    ("SessionStart"     . "session-start")
+    ("PostToolUse"      . "post-tool-use")
+    ("UserPromptSubmit" . "user-prompt")
+    ("SessionEnd"       . "session-end"))
+  "Alist of Claude Code hook names to their `anvil-hook' event
+sub-commands.  The car is the JSON key written into
+`~/.claude/settings.json'; the cdr is the first argv of the
+wrapper script.")
+
+(defun anvil-session--hook-command-for (event-cli script)
+  "Return the command string bound to EVENT-CLI in Claude settings.
+SCRIPT is the absolute path to `anvil-hook'.  Sub-commands like
+`post-tool-use' forward Claude-provided env vars as trailing argv
+so the dispatcher can extract session-id, tool name, and prompt
+excerpt.  This is a plain string rather than an argv list because
+Claude Code's hooks schema is shell-like."
+  (pcase event-cli
+    ("pre-compact"    (format "%s pre-compact $CLAUDE_SESSION_ID"
+                              script))
+    ("session-start"  (format "%s session-start $CLAUDE_SESSION_ID"
+                              script))
+    ("post-tool-use"  (format
+                       "%s post-tool-use $CLAUDE_SESSION_ID $CLAUDE_TOOL_NAME"
+                       script))
+    ("user-prompt"    (format
+                       "%s user-prompt $CLAUDE_SESSION_ID $CLAUDE_PROMPT"
+                       script))
+    ("session-end"    (format "%s session-end $CLAUDE_SESSION_ID"
+                              script))
+    (_ (error "anvil-session: unknown hook sub-command %S" event-cli))))
+
+(defun anvil-session--read-settings (path)
+  "Return the JSON object at PATH as a hash-table, or an empty one.
+Missing file → empty table so the install path never aborts on a
+fresh machine.  JSON parse errors signal — the caller promoted the
+risk of corrupting the user's settings."
+  (if (and (stringp path) (file-exists-p path))
+      (with-temp-buffer
+        (insert-file-contents path)
+        (goto-char (point-min))
+        (json-parse-buffer :object-type 'hash-table
+                           :array-type 'array
+                           :null-object :null
+                           :false-object :false))
+    (make-hash-table :test 'equal)))
+
+(defun anvil-session--write-settings (path settings)
+  "Serialize SETTINGS (hash-table) to PATH with two-space indent.
+Ensures the parent directory exists.  Overwrites atomically via
+`write-region' so a mid-write crash does not leave the file
+truncated."
+  (let ((dir (file-name-directory path)))
+    (unless (file-exists-p dir)
+      (make-directory dir t)))
+  (with-temp-file path
+    (insert (json-serialize settings
+                            :false-object :false
+                            :null-object :null))
+    ;; Pretty-print — Claude users edit this file by hand.
+    (goto-char (point-min))
+    (when (fboundp 'json-pretty-print-buffer)
+      (ignore-errors (json-pretty-print-buffer)))))
+
+(defun anvil-session--settings-plan (existing-hooks script op)
+  "Return `(NEW-HOOKS . DIFF)' describing OP applied to EXISTING-HOOKS.
+OP is `install' or `uninstall'.  SCRIPT is the anvil-hook path.
+DIFF is a list of (ACTION KEY VALUE) tuples for the dry-run
+printout: ACTION ∈ {`add', `update', `remove', `keep'}."
+  (let ((new (copy-hash-table existing-hooks))
+        (diff nil))
+    (pcase op
+      ('install
+       (dolist (pair anvil-session--hook-events)
+         (let* ((claude-key (car pair))
+                (sub-cmd (cdr pair))
+                (desired (anvil-session--hook-command-for sub-cmd script))
+                (existing (gethash claude-key existing-hooks)))
+           (cond
+            ((null existing)
+             (puthash claude-key desired new)
+             (push (list 'add claude-key desired) diff))
+            ((equal existing desired)
+             (push (list 'keep claude-key desired) diff))
+            (t
+             (puthash claude-key desired new)
+             (push (list 'update claude-key desired) diff))))))
+      ('uninstall
+       (dolist (pair anvil-session--hook-events)
+         (let* ((claude-key (car pair))
+                (existing (gethash claude-key existing-hooks)))
+           (when existing
+             (remhash claude-key new)
+             (push (list 'remove claude-key existing) diff))))))
+    (cons new (nreverse diff))))
+
+(defun anvil-session--format-diff (diff)
+  "Render DIFF from `--settings-plan' as a human-readable string."
+  (if (null diff)
+      "(no changes)"
+    (mapconcat
+     (lambda (entry)
+       (pcase (car entry)
+         ('add    (format "+ %s: %s"    (nth 1 entry) (nth 2 entry)))
+         ('update (format "~ %s: %s"    (nth 1 entry) (nth 2 entry)))
+         ('remove (format "- %s (was: %s)" (nth 1 entry) (nth 2 entry)))
+         ('keep   (format "= %s"        (nth 1 entry)))))
+     diff "\n")))
+
+;;;###autoload
+(cl-defun anvil-hook-install-settings (&key dry-run uninstall path script)
+  "Install the Doc 17 Claude Code hook bindings into settings JSON.
+
+Keyword arguments:
+  :dry-run   — preview the additions / updates, don't write.  Never
+               mutates the file; always returns the diff string.
+  :uninstall — remove the anvil hooks from the settings; non-anvil
+               hooks are preserved.
+  :path      — override `anvil-session-claude-settings-path'.
+  :script    — override `anvil-session-hook-script'.
+
+Returns a plist `(:path PATH :diff STR :applied BOOL)'.  `applied'
+is nil when DRY-RUN is non-nil or the diff is empty.
+
+The function is non-destructive: every JSON key outside `hooks.*'
+stays verbatim, hooks we do not install (user's PreToolUse etc.)
+stay verbatim, and UPDATE actions only fire when the existing
+binding targets a different anvil-hook invocation."
+  (let* ((path* (or path anvil-session-claude-settings-path))
+         (script* (or script anvil-session-hook-script))
+         (settings (anvil-session--read-settings path*))
+         (hooks (or (gethash "hooks" settings)
+                    (make-hash-table :test 'equal)))
+         (plan (anvil-session--settings-plan
+                hooks script* (if uninstall 'uninstall 'install)))
+         (new-hooks (car plan))
+         (diff (cdr plan))
+         (diff-str (anvil-session--format-diff diff))
+         (applied nil))
+    (puthash "hooks" new-hooks settings)
+    (unless (or dry-run (null diff))
+      (anvil-session--write-settings path* settings)
+      (setq applied t))
+    (list :path path* :diff diff-str :applied applied)))
 
 
 ;;;; --- MCP tool wrappers --------------------------------------------------
