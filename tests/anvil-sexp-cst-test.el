@@ -977,15 +977,15 @@ position=1."
       (should (string-prefix-p "(" repaired)))))
 
 (ert-deftest anvil-sexp-cst-test-repair-returns-error-when-unfixable ()
-  "Structural damage beyond simple paren imbalance (e.g. an
-unterminated string) must surface as a typed `sexp-cst/repair-failed'
-error rather than silently returning an invalid `repaired-content'.
-This is the guardrail that keeps Phase 3a from over-promising: close-
-paren balancing only helps with the paren-delta family of breaks."
+  "Structural damage outside the paren-delta / unterminated-string
+families (here: a close-paren followed by unrelated text and a stray
+open) surfaces as a typed `sexp-cst/repair-failed' rather than a
+silent invalid `repaired-content'.  Guardrail against claiming
+repairs the tool cannot prove."
   (skip-unless (anvil-sexp-cst-test--repair-available-p))
   (skip-unless (anvil-sexp-cst-test--grammar-ready-p))
   (anvil-sexp-cst-test--with-elisp-file path
-      "(foo \"unterminated"
+      ")foo("
     (let* ((obj (anvil-sexp-cst-test--invoke-repair path))
            (err (anvil-sexp-cst-test--get obj "error")))
       (should (hash-table-p err))

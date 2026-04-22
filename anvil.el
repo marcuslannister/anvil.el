@@ -152,9 +152,12 @@ These are not loaded by default.  Available modules:
                 prepends `(' at BOF when closes exceed opens) and
                 re-parses to verify ERROR nodes are gone; returns a
                 dry-run `repaired-content' for the caller to apply
-                via a separate write tool (Doc 31, requires Emacs
-                29+ and the tree-sitter-elisp grammar for Phase 2/3
-                tools)"
+                via a separate write tool.  Phase 3c extends repair
+                with an unterminated-string detector: when the scan
+                ends inside a `\"'-literal, the missing quote is
+                appended before paren balancing runs (Doc 31,
+                requires Emacs 29+ and the tree-sitter-elisp grammar
+                for Phase 2/3 tools)"
   :type '(repeat symbol)
   :group 'anvil)
 

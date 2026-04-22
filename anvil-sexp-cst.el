@@ -46,15 +46,17 @@
 (defconst anvil-sexp-cst-supported-types
   '(integer nil symbol string list alist plist hash-table vector cons
             record char-table truncation circular drill byte-cap
-            eieio purge cst-read cst-edit cst-edit-write cst-repair)
+            eieio purge cst-read cst-edit cst-edit-write cst-repair
+            cst-repair-string)
   "Type tags + behaviors that `anvil-inspect-object' handles today.
 Phase 1a/1b/2/3 chunks extend this list; tests in
 tests/anvil-sexp-cst-test.el gate their `skip-unless' on membership
 here so a half-shipped chunk never breaks CI.  The pseudo-tags
 `truncation', `circular', `drill', `byte-cap', `eieio', `purge',
-`cst-read', `cst-edit', `cst-edit-write', `cst-repair' describe
-emitted *behaviors* rather than Emacs runtime types — they live on
-the same list so each test can self-describe its capability gate.")
+`cst-read', `cst-edit', `cst-edit-write', `cst-repair',
+`cst-repair-string' describe emitted *behaviors* rather than Emacs
+runtime types — they live on the same list so each test can self-
+describe its capability gate.")
 
 (defconst anvil-sexp-cst--real-type-tags
   '(integer nil symbol string list alist plist hash-table vector cons
@@ -1086,14 +1088,17 @@ MCP Parameters:
 
 ;;;; --- sexp-cst-repair (Phase 3a, close-paren balancing) -----------------
 
-(defun anvil-sexp-cst--paren-delta (content)
-  "Return signed paren imbalance for CONTENT.
-Positive N = N unclosed `(' (need N closes appended).
-Negative N = N excess `)' (need |N| opens prepended).
-Tracks strings (\") and line comments (;) manually so `parse-
-partial-sexp' cannot abort mid-scan on a broken input — the whole
-point of the repair tool is to accept inputs the real parser
-rejects."
+(defun anvil-sexp-cst--paren-scan (content)
+  "Return plist (:delta N :in-string-at-eob BOOL) for CONTENT.
+:delta is the signed paren imbalance *outside* strings/comments:
+positive N = N unclosed `(' need appending, negative N = |N| excess
+`)' need prepending.
+:in-string-at-eob is t when the scan reached EOF inside a string
+literal (unterminated `\"') — surfaces the Phase 3c repair opening.
+
+Hand-rolls the string/comment/?char tracking because `parse-
+partial-sexp' aborts on unbalanced input, which is exactly the
+shape of input the repair tool has to accept."
   (let ((delta 0)
         (i 0)
         (n (length content))
@@ -1130,7 +1135,11 @@ rejects."
            ((eq c ?\))
             (cl-decf delta) (cl-incf i))
            (t (cl-incf i)))))))
-    delta))
+    (list :delta delta :in-string-at-eob (and in-string t))))
+
+(defun anvil-sexp-cst--paren-delta (content)
+  "Backward-compatible wrapper: signed paren imbalance outside strings."
+  (plist-get (anvil-sexp-cst--paren-scan content) :delta))
 
 (defun anvil-sexp-cst--content-has-error-p (content)
   "Return non-nil when tree-sitter-elisp finds ERROR nodes in CONTENT."
@@ -1140,21 +1149,70 @@ rejects."
            (root (treesit-parser-root-node parser)))
       (treesit-node-check root 'has-error))))
 
+(defun anvil-sexp-cst--classify-fix-kind (in-string paren-direction)
+  "Pick the fix.kind label for an attempted repair.
+IN-STRING is non-nil when the original content ended inside a
+string literal (Phase 3c closed it by appending `\"').
+PAREN-DIRECTION is `close-added', `open-prepended', or nil."
+  (cond
+   ((and (not in-string) (null paren-direction)) "noop")
+   ((and (not in-string) (eq paren-direction 'close-added)) "close-paren-added")
+   ((and (not in-string) (eq paren-direction 'open-prepended)) "open-paren-prepended")
+   ((and in-string (null paren-direction)) "unterminated-string-closed")
+   ((and in-string (eq paren-direction 'close-added))
+    "unterminated-string-and-close-paren-added")
+   ((and in-string (eq paren-direction 'open-prepended))
+    "unterminated-string-and-open-paren-prepended")))
+
 (defun anvil-sexp-cst--repair-compute (file)
-  "Read FILE, try to balance parens, return a plist.
+  "Read FILE, attempt the repair pipeline, return a plist.
 On success: (:status :ok :plist PAYLOAD).
 On failure: (:status :error :kind KIND :message MSG).  The only
-`kind' this phase emits is `sexp-cst/repair-failed' — other error
-kinds (missing-file, grammar-unavailable) are checked by the
-caller before we get here."
+`kind' this function emits is `sexp-cst/repair-failed' — other
+error kinds (missing-file, grammar-unavailable) are checked by
+the caller.
+
+Pipeline (Phase 3a + 3c):
+  1. Scan CONTENT for paren delta AND in-string-at-eob.
+  2. If in-string-at-eob, append `\"' first (Phase 3c).
+  3. On the post-string-close text, append close-parens for
+     positive delta, prepend opens for negative delta.
+  4. Re-parse with tree-sitter-elisp.  Any ERROR node → fail."
   (with-temp-buffer
     (insert-file-contents file)
     (let* ((content (buffer-string))
            (bytes-before (string-bytes content))
            (has-error-before (anvil-sexp-cst--content-has-error-p content))
-           (delta (anvil-sexp-cst--paren-delta content)))
+           (scan (anvil-sexp-cst--paren-scan content))
+           (delta0 (plist-get scan :delta))
+           (in-string (plist-get scan :in-string-at-eob))
+           (string-closed (if in-string (concat content "\"") content))
+           (scan2 (if in-string
+                      (anvil-sexp-cst--paren-scan string-closed)
+                    scan))
+           (delta (plist-get scan2 :delta))
+           (paren-direction (cond ((> delta 0) 'close-added)
+                                  ((< delta 0) 'open-prepended)
+                                  (t nil)))
+           (paren-chars (abs delta))
+           (quote-added (if in-string 1 0))
+           (total-added (+ quote-added paren-chars))
+           (repaired (cond
+                      ((> delta 0)
+                       (concat string-closed (make-string delta ?\))))
+                      ((< delta 0)
+                       (concat (make-string (- delta) ?\() string-closed))
+                      (t string-closed)))
+           (no-change (and (zerop quote-added) (null paren-direction)))
+           (kind (anvil-sexp-cst--classify-fix-kind in-string paren-direction))
+           (position (cond
+                      ((or (equal kind "noop") (null kind)) 0)
+                      ((equal kind "open-paren-prepended") 1)
+                      ((equal kind "unterminated-string-and-open-paren-prepended") 1)
+                      (t (1+ (length content))))))
       (cond
-       ((and (zerop delta) (not has-error-before))
+       ;; Happy noop: balanced, no unterminated string, no prior ERROR.
+       ((and no-change (not has-error-before))
         (list :status :ok
               :plist (list :type "repair-result"
                            :before (list :bytes bytes-before
@@ -1165,52 +1223,34 @@ caller before we get here."
                                         :has-error :false)
                            :fix (list :kind "noop" :added 0 :position 0)
                            :repaired-content content)))
-       ((> delta 0)
-        (let* ((repaired (concat content (make-string delta ?\))))
-               (still-error (anvil-sexp-cst--content-has-error-p repaired)))
-          (if still-error
-              (list :status :error
-                    :kind "sexp-cst/repair-failed"
-                    :message
-                    (format "Appended %d close-paren(s) but tree-sitter still reports ERROR nodes; damage beyond paren imbalance." delta))
-            (list :status :ok
-                  :plist (list :type "repair-result"
-                               :before (list :bytes bytes-before
-                                             :paren-delta delta
-                                             :has-error (if has-error-before t :false))
-                               :after (list :bytes (string-bytes repaired)
-                                            :paren-delta 0
-                                            :has-error :false)
-                               :fix (list :kind "close-paren-added"
-                                          :added delta
-                                          :position (1+ (length content)))
-                               :repaired-content repaired)))))
-       ((< delta 0)
-        (let* ((missing (- delta))
-               (repaired (concat (make-string missing ?\() content))
-               (still-error (anvil-sexp-cst--content-has-error-p repaired)))
-          (if still-error
-              (list :status :error
-                    :kind "sexp-cst/repair-failed"
-                    :message
-                    (format "Prepended %d open-paren(s) but tree-sitter still reports ERROR nodes; damage beyond paren imbalance." missing))
-            (list :status :ok
-                  :plist (list :type "repair-result"
-                               :before (list :bytes bytes-before
-                                             :paren-delta delta
-                                             :has-error (if has-error-before t :false))
-                               :after (list :bytes (string-bytes repaired)
-                                            :paren-delta 0
-                                            :has-error :false)
-                               :fix (list :kind "open-paren-prepended"
-                                          :added missing
-                                          :position 1)
-                               :repaired-content repaired)))))
-       (t
+       ;; Balanced + no unterminated string, but tree-sitter still
+       ;; reports ERROR — damage beyond our scope.
+       (no-change
         (list :status :error
               :kind "sexp-cst/repair-failed"
               :message
-              "Parens are balanced but tree-sitter still reports ERROR nodes; close-paren balancing cannot help."))))))
+              "Parens are balanced but tree-sitter still reports ERROR nodes; close-paren balancing cannot help."))
+       ;; Some repair was attempted — verify with a live re-parse.
+       ((anvil-sexp-cst--content-has-error-p repaired)
+        (list :status :error
+              :kind "sexp-cst/repair-failed"
+              :message
+              (format "%s strategy did not converge: tree-sitter still reports ERROR nodes after +%d char(s)."
+                      (or kind "repair") total-added)))
+       ;; Success.
+       (t
+        (list :status :ok
+              :plist (list :type "repair-result"
+                           :before (list :bytes bytes-before
+                                         :paren-delta delta0
+                                         :has-error (if has-error-before t :false))
+                           :after (list :bytes (string-bytes repaired)
+                                        :paren-delta 0
+                                        :has-error :false)
+                           :fix (list :kind kind
+                                      :added total-added
+                                      :position position)
+                           :repaired-content repaired)))))))
 
 ;;;###autoload
 (defun anvil-sexp-cst-repair (file)
@@ -1222,10 +1262,12 @@ from the returned JSON and applies it via `file-replace-string',
 tool.  Phase 3a deliberately avoids an on-disk variant so LLM
 tool calls cannot silently rewrite source that failed to parse.
 
-Strategy (parinfer fallback, close-paren balancing only):
-  1. Count `(' vs `)' outside strings/comments/char-literals.
-  2. If delta > 0, append `delta' close-parens at EOF.
-  3. If delta < 0, prepend |delta| open-parens at BOF.
+Strategy (parinfer fallback; Phase 3a + 3c):
+  1. Scan content for paren delta AND unterminated-string flag.
+  2. If the scan ends inside a string literal, append `\"' at EOF
+     to close it (Phase 3c).
+  3. On the post-string-close text, append `delta' close-parens for
+     positive delta, prepend |delta| open-parens for negative delta.
   4. Re-parse with tree-sitter-elisp.  If ERROR nodes persist,
      return `sexp-cst/repair-failed' — damage is beyond our scope.
 
@@ -1233,7 +1275,12 @@ Output shape:
   {type:\"repair-result\",
    before:{bytes, paren-delta, has-error},
    after: {bytes, paren-delta, has-error},
-   fix:   {kind:\"noop\"|\"close-paren-added\"|\"open-paren-prepended\",
+   fix:   {kind: \"noop\"
+                | \"close-paren-added\"
+                | \"open-paren-prepended\"
+                | \"unterminated-string-closed\"
+                | \"unterminated-string-and-close-paren-added\"
+                | \"unterminated-string-and-open-paren-prepended\",
            added, position},
    repaired-content}
 
@@ -1371,13 +1418,15 @@ fields (before/after/new-content).  Write tool.")
    :server-id anvil-sexp-cst--server-id
    :description
    "Close-paren balance an elisp FILE that fails to parse.  Counts `(' /
-`)' outside strings/comments/char-literals, appends missing close-parens
-at EOF (or prepends opens at BOF when closes exceed opens), re-parses
-with tree-sitter-elisp to verify ERROR nodes are gone.  Returns a
-dry-run JSON: {type:\"repair-result\", before, after, fix{kind,added,
-position}, repaired-content}; caller applies the patched content via a
-separate write tool.  Typed error sexp-cst/repair-failed when balancing
-does not converge (damage beyond paren imbalance).  Read-only."
+`)' outside strings/comments/char-literals; if the scan ends inside an
+unterminated string literal, also appends `\"' to close it (Phase 3c).
+Appends missing close-parens at EOF or prepends opens at BOF as needed,
+then re-parses with tree-sitter-elisp to verify ERROR nodes are gone.
+Returns a dry-run JSON: {type:\"repair-result\", before, after,
+fix{kind,added,position}, repaired-content}; caller applies the patched
+content via a separate write tool.  Typed error sexp-cst/repair-failed
+when balancing does not converge (damage beyond paren imbalance).
+Read-only."
    :read-only t))
 
 (defun anvil-sexp-cst--unregister-tools ()
