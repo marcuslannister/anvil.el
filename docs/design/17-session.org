@@ -9,7 +9,9 @@
   :ID:       f1dd6d46-6e38-4942-97d6-feb402fb826a
   :END:
 ~DRAFT~ (2026-04-19, extended 2026-04-20 with Phase 3-4 for Claude
-Code lifecycle hooks — Week-3 Ship 5, 競合 context-mode 由来)
+Code lifecycle hooks — Week-3 Ship 5, 競合 context-mode 由来) →
+~SHIPPED~ (2026-04-22、Phase 1 + 3 + 4 全 develop、make test-all
+926/931 pass 0 failed、Phase 2 は後続)
 
 Tier 3 of Week-2 roadmap.  Ephemeral-state persistence that sits
 between a single Claude conversation and the long-term memory system.
@@ -94,16 +96,25 @@ without a wall of Read calls.
 
 * Phases
 
-** Phase 1 — snapshot + resume + list
+** Phase 1 — snapshot + resume + list (~SHIPPED~ 2026-04-22)
 
-Minimum viable.  ERT 5.
+Primitives ship as `anvil-session.el' + 4 MCP tools:
+=session-snapshot= / =session-resume= / =session-list= /
+=session-delete=.  Payload stored in anvil-state ns=session, TTL
+14 d.  `:preamble-suggested' auto-built from name + branch +
+task-summary + notes — 1-call resume block for the next Claude
+conversation.
+
+ERT 5 (roundtrips / preamble / list / delete / missing-name).
+commit: =d52e0ee= (feat + test) → =d197e3f= (MCP tools).
 
 ** Phase 2 — auto-snapshot hooks
 
 Optional hook on branch-switch or after ~my-anvil-ship-verify~ to
-capture automatically under a computed name.
+capture automatically under a computed name.  Deferred — Phase 3
+covers the hook use case that actually generates token savings.
 
-** Phase 3 — Claude Code lifecycle hooks (Ship 5)
+** Phase 3 — Claude Code lifecycle hooks (Ship 5, ~SHIPPED~ 2026-04-22)
 
 context-mode の "4-hook session continuity" pattern を anvil へ。
 Claude Code の =~/.claude/settings.json= から anvil MCP tool を
@@ -201,15 +212,30 @@ Recent key events (last 5 tool calls):
 
 を emit。Claude は 1 回の preamble 読みで context を再構築できる。
 
-** Phase 4 — hook 無効化 / opt-out
+** Phase 4 — hook 無効化 / opt-out (~SHIPPED~ 2026-04-22)
 
-hook は全 anvil ユーザーに強制すべきではない。=anvil-session-hooks-
-enabled= defcustom (default nil) で明示 opt-in。有効化すると
-=anvil-hook-install-settings= command が
-=~/.claude/settings.json= に hook 5 件を追記する。
+=anvil-session-hooks-enabled= defcustom (default nil) で明示 opt-in。
+=anvil-hook-install-settings= command が =~/.claude/settings.json= に
+hook 5 件を deep-merge する。
 
-=anvil-hook-install-settings --dry-run= で差分プレビュー、
-=--uninstall= で撤去。破壊的変更は避け、既存 hook を保持。
+ship 差分:
+- =anvil-hook-install-settings= の API は keyword-style (=:dry-run=
+  / =:uninstall= / =:path= / =:script=) に確定。戻り値 =(:path
+  :diff :applied)= で diff 文字列を CLI で見せ、実書込みは applied
+  フラグで確認できる。
+- =scripts/anvil-hook= (POSIX sh) と =scripts/anvil-hook.bat=
+  (Windows cmd.exe) を同梱。POSIX 側は =session-start= の quoted
+  string return を unwrap + unescape して、hook stdout が elisp
+  文字列構文ではなく素の preamble テキストになるよう調整。
+- install-settings は deep-merge: 既存 =hooks.*= のうち anvil 管理
+  外の key (user の =PreToolUse= 等) は touch せず、top-level の
+  非 hooks key (=model= / =permissions= 等) も全て verbatim。
+- =anvil-session-hook-script= / =-claude-settings-path= defcustom で
+  マシンごとの path をコードいじらず設定可能。
+
+ERT 5 (creates-all-hooks / preserves-unrelated / dry-run-no-write /
+uninstall-removes / idempotent-keep)。commit: =520a586= (hook
+dispatch) → =0111776= (Phase 4 wrapper + install)。
 
 * Out of scope / future
 
