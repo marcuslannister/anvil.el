@@ -1008,6 +1008,67 @@ callers can treat all sexp-cst-* tools uniformly."
     (should (equal (gethash "kind" err) "sexp-cst/file-not-found"))))
 
 
+;;;; --- sexp-cst-repair unterminated-string (Phase 3c) --------------------
+
+(defun anvil-sexp-cst-test--repair-string-available-p ()
+  "Return non-nil when Phase 3c unterminated-string repair is live."
+  (and (anvil-sexp-cst-test--available-p 'cst-repair-string)
+       (fboundp 'anvil-sexp-cst-repair)))
+
+(ert-deftest anvil-sexp-cst-test-repair-unterminated-string-with-parens ()
+  "An unterminated string before EOF with an unclosed outer form is
+rescued by appending `\"' (close the string) plus the remaining
+close-parens.  Models the common LLM truncation-mid-string case and
+exercises the combined fix.kind."
+  (skip-unless (anvil-sexp-cst-test--repair-string-available-p))
+  (skip-unless (anvil-sexp-cst-test--grammar-ready-p))
+  (anvil-sexp-cst-test--with-elisp-file path
+      "(foo \"unterminated"
+    (let* ((obj (anvil-sexp-cst-test--invoke-repair path))
+           (fix (anvil-sexp-cst-test--get obj "fix"))
+           (before (anvil-sexp-cst-test--get obj "before"))
+           (after (anvil-sexp-cst-test--get obj "after"))
+           (repaired (anvil-sexp-cst-test--get obj "repaired-content")))
+      (should (equal (anvil-sexp-cst-test--get obj "type") "repair-result"))
+      (should (equal (gethash "kind" fix)
+                     "unterminated-string-and-close-paren-added"))
+      ;; 1 `\"' + 1 `)' = 2 chars added.
+      (should (equal (gethash "added" fix) 2))
+      (should (integerp (gethash "position" fix)))
+      ;; Original had paren-delta = 1 (outer `(' unclosed, string-inner parens
+      ;; don't count) and ERROR nodes; after repair both cleared.
+      (should (equal (gethash "paren-delta" before) 1))
+      (should (eq (gethash "has-error" before) t))
+      (should (equal (gethash "paren-delta" after) 0))
+      (should (eq (gethash "has-error" after) :false))
+      ;; Content must end with string-close + paren-close.
+      (should (string-suffix-p "\")" repaired)))))
+
+(ert-deftest anvil-sexp-cst-test-repair-unterminated-string-with-paren-inside ()
+  "Parens that appear inside an unterminated string must not be
+counted toward paren-delta — the scanner has to close the string
+before totaling opens vs closes.  Regression guard for the common
+`(message \"partial (text' failure mode."
+  (skip-unless (anvil-sexp-cst-test--repair-string-available-p))
+  (skip-unless (anvil-sexp-cst-test--grammar-ready-p))
+  (anvil-sexp-cst-test--with-elisp-file path
+      "(message \"hello (world"
+    (let* ((obj (anvil-sexp-cst-test--invoke-repair path))
+           (fix (anvil-sexp-cst-test--get obj "fix"))
+           (after (anvil-sexp-cst-test--get obj "after"))
+           (repaired (anvil-sexp-cst-test--get obj "repaired-content")))
+      (should (equal (anvil-sexp-cst-test--get obj "type") "repair-result"))
+      (should (equal (gethash "kind" fix)
+                     "unterminated-string-and-close-paren-added"))
+      (should (equal (gethash "added" fix) 2))
+      (should (equal (gethash "paren-delta" after) 0))
+      (should (eq (gethash "has-error" after) :false))
+      ;; The `(world' inside the string must survive unchanged — only
+      ;; the trailing `\")' gets appended.
+      (should (string-match-p "hello (world" repaired))
+      (should (string-suffix-p "\")" repaired)))))
+
+
 ;;;; --- meta-test: shape lock file is loaded and TDD-lite gate active -----
 
 (ert-deftest anvil-sexp-cst-test-meta-locks-loaded ()
