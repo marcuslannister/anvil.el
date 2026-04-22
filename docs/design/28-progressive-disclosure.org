@@ -11,8 +11,7 @@
 ~APPROVED~ (2026-04-20) — Week-3 Ship 3, 競合 token-savior の
 =memory_index= → =memory_search= → =memory_get= 3 層契約を
 anvil-org-index / anvil-defs / anvil-file に移植。
-*全 Phase SHIPPED* (Phase 1/2 develop merge 済、Phase 3 + 4 feat
-branch):
+*全 Phase SHIPPED + develop 統合済* (2026-04-21):
 - Phase 1: citation URI scheme + =org-index-index= (Layer 1) +
   =disclosure-help= tool + =org-index-search= (Layer 2) /
   =org-read-by-id= (Layer 3) description + URI auto-strip。
