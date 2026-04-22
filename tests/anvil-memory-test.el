@@ -1133,6 +1133,173 @@ forwarded keyword args so tests can assert call counts / contents."
         (should (equal "sonnet-4-6"  (plist-get (car mock-calls) :model)))))))
 
 
+;;;; --- Phase 2b-iii: MDL distillation ------------------------------------
+
+(defun anvil-memory-test--seed-trio (root)
+  "Populate ROOT with three feedback memories that share a common rule."
+  (anvil-memory-test--write
+   (expand-file-name "feedback_commit_one.md" root)
+   "---\ntype: feedback\n---\nAlways include Co-Authored-By in every commit.\n")
+  (anvil-memory-test--write
+   (expand-file-name "feedback_commit_two.md" root)
+   "---\ntype: feedback\n---\nAlways attach Co-Authored-By tag.\n")
+  (anvil-memory-test--write
+   (expand-file-name "feedback_commit_three.md" root)
+   "---\ntype: feedback\n---\nCommits need Co-Authored-By trailer.\n"))
+
+(defconst anvil-memory-test--mdl-draft
+  "---\nname: commit-co-authored-by rule\ndescription: always include Co-Authored-By\ntype: feedback\n---\nEvery commit authored with Claude must carry a Co-Authored-By trailer.\n"
+  "Canned MDL draft returned by the mock orchestrator.")
+
+(ert-deftest anvil-memory-test/mdl-distill-empty-files-errors ()
+  "Empty FILES list raises user-error before calling the orchestrator."
+  (skip-unless (anvil-memory-test--supported-p 'mdl-distill))
+  (anvil-memory-test--with-env
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock nil
+      (should-error (anvil-memory-mdl-distill nil))
+      (should (null mock-calls)))))
+
+(ert-deftest anvil-memory-test/mdl-distill-unindexed-file-errors ()
+  "A path not in memory_meta raises user-error; no orchestrator call."
+  (skip-unless (anvil-memory-test--supported-p 'mdl-distill))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-trio root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock nil
+      (should-error
+       (anvil-memory-mdl-distill
+        (list (expand-file-name "feedback_missing.md" root))))
+      (should (null mock-calls)))))
+
+(ert-deftest anvil-memory-test/mdl-distill-single-memory-returns-draft ()
+  "A one-element FILES list still distils (caller may reuse the loop)."
+  (skip-unless (anvil-memory-test--supported-p 'mdl-distill))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-trio root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock
+        (list (list :status 'done :summary anvil-memory-test--mdl-draft
+                    :pending nil))
+      (let* ((files (list (expand-file-name "feedback_commit_one.md" root)))
+             (res (anvil-memory-mdl-distill files)))
+        (should (stringp (plist-get res :draft)))
+        (should (equal files (plist-get res :sources)))
+        (should (null (plist-get res :error)))
+        (should (= 1 (length mock-calls)))))))
+
+(ert-deftest anvil-memory-test/mdl-distill-multiple-memories ()
+  "N inputs → one orchestrator call; :sources preserves caller order."
+  (skip-unless (anvil-memory-test--supported-p 'mdl-distill))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-trio root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock
+        (list (list :status 'done :summary anvil-memory-test--mdl-draft
+                    :pending nil))
+      (let* ((files (list (expand-file-name "feedback_commit_one.md" root)
+                          (expand-file-name "feedback_commit_two.md" root)
+                          (expand-file-name "feedback_commit_three.md" root)))
+             (res (anvil-memory-mdl-distill files)))
+        (should (= 1 (length mock-calls)))
+        (should (equal files (plist-get res :sources)))
+        (should (stringp (plist-get res :draft)))))))
+
+(ert-deftest anvil-memory-test/mdl-distill-prompt-includes-bodies ()
+  "Orchestrator prompt carries each source's body as a labelled block."
+  (skip-unless (anvil-memory-test--supported-p 'mdl-distill))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-trio root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock
+        (list (list :status 'done :summary anvil-memory-test--mdl-draft
+                    :pending nil))
+      (let ((files (list (expand-file-name "feedback_commit_one.md" root)
+                         (expand-file-name "feedback_commit_two.md" root))))
+        (anvil-memory-mdl-distill files)
+        (let ((prompt (plist-get (car mock-calls) :prompt)))
+          (should (stringp prompt))
+          (should (string-match-p "Co-Authored-By" prompt))
+          (should (string-match-p "Co-Authored-By tag" prompt))
+          (should (string-match-p "feedback_commit_one" prompt))
+          (should (string-match-p "feedback_commit_two" prompt)))))))
+
+(ert-deftest anvil-memory-test/mdl-distill-failed-status-error ()
+  "Orchestrator :status failed surfaces as :error, :draft is nil."
+  (skip-unless (anvil-memory-test--supported-p 'mdl-distill))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-trio root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock
+        (list (list :status 'failed :error "boom" :pending nil))
+      (let* ((files (list (expand-file-name "feedback_commit_one.md" root)))
+             (res (anvil-memory-mdl-distill files)))
+        (should (null (plist-get res :draft)))
+        (should (stringp (plist-get res :error)))
+        (should (equal files (plist-get res :sources)))))))
+
+(ert-deftest anvil-memory-test/mdl-distill-pending-timeout-error ()
+  "Orchestrator :pending t surfaces as :error, :draft nil."
+  (skip-unless (anvil-memory-test--supported-p 'mdl-distill))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-trio root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock
+        (list (list :status 'running :pending t))
+      (let* ((files (list (expand-file-name "feedback_commit_one.md" root)))
+             (res (anvil-memory-mdl-distill files)))
+        (should (null (plist-get res :draft)))
+        (should (stringp (plist-get res :error)))))))
+
+(ert-deftest anvil-memory-test/mdl-distill-forwards-provider-model ()
+  "`:provider' / `:model' reach the orchestrator call."
+  (skip-unless (anvil-memory-test--supported-p 'mdl-distill))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-trio root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock
+        (list (list :status 'done :summary anvil-memory-test--mdl-draft
+                    :pending nil))
+      (anvil-memory-mdl-distill
+       (list (expand-file-name "feedback_commit_one.md" root))
+       :provider "codex" :model "gemma4")
+      (should (equal "codex"  (plist-get (car mock-calls) :provider)))
+      (should (equal "gemma4" (plist-get (car mock-calls) :model))))))
+
+(ert-deftest anvil-memory-test/mdl-distill-does-not-write-disk ()
+  "Distillation is read-only: no source / MEMORY.md file is modified."
+  (skip-unless (anvil-memory-test--supported-p 'mdl-distill))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-trio root)
+    (anvil-memory-scan)
+    (let* ((src (expand-file-name "feedback_commit_one.md" root))
+           (before (nth 5 (file-attributes src))))
+      (anvil-memory-test--with-llm-mock
+          (list (list :status 'done :summary anvil-memory-test--mdl-draft
+                      :pending nil))
+        (anvil-memory-mdl-distill (list src)))
+      (let ((after (nth 5 (file-attributes src))))
+        (should (equal before after))))))
+
+(ert-deftest anvil-memory-test/mdl-distill-mcp-tool-roundtrip ()
+  "MCP `memory-mdl-distill' accepts a colon-separated files string."
+  (skip-unless (anvil-memory-test--supported-p 'mdl-distill))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-trio root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock
+        (list (list :status 'done :summary anvil-memory-test--mdl-draft
+                    :pending nil))
+      (let* ((f1 (expand-file-name "feedback_commit_one.md" root))
+             (f2 (expand-file-name "feedback_commit_two.md" root))
+             (joined (concat f1 ":" f2))
+             (res (anvil-memory--tool-mdl-distill joined "claude" "sonnet")))
+        (should (stringp (plist-get res :draft)))
+        (should (equal (list f1 f2) (plist-get res :sources)))
+        (should (equal "claude" (plist-get (car mock-calls) :provider)))
+        (should (equal "sonnet" (plist-get (car mock-calls) :model)))))))
+
+
 (provide 'anvil-memory-test)
 
 ;;; anvil-memory-test.el ends here

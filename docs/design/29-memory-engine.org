@@ -8,13 +8,14 @@
   :PROPERTIES:
   :ID:       c6f05c1e-72a6-4e3b-87a6-d0a6a3b7c004
   :END:
-~Phase 1a + 1b + 2a + 2b-i + 2b-ii SHIPPED~ (2026-04-22、stacked
+~Phase 1a + 1b + 2a + 2b (i/ii/iii) SHIPPED~ (2026-04-22、stacked
 feat branches) — Week-3 Ship 4、競合 token-savior の "memory
 engine" を anvil + Claude Code auto-memory に統合する。非
 destructive (metadata layer のみ SQLite、memory =.md= files の
 rename 以外は不変) の foundation + 検出 + ranking & lifecycle +
-tokenizer swap + LLM verdict。MDL distillation は Phase 2b-iii
-送り、web viewer / cross-project は Phase 3/4。
+tokenizer swap + LLM verdict + MDL distillation。
+Phase 2b 3 sub-phase 全て完了、web viewer / cross-project 移行
+(Phase 3/4) はオプション扱い。
 
 *Phase 1a (feat/doc-29-memory-engine-phase1a):* =anvil-memory.el=
 metadata 索引 + scan + per-type TTL audit + access tracker + 4
@@ -55,6 +56,16 @@ keyword =:with-llm= / =:provider= / =:model= / =:timeout-sec= 追加)。
 MCP tool は =with_llm= / =provider= / =model= keyword。module 側は
 =anvil-orchestrator= を require せず =declare-function= guard で
 optional 依存を保つ。11 ERT (合計 71)。
+
+*Phase 2b-iii (feat/doc-29-memory-engine-phase2b-iii):*
+=memory-mdl-distill= 追加。N 本の indexed memory を 1 本の
+"convention memory" に distil する提案機能。FILES を明示で受け、
+orchestrator に labelled source block (===--- FILE: path ---===
+区切り) を投げ、reply を =:draft= として verbatim 返却 (parser
+しない)。書き込みなしの read-only (memory-pruner skill / 人間が
+採用判断)。empty / unindexed FILES は =user-error= で事前 reject、
+LLM call を無駄にしない。新 MCP tool =memory-mdl-distill= は
+colon-separated files param。10 ERT (合計 81)。
 
 *module placement:* =anvil-optional-modules= の =memory= (Emacs 29+
 SQLite 依存、opt-in)。=with_urls= audit は =anvil-http= を別途
@@ -346,11 +357,34 @@ commit: =55265b0= (test-lock、11 ERT) → =89f0372= (impl、+157 行)。
 
 commit: =d31d86a= (test-lock、11 ERT) → =51900de= (impl、+196 行)。
 
-** Phase 2b-iii — MDL distillation (~DRAFT~)
+** Phase 2b-iii — MDL distillation (~SHIPPED~ 2026-04-22)
 
-11. MDL distillation: 複数 memory の共通項を抽出し「convention
-    memory」の草稿を生成する提案機能 (orchestrator-dispatch)。
-    書き込みはせず draft 返却のみ (human-in-the-loop 維持)。
+11. =memory-mdl-distill= 追加: N 本の indexed memory を 1 本の
+    "convention memory" draft に distil する提案機能。
+    - 入力: FILES (明示 list)、各 path は =memory_meta= に
+      存在していないと =user-error= で reject。empty list も
+      user-error (LLM call を無駄にしない)。
+    - =anvil-memory--distill-prompt= が各 body を
+      ===--- FILE: path ---=== の labelled block として連結、
+      frontmatter (name / description / type) + body ≤50 行の
+      出力を要求する prompt を生成。
+    - =anvil-orchestrator-submit-and-collect= に一括投げ、
+      =:summary= を verbatim で =:draft= に入れて返す (parser
+      しない、採用判断は skill / 人間)。
+    - 失敗時: =:status failed= → =:error STRING=、
+      =:pending t= → =:error "orchestrator pending (timeout)"=。
+      =:sources= は常に FILES verbatim を保存 (rescued log 用)。
+    - 書き込みなしの read-only: source .md / MEMORY.md を一切
+      触らない。=mdl-distill-does-not-write-disk= fixture で
+      mtime 前後同値を assert。
+    - defcustom 再利用: Phase 2b-ii の =anvil-memory-llm-
+      provider= / =-llm-model= / =-llm-timeout-sec= をそのまま。
+    - 新 MCP tool =memory-mdl-distill= (colon-separated files /
+      provider / model)。=anvil-orchestrator= は =declare-
+      function= guard で optional (未 load でも module 自身は
+      load できる、MDL path だけ使えない)。
+
+commit: =e8c1bd8= (test-lock、10 ERT) → =8e2d863= (impl、+150 行)。
 
 ** Phase 3 — web-viewer
 
