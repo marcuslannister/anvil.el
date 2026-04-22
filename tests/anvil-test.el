@@ -173,6 +173,80 @@ MCP Parameters:
     (should (assoc "task_id" props))
     (should (equal ["task_id"] required))))
 
+;;;; --- encoded registration wrappers -------------------------------------
+
+(ert-deftest anvil-test-register-tool-normalizes-encoded-handler ()
+  "`anvil-server-register-tool' must introspect wrapped tools via the raw handler."
+  (defun anvil-test--wrapped-schema-tool (path &optional mode)
+    "Return PATH and MODE in a plist.
+
+MCP Parameters:
+  path - Absolute path to inspect.
+  mode - Optional mode string."
+    (list :path path :mode mode))
+  (let ((tool-id "anvil-test-wrapped-schema")
+        (server-id "anvil-test")
+        (wrapped
+         (anvil-server-encode-handler #'anvil-test--wrapped-schema-tool)))
+    (unwind-protect
+        (progn
+          (anvil-server-register-tool
+           wrapped
+           :id tool-id
+           :description "wrapped schema test"
+           :server-id server-id)
+          (let* ((tool (gethash tool-id
+                                (anvil-server--get-server-tools server-id)))
+                 (schema (plist-get tool :schema))
+                 (props (alist-get 'properties schema))
+                 (required (alist-get 'required schema)))
+            (should (eq 'anvil-test--wrapped-schema-tool
+                        (plist-get tool :handler)))
+            (should (equal '(path &optional mode)
+                           (plist-get tool :arglist)))
+            (should (plist-get tool :encode-result))
+            (should (assoc "path" props))
+            (should (assoc "mode" props))
+            (should (equal ["path"] required))))
+      (anvil-server-unregister-tool tool-id server-id))))
+
+(ert-deftest anvil-test-dispatch-encodes-wrapped-handler-result ()
+  "`tools/call' must validate args against the raw signature, then encode the result."
+  (defun anvil-test--wrapped-dispatch-tool (task_id &optional mode)
+    "Echo TASK_ID and MODE as a plist.
+
+MCP Parameters:
+  task_id - Task identifier string.
+  mode - Optional execution mode string."
+    (list :task_id task_id :mode mode))
+  (let ((tool-id "anvil-test-wrapped-dispatch")
+        (server-id "anvil-test")
+        (wrapped
+         (anvil-server-encode-handler #'anvil-test--wrapped-dispatch-tool)))
+    (unwind-protect
+        (progn
+          (anvil-server-register-tool
+           wrapped
+           :id tool-id
+           :description "wrapped dispatch test"
+           :server-id server-id)
+          (let* ((params `((name . ,tool-id)
+                           (arguments . ((task_id . "task-7")
+                                         (mode . "fast")))))
+                 (resp (anvil-server--handle-tools-call
+                        "t-wrapped" params
+                        (make-anvil-server-metrics) server-id))
+                 (decoded (json-read-from-string resp))
+                 (result (alist-get 'result decoded))
+                 (text (alist-get 'text
+                                  (aref (alist-get 'content result) 0)))
+                 (payload (json-parse-string text :object-type 'plist)))
+            (should (eq :json-false (alist-get 'isError result)))
+            (should (stringp text))
+            (should (equal "task-7" (plist-get payload :task_id)))
+            (should (equal "fast" (plist-get payload :mode)))))
+      (anvil-server-unregister-tool tool-id server-id))))
+
 ;;; :offload dispatch (Doc 03 Phase 2b) ------------------------------
 
 (defun anvil-test--offload-stub-dir ()
@@ -579,21 +653,34 @@ checkpoint's `:value' and `:cursor' when the handler called
 ;;;; --- bundle: anvil-server-encode-handler / --to-json-value ------------
 
 (defun anvil-test--encode-handler-fixture-handler (a &optional b)
-  "Fixture returning a plist with a dotted-pair alist inside."
+  "Fixture returning a plist with a dotted-pair alist inside.
+
+MCP Parameters:
+  a - First argument (string).
+  b - Optional second argument (string)."
   (list :a a :b (or b "default")
         :matrix (list (cons "k1" 1.0) (cons "k2" 2.0))))
 
-(ert-deftest anvil-test-encode-handler-preserves-arglist ()
-  "`anvil-server-encode-handler' wrapper must keep the original arglist
-so `anvil-server--generate-schema-from-function' accepts it — a
-`(lambda (&rest args) ...)' wrapper would be rejected by the &rest
-guard (see memory feedback_mcp_encoding_plumbing)."
+(ert-deftest anvil-test-encode-handler-exposes-raw-handler ()
+  "PR #12 switched `anvil-server-encode-handler' to a symbol-backed
+wrapper that records the raw handler on the `anvil-server-raw-handler'
+symbol property and flags `anvil-server-encode-result' t.  Registration
+normalizes via those properties, so schema generation sees the raw
+handler's arglist even though the wrapper itself is an
+`apply-partially' closure with `(&rest args)' shape."
   (let ((wrapped (anvil-server-encode-handler
                   #'anvil-test--encode-handler-fixture-handler)))
-    (should (equal '(a &optional b)
-                   (help-function-arglist wrapped t)))
-    ;; Round-trip: schema generation must succeed.
-    (should (anvil-server--generate-schema-from-function wrapped))))
+    (should (symbolp wrapped))
+    (should (eq #'anvil-test--encode-handler-fixture-handler
+                (get wrapped 'anvil-server-raw-handler)))
+    (should (get wrapped 'anvil-server-encode-result))
+    ;; Schema generation from the RAW handler (via the normalize helper)
+    ;; must yield the expected arg shape.
+    (let* ((meta (anvil-server--normalize-tool-handler wrapped))
+           (raw (plist-get meta :handler)))
+      (should (eq raw #'anvil-test--encode-handler-fixture-handler))
+      (should (equal '(a &optional b) (plist-get meta :arglist)))
+      (should (anvil-server--generate-schema-from-function raw)))))
 
 (ert-deftest anvil-test-encode-handler-registers-with-register-tool ()
   "Wrapped handler must pass the full register-tool path (schema gen)."
