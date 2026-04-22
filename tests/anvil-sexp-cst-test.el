@@ -408,10 +408,11 @@ documented in Phase 1b-b — the 4 KB ceiling the module has advertised
 since Phase 1a but not enforced."
   (skip-unless (anvil-sexp-cst-test--available-p 'byte-cap))
   (anvil-sexp-cst-test--with-drill-env
-    (let* ((anvil-sexp-cst-cap-bytes 512)
+    (let* ((anvil-sexp-cst-cap-bytes 200)
            (anvil-sexp-cst-top-limit 10)
-           ;; 5 alist cells, each key 120 chars — well over 512 bytes total
-           ;; but well under the 10-entry count cap.
+           ;; 5 alist cells under the count cap; with 200-byte output
+           ;; budget and per-entry repr ~60-80 bytes, byte cap must
+           ;; drop at least one entry and mint a cursor.
            (big (cl-loop for i below 5
                          collect (cons (make-string 120 ?x) i)))
            (raw (anvil-inspect-object big anvil-sexp-cst-test--client-id))
@@ -420,12 +421,11 @@ since Phase 1a but not enforced."
                                    :null-object :null
                                    :false-object :false)))
       (should (stringp raw))
-      (should (<= (string-bytes raw) 512))
+      (should (<= (string-bytes raw) 200))
       (should (equal (anvil-sexp-cst-test--get obj "type") "alist"))
       (should (equal (anvil-sexp-cst-test--get obj "length") 5))
       (should (eq (anvil-sexp-cst-test--get obj "truncated") t))
       (should (stringp (anvil-sexp-cst-test--get obj "cursor")))
-      ;; Cursor still namespaced by client-id.
       (should (string-prefix-p
                (format "inspect-object/%s/" anvil-sexp-cst-test--client-id)
                (anvil-sexp-cst-test--get obj "cursor"))))))

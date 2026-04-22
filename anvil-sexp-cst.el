@@ -45,14 +45,14 @@
 
 (defconst anvil-sexp-cst-supported-types
   '(integer nil symbol string list alist plist hash-table vector cons
-            record truncation circular drill)
+            record truncation circular drill byte-cap)
   "Type tags + behaviors that `anvil-inspect-object' handles today.
 Phase 1a chunks extend this list; tests in
 tests/anvil-sexp-cst-test.el gate their `skip-unless' on membership
 here so a half-shipped chunk never breaks CI.  The pseudo-tags
-`truncation', `circular', and `drill' describe emitted *behaviors*
-rather than Emacs runtime types — they live on the same list so
-each test can self-describe its capability gate.")
+`truncation', `circular', `drill', and `byte-cap' describe emitted
+*behaviors* rather than Emacs runtime types — they live on the
+same list so each test can self-describe its capability gate.")
 
 (defconst anvil-sexp-cst--real-type-tags
   '(integer nil symbol string list alist plist hash-table vector cons record)
@@ -109,15 +109,38 @@ Order matters: char-table predicate must precede vector because
 
 ;;;; --- JSON output encoder -----------------------------------------------
 
+(defun anvil-sexp-cst--build-payload (type length entries truncated cursor err)
+  "Return a plist payload ready for `json-serialize'.
+Absent keys stay absent (tests require this to distinguish `no
+length' from `length = null')."
+  (let ((p (list :type (symbol-name type))))
+    (when length (setq p (nconc p (list :length length))))
+    (when entries (setq p (nconc p (list :entries entries))))
+    (setq p (nconc p (list :truncated (if truncated t :false))))
+    (when cursor (setq p (nconc p (list :cursor cursor))))
+    (when err (setq p (nconc p (list :error err))))
+    p))
+
+(defun anvil-sexp-cst--serialize (payload)
+  "Serialize PAYLOAD plist as JSON with false-/null-object set."
+  (json-serialize payload :false-object :false :null-object :null))
+
 (defun anvil-sexp-cst--encode (type &rest props)
   "Encode TYPE + PROPS as the shape-locked JSON output string.
 
 PROPS is a plist understood keys:
-  :length    INTEGER  — optional, omitted when nil
-  :entries   VECTOR   — optional, omitted when nil
-  :truncated BOOLEAN  — emitted as JSON false/true; nil defaults to false
-  :cursor    STRING   — optional, omitted when nil
-  :error     ALIST    — optional, omitted when nil (typed error envelope)
+  :length        INTEGER  — optional, omitted when nil
+  :entries       VECTOR   — optional, omitted when nil
+  :truncated     BOOLEAN  — emitted as JSON false/true; nil → false
+  :cursor        STRING   — optional, omitted when nil
+  :error         ALIST    — optional, omitted when nil (typed error)
+  :cursor-source VALUE    — optional.  When set, the byte-cap
+                            backoff (Phase 1b-b) may drop entries
+                            from the tail until the serialised bytes
+                            fit `anvil-sexp-cst-cap-bytes'.  Each
+                            drop sets `:truncated' to t; a new
+                            cursor is minted from this value only
+                            when `:cursor' was not already supplied.
 
 Keys with nil values are not emitted; the test suite's `json-parse-string'
 walks the resulting hash-table and requires absent keys to stay absent
@@ -127,21 +150,36 @@ rather than round-tripping to `:null'."
          (truncated (plist-get props :truncated))
          (cursor    (plist-get props :cursor))
          (err       (plist-get props :error))
-         (payload   (list :type (symbol-name type))))
-    (when length
-      (setq payload (nconc payload (list :length length))))
-    (when entries
-      (setq payload (nconc payload (list :entries entries))))
-    (setq payload
-          (nconc payload
-                 (list :truncated (if truncated t :false))))
-    (when cursor
-      (setq payload (nconc payload (list :cursor cursor))))
-    (when err
-      (setq payload (nconc payload (list :error err))))
-    (json-serialize payload
-                    :false-object :false
-                    :null-object :null)))
+         (source    (plist-get props :cursor-source))
+         (cap       anvil-sexp-cst-cap-bytes)
+         (enc       (anvil-sexp-cst--serialize
+                     (anvil-sexp-cst--build-payload
+                      type length entries truncated cursor err))))
+    (cond
+     ;; Happy path: under cap or byte-cap disabled for this call.
+     ((or (null source) (<= (string-bytes enc) cap))
+      enc)
+     ;; Byte cap fires: drop entries from the tail until the payload fits.
+     (t
+      (let ((vec (cond ((vectorp entries) entries)
+                       ((listp entries) (apply #'vector entries))
+                       (t (vector))))
+            (cur (or cursor (anvil-sexp-cst--make-cursor source)))
+            (fit nil))
+        (while (and (null fit) (> (length vec) 0))
+          (setq vec (cl-subseq vec 0 (1- (length vec))))
+          (let ((candidate (anvil-sexp-cst--serialize
+                            (anvil-sexp-cst--build-payload
+                             type length
+                             (and (> (length vec) 0) vec)
+                             t cur err))))
+            (when (<= (string-bytes candidate) cap)
+              (setq fit candidate))))
+        (or fit
+            ;; Minimal envelope: drop entries entirely.
+            (anvil-sexp-cst--serialize
+             (anvil-sexp-cst--build-payload
+              type length nil t cur err))))))))
 
 
 ;;;; --- scalar handlers (chunk 1) -----------------------------------------
@@ -298,7 +336,8 @@ that offset — this drives Phase 1b-a pagination."
      :length len
      :entries (apply #'vector entries)
      :truncated (car ti)
-     :cursor (cdr ti))))
+     :cursor (cdr ti)
+     :cursor-source lst)))
 
 (defun anvil-sexp-cst--inspect-alist (al)
   "Render alist AL as shape-lock JSON.
@@ -320,7 +359,8 @@ first top-limit cells."
      :length len
      :entries (apply #'vector entries)
      :truncated (car ti)
-     :cursor (cdr ti))))
+     :cursor (cdr ti)
+     :cursor-source al)))
 
 (defun anvil-sexp-cst--inspect-plist (pl)
   "Render plist PL as shape-lock JSON.
@@ -345,7 +385,8 @@ drill contract."
      :length len
      :entries (apply #'vector entries)
      :truncated (car ti)
-     :cursor (cdr ti))))
+     :cursor (cdr ti)
+     :cursor-source pl)))
 
 
 ;;;; --- hash-table / vector / cons handlers (chunk 3) --------------------
@@ -376,7 +417,8 @@ entries maphash yields from an arbitrary start)."
        :length len
        :entries (apply #'vector (nreverse entries))
        :truncated (car ti)
-       :cursor (cdr ti)))))
+       :cursor (cdr ti)
+       :cursor-source h))))
 
 (defun anvil-sexp-cst--inspect-vector (vec)
   "Render vector VEC as shape-lock JSON with drill cursor past cap.
@@ -393,7 +435,8 @@ Honors `anvil-sexp-cst--window-offset' for drill pagination."
      :length len
      :entries (apply #'vector entries)
      :truncated (car ti)
-     :cursor (cdr ti))))
+     :cursor (cdr ti)
+     :cursor-source vec)))
 
 (defun anvil-sexp-cst--inspect-cons (c)
   "Render an improper cons C as shape-lock JSON.
