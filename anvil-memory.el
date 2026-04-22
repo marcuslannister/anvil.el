@@ -63,6 +63,13 @@
 (require 'subr-x)
 (require 'anvil-server)
 
+;; Phase 2b-ii: the LLM verdict path calls
+;; `anvil-orchestrator-submit-and-collect' only when the caller
+;; opts in with `:with-llm t'.  The module itself does not require
+;; anvil-orchestrator so the no-LLM code path works on an installation
+;; without the orchestrator loaded.
+(declare-function anvil-orchestrator-submit-and-collect "anvil-orchestrator")
+
 
 ;;;; --- group + defcustoms -------------------------------------------------
 
@@ -92,7 +99,7 @@ indexed in a single DB.  Explicit list overrides auto-detection."
 (defconst anvil-memory-supported
   '(scan audit access list
          search save-check duplicates audit-urls
-         decay promote regenerate reindex-fts)
+         decay promote regenerate reindex-fts llm-verdict)
   "Capability tags this module currently provides.
 Tests in tests/anvil-memory-test.el gate their `skip-unless' on
 membership here so a half-shipped feature never breaks CI.")
@@ -143,6 +150,28 @@ MCP tool) to swap tokenizers in-place."
   :type '(choice (const :tag "Auto (trigram if available)" auto)
                  (const :tag "Trigram (SQLite 3.34+)" trigram)
                  (const :tag "unicode61 (default)" unicode61))
+  :group 'anvil-memory)
+
+(defcustom anvil-memory-llm-provider "claude"
+  "Default provider id passed to `anvil-orchestrator-submit-and-collect'
+when `anvil-memory-save-check' is called with `:with-llm t' and no
+explicit provider.  Override per-call with `:provider'."
+  :type 'string
+  :group 'anvil-memory)
+
+(defcustom anvil-memory-llm-model nil
+  "Default model slug for the LLM verdict classifier (nil means let
+the orchestrator pick the provider's default).  Override per-call
+with `:model'."
+  :type '(choice (const :tag "Provider default" nil) string)
+  :group 'anvil-memory)
+
+(defcustom anvil-memory-llm-timeout-sec 30
+  "Per-candidate wall-clock cap passed as :collect-timeout-sec when
+`anvil-memory-save-check' dispatches a verdict classification.
+Each call also forwards this as :timeout-sec to the provider.
+Kept short because the expected output is a single keyword."
+  :type 'integer
   :group 'anvil-memory)
 
 (defconst anvil-memory-ttl-policies
@@ -609,12 +638,26 @@ FTS5 rank (best first).  Empty / whitespace-only QUERY returns nil."
               rows))))
 
 ;;;###autoload
-(defun anvil-memory-save-check (subject body &optional top-n)
+(cl-defun anvil-memory-save-check
+    (subject body &optional top-n
+             &key with-llm provider model timeout-sec)
   "Return top-N memories similar to the draft SUBJECT/BODY.
 TOP-N defaults to 3.  Uses FTS5 keyword search against
 SUBJECT + BODY to shortlist candidates, then ranks them by
-jaccard overlap against BODY.  Each result plist:
-(:file :type :snippet :similarity)."
+jaccard overlap against BODY.  Each result plist carries at
+least (:file :type :snippet :similarity).
+
+Phase 2b-ii: when WITH-LLM is non-nil every returned candidate
+is additionally classified via `anvil-orchestrator-submit-and-
+collect' and the result grows one of:
+  :verdict       — `duplicate' / `contradicting' / `orthogonal'
+  :verdict-raw   — model text if the verdict word was missing
+  :verdict-error — string when the orchestrator failed / timed out
+
+PROVIDER / MODEL / TIMEOUT-SEC default to
+`anvil-memory-llm-provider' / `anvil-memory-llm-model' /
+`anvil-memory-llm-timeout-sec'.  Zero candidates skips the
+orchestrator entirely so the LLM is never paid for a miss."
   (let* ((top-n (or top-n 3))
          (query (anvil-memory--tokens-to-fts-query
                  (append (anvil-memory--tokens subject)
@@ -634,9 +677,88 @@ jaccard overlap against BODY.  Each result plist:
                       :snippet (plist-get cand :snippet)
                       :similarity sim)
                 scored))))
-    (let ((ranked (cl-sort scored #'>
-                           :key (lambda (x) (plist-get x :similarity)))))
-      (seq-take ranked top-n))))
+    (let ((ranked (seq-take
+                   (cl-sort scored #'>
+                            :key (lambda (x) (plist-get x :similarity)))
+                   top-n)))
+      (if with-llm
+          (mapcar (lambda (cand)
+                    (anvil-memory--classify-candidate
+                     cand subject body
+                     (or provider anvil-memory-llm-provider)
+                     (or model anvil-memory-llm-model)
+                     (or timeout-sec anvil-memory-llm-timeout-sec)))
+                  ranked)
+        ranked))))
+
+(defun anvil-memory--verdict-prompt (subject body cand-body)
+  "Build the one-word verdict prompt for CAND-BODY vs SUBJECT/BODY."
+  (format "Classify the relationship between the NEW memory draft and \
+the EXISTING memory below.  Reply with exactly one of these words, \
+lowercase, no punctuation:
+  duplicate      — same rule / fact, redundant
+  contradicting  — asserts something incompatible with EXISTING
+  orthogonal     — different topic / compatible
+
+NEW memory draft:
+Subject: %s
+Body:
+%s
+
+EXISTING memory:
+%s
+
+Verdict (one word):"
+          subject body cand-body))
+
+(defun anvil-memory--parse-verdict (text)
+  "Return `duplicate' / `contradicting' / `orthogonal' found in TEXT, else nil.
+Match is case-insensitive and tolerates surrounding punctuation /
+labels (`Verdict: DUPLICATE.')."
+  (let ((s (downcase (or text ""))))
+    (cond
+     ((string-match-p "\\bcontradict\\(ing\\|s\\|ed\\|ion\\)?\\b" s)
+      'contradicting)
+     ((string-match-p "\\bduplicate\\b" s) 'duplicate)
+     ((string-match-p "\\borthogonal\\b" s) 'orthogonal))))
+
+(defun anvil-memory--classify-candidate (cand subject body provider model timeout)
+  "Run the LLM verdict classifier on CAND (a save-check plist).
+PROVIDER / MODEL / TIMEOUT are passed through to
+`anvil-orchestrator-submit-and-collect'.  Returns CAND enriched
+with :verdict / :verdict-raw / :verdict-error per the result."
+  (let* ((cand-body (or (anvil-memory--get-body (plist-get cand :file)) ""))
+         (prompt (anvil-memory--verdict-prompt subject body cand-body))
+         (result (condition-case err
+                     (anvil-orchestrator-submit-and-collect
+                      :provider provider
+                      :prompt prompt
+                      :model model
+                      :timeout-sec timeout
+                      :collect-timeout-sec timeout)
+                   (error (list :status 'failed
+                                :error (error-message-string err)
+                                :pending nil))))
+         (status (plist-get result :status))
+         (pending (plist-get result :pending))
+         (summary (plist-get result :summary))
+         (err-msg (plist-get result :error)))
+    (cond
+     (pending
+      (append cand (list :verdict nil
+                         :verdict-error "orchestrator pending (timeout)")))
+     ((eq status 'done)
+      (let ((v (anvil-memory--parse-verdict summary)))
+        (if v
+            (append cand (list :verdict v))
+          (append cand (list :verdict nil
+                             :verdict-raw (or summary ""))))))
+     (t
+      (append cand (list :verdict nil
+                         :verdict-error
+                         (format "orchestrator %s: %s"
+                                 (or status 'unknown)
+                                 (or err-msg "no error message"))))))))
 
 ;;;###autoload
 (defun anvil-memory-duplicates (&optional threshold)
@@ -924,17 +1046,51 @@ Returns (:rows ROWS) ordered by FTS rank (best first)."
           :type (anvil-memory--coerce-type type)
           :limit (anvil-memory--coerce-int limit 20)))))
 
-(defun anvil-memory--tool-save-check (subject body)
+(defun anvil-memory--coerce-bool (v)
+  "Coerce V (nil / bool / string) to `t' / nil.
+Empty string / \"false\" / \"nil\" / \"0\" → nil; anything else
+non-nil → t."
+  (cond
+   ((null v) nil)
+   ((eq v t) t)
+   ((stringp v)
+    (not (member (downcase v) '("" "false" "nil" "0" "no" "off"))))
+   (t t)))
+
+(defun anvil-memory--tool-save-check (subject body
+                                              &optional with_llm provider model)
   "Return top-N indexed memories similar to a draft SUBJECT/BODY.
 
 MCP Parameters:
-  subject - Draft memory subject (or empty).
-  body    - Draft memory body.  FTS5 shortlist + jaccard ranking.
+  subject  - Draft memory subject (or empty).
+  body     - Draft memory body.  FTS5 shortlist + jaccard ranking.
+  with_llm - Optional truthy flag (`true' / `1' / `t').  When set,
+             each candidate carries an LLM verdict
+             (`duplicate' / `contradicting' / `orthogonal') via
+             `anvil-orchestrator-submit-and-collect'.  Opt-in —
+             unset stays keyword-only like Phase 1b.
+  provider - Optional orchestrator provider id (defaults to
+             `anvil-memory-llm-provider').
+  model    - Optional model slug (defaults to
+             `anvil-memory-llm-model').
 
-Returns (:candidates ROWS), each :file :type :snippet :similarity."
+Returns (:candidates ROWS).  Each row carries :file / :type /
+:snippet / :similarity plus, when WITH_LLM was set, one of
+:verdict / :verdict-raw / :verdict-error."
   (anvil-server-with-error-handling
-   (list :candidates
-         (anvil-memory-save-check (or subject "") (or body "")))))
+   (let* ((llm-p (anvil-memory--coerce-bool with_llm))
+          (prov (cond ((null provider) nil)
+                      ((and (stringp provider) (string-empty-p provider)) nil)
+                      (t provider)))
+          (mdl (cond ((null model) nil)
+                     ((and (stringp model) (string-empty-p model)) nil)
+                     (t model))))
+     (list :candidates
+           (anvil-memory-save-check
+            (or subject "") (or body "") nil
+            :with-llm llm-p
+            :provider prov
+            :model mdl)))))
 
 (defun anvil-memory--tool-duplicates (&optional threshold)
   "Return memory pairs whose body jaccard overlap exceeds THRESHOLD.
@@ -1099,10 +1255,13 @@ this as Layer 2 before `memory-get'-ish full-body reads."
      :description
      "Return top-N indexed memories similar to a draft SUBJECT/BODY.
 FTS5 candidate shortlist plus jaccard overlap scoring (Phase 1b
-keyword / Levenshtein baseline; Phase 2 will add LLM
-contradiction classification).  Each row carries :similarity in
-the 0.0–1.0 range — callers flag >=0.7 as a duplicate / merge
-candidate."
+keyword baseline).  Each row carries :similarity in the 0.0–1.0
+range — callers flag >=0.7 as a duplicate / merge candidate.
+Phase 2b-ii: pass with_llm=true (plus optional provider / model)
+to enrich every candidate with a one-word LLM verdict
+(duplicate / contradicting / orthogonal) via anvil-orchestrator.
+The LLM path is opt-in — omitting with_llm keeps the response
+network-free."
      :read-only t)
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-duplicates)

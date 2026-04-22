@@ -1025,7 +1025,9 @@ forwarded keyword args so tests can assert call counts / contents."
         (list (list :status 'done :summary "Verdict: DUPLICATE." :pending nil)
               (list :status 'done :summary "The answer is: CONTRADICTING." :pending nil))
       (let ((hits (anvil-memory-save-check
-                   "S" "B" 3 :with-llm t)))
+                   "Co-Authored-By rule"
+                   "Always include Co-Authored-By in every commit."
+                   3 :with-llm t)))
         (should (memq (plist-get (car hits) :verdict)
                       '(duplicate contradicting orthogonal)))))))
 
@@ -1039,7 +1041,9 @@ forwarded keyword args so tests can assert call counts / contents."
         (list (list :status 'done :summary "maybe perhaps" :pending nil)
               (list :status 'done :summary "something else" :pending nil))
       (let ((hits (anvil-memory-save-check
-                   "S" "B" 3 :with-llm t)))
+                   "Co-Authored-By rule"
+                   "Always include Co-Authored-By in every commit."
+                   3 :with-llm t)))
         (should (> (length hits) 0))
         (dolist (h hits)
           (should (null (plist-get h :verdict)))
@@ -1055,7 +1059,9 @@ forwarded keyword args so tests can assert call counts / contents."
         (list (list :status 'failed :error "boom" :pending nil)
               (list :status 'failed :error "boom" :pending nil))
       (let ((hits (anvil-memory-save-check
-                   "S" "B" 3 :with-llm t)))
+                   "Co-Authored-By rule"
+                   "Always include Co-Authored-By in every commit."
+                   3 :with-llm t)))
         (should (> (length hits) 0))
         (dolist (h hits)
           (should (null (plist-get h :verdict)))
@@ -1071,7 +1077,9 @@ forwarded keyword args so tests can assert call counts / contents."
         (list (list :status 'running :pending t)
               (list :status 'running :pending t))
       (let ((hits (anvil-memory-save-check
-                   "S" "B" 3 :with-llm t)))
+                   "Co-Authored-By rule"
+                   "Always include Co-Authored-By in every commit."
+                   3 :with-llm t)))
         (should (> (length hits) 0))
         (dolist (h hits)
           (should (null (plist-get h :verdict)))
@@ -1087,7 +1095,10 @@ forwarded keyword args so tests can assert call counts / contents."
         (list (list :status 'done :summary "duplicate" :pending nil)
               (list :status 'done :summary "duplicate" :pending nil)
               (list :status 'done :summary "duplicate" :pending nil))
-      (let ((hits (anvil-memory-save-check "S" "B" 5 :with-llm t)))
+      (let ((hits (anvil-memory-save-check
+                   "Co-Authored-By rule"
+                   "Always include Co-Authored-By in every commit."
+                   5 :with-llm t)))
         (should (= (length hits) (length mock-calls)))))))
 
 (ert-deftest anvil-memory-test/llm-verdict-no-candidates-no-call ()
@@ -1110,7 +1121,9 @@ forwarded keyword args so tests can assert call counts / contents."
         (list (list :status 'done :summary "duplicate" :pending nil)
               (list :status 'done :summary "duplicate" :pending nil))
       (let* ((result (anvil-memory--tool-save-check
-                      "S" "B" "true" "claude" "sonnet-4-6"))
+                      "Co-Authored-By rule"
+                      "Always include Co-Authored-By in every commit."
+                      "true" "claude" "sonnet-4-6"))
              (cands (plist-get result :candidates)))
         (should (> (length cands) 0))
         (dolist (c cands)
