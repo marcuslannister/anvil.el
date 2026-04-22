@@ -280,20 +280,53 @@ config を持つ claude-cli / codex-cli を起動すれば、child session の
 per-server-id profile / enable/disable で alias install/uninstall /
 end-to-end で emacs-eval-ultra が ultra 絞り込み反映)。全 24 ERT pass。
 
-** Phase 1b — orchestrator subprocess env 自動注入 (~DRAFT~)
+** Phase 1b — orchestrator subprocess auto-inject (~SHIPPED~ 2026-04-22)
 
-現状 Phase 1a は *Claude Code config 側で手動に* virtual server-id
-を指定する必要がある。Phase 1b では =anvil-orchestrator.el= の
-=anvil-orchestrator--spawn= で、provider が claude-cli / codex 等
-の場合に自動で =--mcp-server emacs-eval-ultra= 相当の設定を差し込む:
+Phase 1a までは Claude Code config 側で手動に virtual server-id
+を指定する必要があった。Phase 1b で =anvil-orchestrator--spawn= が
+provider の =build-cmd= に per-task MCP config を自動注入し、
+ユーザーの =~/.claude.json= を触らずに child session の
+=tools/list= を profile-filtered にできる。
 
-- Provider の =build-cmd= で claude-cli の =--mcp-config= に ultra 版
-  を組み込み。
-- 既存 user config と衝突しないよう temp file or env で分離。
-- Opt-out: task plist に =:no-manifest-override t= があれば無効化。
+実装範囲:
+- 2 defcustom:
+  - =anvil-orchestrator-manifest-profile= (default nil = opt-in。
+    Phase 0 measured main-session ROI <1% につき既定無効。)
+  - =anvil-orchestrator-manifest-stdio-command= (user の
+    =anvil-stdio.sh= path。nil / 未存在ファイルは graceful no-op。)
+- Helper 群 (claude 以外の provider でも再利用可能な stateless 函数):
+  - =--manifest-config-file-path TASK-ID=: 決定論的 temp path。
+    sentinel cleanup が同じファイルを見つけられるよう task-id 起因。
+  - =--manifest-active-profile TASK=: opt-out (task plist の
+    =:no-manifest-override t=) と defcustom を合成、返り値は
+    profile symbol or nil。
+  - =--manifest-stdio-ready-p=: stdio command customization 検証。
+  - =--manifest-write-config TASK PROFILE=: 単一 =mcpServers= entry
+    JSON を temp ファイルに書く。entry は =type=stdio=、=command=
+    = customization、=args= = =[--server-id=emacs-eval-PROFILE,
+    --init-function=anvil-enable]=。
+  - =--manifest-inject-mcp-config CMD TASK=: pipeline stage、
+    active-profile + stdio-ready なら CMD に =--mcp-config FILE=
+    を append、そうでなければ CMD を素通し。
+  - =--manifest-cleanup-config TASK-ID=: sentinel 側 rm。
+- claude =build-cmd= は worktree flag の直後で helper を呼ぶ 1 行
+  のみ追加。
+- Sentinel (=--finalize=) が cleanup を task-id で呼び出し、failure
+  / cancel でも temp file leak 無し。
 
-Phase 1a 経過観察 (orchestrator 実戦での token 削減実測) 後に
-Phase 1b 着手。
+Scope 制限: claude のみ wire-up。codex / gemini / aider は各 CLI
+の MCP config flag が異なるため同 pattern で後続 phase で追加可能。
+build-cmd 側の helper は provider-agnostic なので再利用前提。
+
+Tests: 5 ERT fixture 全 pass:
+- =manifest-disabled-adds-no-flag= (default nil → no flag)
+- =manifest-enabled-injects-mcp-config= (flag + JSON shape 検証)
+- =manifest-opt-out-suppresses-flag= (=:no-manifest-override t=)
+- =manifest-missing-stdio-skips-injection= (graceful degradation)
+- =manifest-config-file-path-helper= (deterministic path)
+
+commit: =0f6d629= (test-lock) → =d886582= (feat、helper 群 + claude
+integration + sentinel cleanup)。make test-all 907/912 pass, 0 failed。
 
 ** Phase 2 — lazy discovery (=ultra= + meta-tool)
 
