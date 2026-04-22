@@ -217,6 +217,129 @@ nil).  The full payload remains accessible via `session-resume'."
   (anvil-state-delete name :ns anvil-session--snapshot-ns))
 
 
+;;;; --- Phase 3: event log primitives --------------------------------------
+
+(defun anvil-session--event-key (session-id ts)
+  "Build a lexicographically-sortable key for SESSION-ID + TS.
+The `us' suffix is integer microseconds so `anvil-state-list-keys'
+returns rows in chronological order for a given session without
+needing a separate index."
+  (format "%s/%017d" session-id (truncate (* ts 1e6))))
+
+(defun anvil-session--truncate-summary (s)
+  "Clamp S to `anvil-session-event-summary-max-chars' (nil stays nil)."
+  (cond
+   ((null s) nil)
+   ((not (stringp s)) (anvil-session--truncate-summary (format "%s" s)))
+   ((> (length s) anvil-session-event-summary-max-chars)
+    (substring s 0 anvil-session-event-summary-max-chars))
+   (t s)))
+
+;;;###autoload
+(cl-defun anvil-session-log-event (session-id kind
+                                              &key tool summary ts)
+  "Append one event row to the Phase 3 session event log.
+
+SESSION-ID is the Claude Code session identifier (hook env var
+`CLAUDE_SESSION_ID' in practice).
+KIND is a short symbol or string, e.g. `tool-use' / `user-prompt'
+/ `error' / `decision'.
+
+Keyword arguments:
+  :tool      — optional tool name (for `tool-use' kind).
+  :summary   — ≤200 chars digest of the event (enforced via
+               `anvil-session-event-summary-max-chars').
+  :ts        — override timestamp (defaults to `float-time').
+
+Returns the stored row plist.  Rows live in anvil-state ns
+`session-events' with TTL `anvil-session-events-ttl-sec'."
+  (unless (and (stringp session-id) (not (string-empty-p session-id)))
+    (user-error "anvil-session-log-event: SESSION-ID required"))
+  (let* ((ts* (or ts (float-time)))
+         (kind-str (cond ((stringp kind) kind)
+                         ((symbolp kind) (symbol-name kind))
+                         (t (format "%s" kind))))
+         (row (list :session-id session-id
+                    :ts ts*
+                    :kind kind-str
+                    :tool tool
+                    :summary (anvil-session--truncate-summary summary)))
+         (key (anvil-session--event-key session-id ts*)))
+    (anvil-state-set key row
+                     :ns anvil-session--events-ns
+                     :ttl anvil-session-events-ttl-sec)
+    row))
+
+(defun anvil-session--all-events ()
+  "Return every live event row, ordered by key (≈ chronological).
+Used as the common pool for `--events-search' / `--events-recent'."
+  (let (out)
+    (dolist (k (sort (copy-sequence
+                      (anvil-state-list-keys
+                       :ns anvil-session--events-ns))
+                     #'string-lessp))
+      (let ((r (anvil-state-get k :ns anvil-session--events-ns)))
+        (when r (push r out))))
+    (nreverse out)))
+
+(defun anvil-session--session-events (session-id)
+  "Return live events for SESSION-ID, chronologically ordered."
+  (let ((prefix (concat session-id "/"))
+        out)
+    (dolist (k (sort (copy-sequence
+                      (anvil-state-list-keys
+                       :ns anvil-session--events-ns))
+                     #'string-lessp))
+      (when (string-prefix-p prefix k)
+        (let ((r (anvil-state-get k :ns anvil-session--events-ns)))
+          (when r (push r out)))))
+    (nreverse out)))
+
+;;;###autoload
+(cl-defun anvil-session-events-recent (&key session-id limit)
+  "Return the last LIMIT events (default 20), newest last.
+SESSION-ID scopes the result to one session; nil spans all sessions."
+  (let* ((limit (or limit 20))
+         (pool (if session-id
+                   (anvil-session--session-events session-id)
+                 (anvil-session--all-events))))
+    (if (> (length pool) limit)
+        (nthcdr (- (length pool) limit) pool)
+      pool)))
+
+;;;###autoload
+(cl-defun anvil-session-events-search (query &key session-id limit)
+  "Return events whose `:summary' or `:tool' contains QUERY (case-insensitive).
+With SESSION-ID, restrict to that session; otherwise search all.
+LIMIT caps the result size (default 20); oldest matches are dropped
+first so the return is the newest LIMIT hits in chronological order.
+
+This is the anvil analog of context-mode's PostToolUse / user-prompt
+full-text search.  Doc 17 design used FTS5 but the anvil-state
+simple-LIKE path is adequate for the ≤500-event/session volume
+anticipated; swap in a dedicated FTS5 DB later if hot."
+  (let* ((limit (or limit 20))
+         (pool (if session-id
+                   (anvil-session--session-events session-id)
+                 (anvil-session--all-events)))
+         (q (and (stringp query) (not (string-empty-p query))
+                 (downcase query)))
+         matches)
+    (dolist (r pool)
+      (let ((summary (plist-get r :summary))
+            (tool    (plist-get r :tool)))
+        (when (or (null q)
+                  (and (stringp summary)
+                       (string-match-p (regexp-quote q) (downcase summary)))
+                  (and (stringp tool)
+                       (string-match-p (regexp-quote q) (downcase tool))))
+          (push r matches))))
+    (setq matches (nreverse matches))
+    (if (> (length matches) limit)
+        (nthcdr (- (length matches) limit) matches)
+      matches)))
+
+
 ;;;; --- MCP tool wrappers --------------------------------------------------
 
 (defun anvil-session--tool-snapshot (name &optional task-summary notes
@@ -273,6 +396,43 @@ MCP Parameters:
   (list :deleted (if (anvil-session-delete name) t :false)
         :name name))
 
+(defun anvil-session--tool-events-search (query &optional session-id limit)
+  "MCP wrapper for `anvil-session-events-search'.
+
+MCP Parameters:
+  query      - Case-insensitive substring to match in `:summary'
+               or `:tool'.  Empty / nil returns the LIMIT most
+               recent events (see session-events-recent).
+  session-id - Optional Claude session id to restrict the hunt.
+  limit      - Optional cap on rows returned (default 20).  Oldest
+               matches are dropped first."
+  (apply #'vector
+         (anvil-session-events-search
+          query
+          :session-id (and (stringp session-id)
+                           (not (string-empty-p session-id))
+                           session-id)
+          :limit (cond ((integerp limit) limit)
+                       ((and (stringp limit) (not (string-empty-p limit)))
+                        (string-to-number limit))
+                       (t nil)))))
+
+(defun anvil-session--tool-events-recent (&optional session-id limit)
+  "MCP wrapper for `anvil-session-events-recent'.
+
+MCP Parameters:
+  session-id - Optional session scope (see session-events-search).
+  limit      - Optional cap (default 20)."
+  (apply #'vector
+         (anvil-session-events-recent
+          :session-id (and (stringp session-id)
+                           (not (string-empty-p session-id))
+                           session-id)
+          :limit (cond ((integerp limit) limit)
+                       ((and (stringp limit) (not (string-empty-p limit)))
+                        (string-to-number limit))
+                       (t nil)))))
+
 
 ;;;; --- module lifecycle ---------------------------------------------------
 
@@ -311,12 +471,33 @@ chars).  Use session-resume for the full payload."
    :server-id anvil-session--server-id
    :description
    "Purge the snapshot stored under NAME.  Returns {deleted: bool,
-name}.  Write tool."))
+name}.  Write tool.")
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-session--tool-events-search)
+   :id "session-events-search"
+   :server-id anvil-session--server-id
+   :description
+   "Case-insensitive substring hunt across the event log's `summary'
++ `tool' fields.  Use for \"which tool did I use last time I hit the
+worker retry-cap bug?\".  Scopes to SESSION-ID when given; LIMIT caps
+the result (default 20, oldest matches dropped first).  Read-only."
+   :read-only t)
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-session--tool-events-recent)
+   :id "session-events-recent"
+   :server-id anvil-session--server-id
+   :description
+   "Return the last LIMIT events (default 20), newest last.  Optional
+SESSION-ID narrows to a single Claude session.  Cheaper than
+session-events-search when the caller just wants recent activity.
+Read-only."
+   :read-only t))
 
 (defun anvil-session--unregister-tools ()
   "Remove every session-* MCP tool from the shared server."
   (dolist (id '("session-snapshot" "session-resume"
-                "session-list"     "session-delete"))
+                "session-list"     "session-delete"
+                "session-events-search" "session-events-recent"))
     (ignore-errors
       (anvil-server-unregister-tool id anvil-session--server-id))))
 

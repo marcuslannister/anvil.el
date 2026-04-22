@@ -124,5 +124,80 @@ returns nil (non-existence is not an error)."
     (should-not (anvil-session-resume "never-created"))))
 
 
+;;;; --- Phase 3 event log --------------------------------------------------
+
+(ert-deftest anvil-session-test-log-event-roundtrips ()
+  "`session-log-event' stores a row that `session-events-recent'
+returns with `:kind', `:tool', and (truncated) `:summary' intact."
+  (anvil-session-test--with-clean-state
+    (anvil-session-log-event "sess-A" 'tool-use
+                             :tool "file-batch"
+                             :summary "anvil-worker.el (12 edits)")
+    (let* ((events (anvil-session-events-recent :session-id "sess-A")))
+      (should (= (length events) 1))
+      (let ((r (car events)))
+        (should (equal (plist-get r :session-id) "sess-A"))
+        (should (equal (plist-get r :kind) "tool-use"))
+        (should (equal (plist-get r :tool) "file-batch"))
+        (should (equal (plist-get r :summary)
+                       "anvil-worker.el (12 edits)"))))))
+
+(ert-deftest anvil-session-test-log-event-truncates-summary ()
+  "Summaries longer than `anvil-session-event-summary-max-chars'
+are clipped to the cap so the log surface stays cheap even if the
+hook forwards a full tool payload."
+  (anvil-session-test--with-clean-state
+    (let* ((anvil-session-event-summary-max-chars 64)
+           (long (make-string 200 ?A)))
+      (anvil-session-log-event "sess-B" 'user-prompt :summary long)
+      (let* ((events (anvil-session-events-recent :session-id "sess-B"))
+             (got (plist-get (car events) :summary)))
+        (should (stringp got))
+        (should (<= (length got) 64))
+        (should (string-match-p "\\`A+\\'" got))))))
+
+(ert-deftest anvil-session-test-events-search-matches-summary ()
+  "`session-events-search' returns rows whose `:summary' contains the
+query (case-insensitive) and respects the SESSION-ID scope."
+  (anvil-session-test--with-clean-state
+    (anvil-session-log-event "sess-X" 'tool-use
+                             :tool "ert-run"
+                             :summary "worker-retry-test PASSED")
+    (anvil-session-log-event "sess-X" 'tool-use
+                             :tool "file-batch"
+                             :summary "unrelated edit")
+    (anvil-session-log-event "sess-Y" 'tool-use
+                             :tool "ert-run"
+                             :summary "different session retry match")
+    ;; match on summary, scoped to sess-X.
+    (let ((hits (anvil-session-events-search
+                 "retry" :session-id "sess-X")))
+      (should (= (length hits) 1))
+      (should (equal (plist-get (car hits) :tool) "ert-run")))
+    ;; unscoped search returns both sess-X and sess-Y hits.
+    (let ((hits (anvil-session-events-search "retry")))
+      (should (>= (length hits) 2)))
+    ;; case-insensitive.
+    (let ((hits (anvil-session-events-search
+                 "PASSED" :session-id "sess-X")))
+      (should (= (length hits) 1)))))
+
+(ert-deftest anvil-session-test-events-recent-respects-limit ()
+  "`session-events-recent' with :limit N returns the newest N rows in
+chronological order (oldest first), dropping older events."
+  (anvil-session-test--with-clean-state
+    (dotimes (i 5)
+      (anvil-session-log-event "sess-R" 'tool-use
+                               :tool "t"
+                               :summary (format "event-%d" i)
+                               :ts (+ (float-time) (* i 0.001))))
+    (let* ((recent (anvil-session-events-recent
+                    :session-id "sess-R" :limit 3))
+           (summaries (mapcar (lambda (r) (plist-get r :summary))
+                              recent)))
+      (should (= (length recent) 3))
+      (should (equal summaries '("event-2" "event-3" "event-4"))))))
+
+
 (provide 'anvil-session-test)
 ;;; anvil-session-test.el ends here
