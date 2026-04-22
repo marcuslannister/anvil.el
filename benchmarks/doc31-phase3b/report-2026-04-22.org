@@ -1,0 +1,74 @@
+#+title: Doc 31 Phase 3b — LLM eval (close-paren repair ROI)
+#+date: 2026-04-22
+#+author: zawatton + Claude Opus 4.7
+
+* Run context
+
+- Emacs: 30.1
+- treesit-elisp grammar ready: YES
+- Cases: 30
+- Dataset: [[file:dataset.el][dataset.el]]
+- Runner: [[file:run.el][run.el]]
+
+* Aggregate by category
+
+| Category         | N | Expected-match | Actually repaired | Failed |
+|------------------+---+----------------+-------------------+--------|
+| trailing-close   | 10 | 10/10 (100%)     | 10/10 (100%)         | 0/10  |
+| leading-excess   | 5 | 5/5 (100%)     | 5/5 (100%)         | 0/5  |
+| deep-nested      | 5 | 5/5 (100%)     | 5/5 (100%)         | 0/5  |
+| multi-form       | 5 | 5/5 (100%)     | 5/5 (100%)         | 0/5  |
+| unfixable        | 5 | 5/5 (100%)     | 0/5 (0%)         | 5/5  |
+
+*Total expected-match:* 30/30 (100%)
+*Repair success (close/open/noop):* 25/30 (83%)
+*Estimated retry-rate reduction:* 97% → 17% (83% of broken cases rescued)
+
+* Per-case detail
+
+| ID | Category         | Expected kind       | Actual kind         | Exp. added | Act. added | Match | Description |
+|----+------------------+---------------------+---------------------+------------+------------+-------+-------------|
+|  1 | trailing-close   | close-paren-added   | close-paren-added   |          1 |          1 | ✓  | single form, missing one ) |
+|  2 | trailing-close   | close-paren-added   | close-paren-added   |          1 |          1 | ✓  | defun with body, missing one ) |
+|  3 | trailing-close   | close-paren-added   | close-paren-added   |          2 |          2 | ✓  | defun with arg list, missing two ) |
+|  4 | trailing-close   | close-paren-added   | close-paren-added   |          2 |          2 | ✓  | let-binding body, missing two ) |
+|  5 | trailing-close   | close-paren-added   | close-paren-added   |          2 |          2 | ✓  | cond with multiple arms, missing close |
+|  6 | trailing-close   | close-paren-added   | close-paren-added   |          2 |          2 | ✓  | lambda body incomplete |
+|  7 | trailing-close   | close-paren-added   | close-paren-added   |          1 |          1 | ✓  | quoted list literal missing ) |
+|  8 | trailing-close   | close-paren-added   | close-paren-added   |          3 |          3 | ✓  | nested function call missing inner+outer ) |
+|  9 | trailing-close   | close-paren-added   | close-paren-added   |          1 |          1 | ✓  | defvar with docstring, missing ) |
+| 10 | trailing-close   | close-paren-added   | close-paren-added   |          1 |          1 | ✓  | when form with implicit progn |
+| 11 | leading-excess   | open-paren-prepended | open-paren-prepended |          1 |          1 | ✓  | single stray ) at EOF |
+| 12 | leading-excess   | open-paren-prepended | open-paren-prepended |          2 |          2 | ✓  | two stray ) at EOF |
+| 13 | leading-excess   | open-paren-prepended | open-paren-prepended |          1 |          1 | ✓  | bare excess close |
+| 14 | leading-excess   | open-paren-prepended | open-paren-prepended |          1 |          1 | ✓  | paranoid over-close on defun |
+| 15 | leading-excess   | open-paren-prepended | open-paren-prepended |          2 |          2 | ✓  | over-closed nested form |
+| 16 | deep-nested      | close-paren-added   | close-paren-added   |          4 |          4 | ✓  | 4-level nest missing innermost close |
+| 17 | deep-nested      | close-paren-added   | close-paren-added   |          4 |          4 | ✓  | 5-level nest missing two closes |
+| 18 | deep-nested      | close-paren-added   | close-paren-added   |          3 |          3 | ✓  | condition-case with handler body unclosed |
+| 19 | deep-nested      | close-paren-added   | close-paren-added   |          3 |          3 | ✓  | doubly-nested let bindings unclosed |
+| 20 | deep-nested      | close-paren-added   | close-paren-added   |          3 |          3 | ✓  | progn inside when inside defun |
+| 21 | multi-form       | close-paren-added   | close-paren-added   |          2 |          2 | ✓  | defvar clean + defun unclosed |
+| 22 | multi-form       | close-paren-added   | close-paren-added   |          2 |          2 | ✓  | comment + clean form + unclosed form |
+| 23 | multi-form       | open-paren-prepended | open-paren-prepended |          1 |          1 | ✓  | three defvars, middle over-closed |
+| 24 | multi-form       | close-paren-added   | close-paren-added   |          2 |          2 | ✓  | provide + require + broken defun |
+| 25 | multi-form       | noop                | noop                |          0 |          0 | ✓  | clean form + clean form — already balanced |
+| 26 | unfixable        | sexp-cst/repair-failed | sexp-cst/repair-failed |          — |          — | ✓  | unterminated string inside form |
+| 27 | unfixable        | sexp-cst/repair-failed | sexp-cst/repair-failed |          — |          — | ✓  | unterminated string with paren-looking chars inside |
+| 28 | unfixable        | sexp-cst/repair-failed | sexp-cst/repair-failed |          — |          — | ✓  | swapped parens (structural, not count) |
+| 29 | unfixable        | sexp-cst/repair-failed | sexp-cst/repair-failed |          — |          — | ✓  | paren-balanced but half-written symbol |
+| 30 | unfixable        | sexp-cst/repair-failed | sexp-cst/repair-failed |          — |          — | ✓  | balanced but has stray ` at EOF |
+
+* Interpretation
+
+`Repair success' means `sexp-cst-repair' returned a
+`repair-result' envelope (not a typed error).  For the
+`unfixable' category we *expect* the tool to refuse — so
+a high `expected-match' there is the right outcome, not a
+high `repaired' rate.
+
+`Retry-rate reduction' models the ROI thesis: without the
+repair tool, every broken case would have forced the LLM
+to retry; with the tool, only the residual unfixable cases
+need retry.  That gap is the token / latency saving Phase
+3a buys the pipeline.
