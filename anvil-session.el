@@ -1,4 +1,5 @@
 ;;; anvil-session.el --- Session snapshots + Claude Code hooks  -*- lexical-binding: t; -*-
+;;; anvil-audit: tools-wrapped-at-registration
 
 ;; Copyright (C) 2026 zawatton
 
