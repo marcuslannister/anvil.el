@@ -39,6 +39,7 @@
 (require 'anvil-sexp-cst nil t)
 (require 'anvil-state nil t)
 (require 'eieio nil t)
+(require 'treesit nil t)
 
 ;;;; --- fixture helpers ----------------------------------------------------
 

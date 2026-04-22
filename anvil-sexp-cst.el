@@ -46,15 +46,15 @@
 (defconst anvil-sexp-cst-supported-types
   '(integer nil symbol string list alist plist hash-table vector cons
             record char-table truncation circular drill byte-cap
-            eieio purge)
+            eieio purge cst-read)
   "Type tags + behaviors that `anvil-inspect-object' handles today.
-Phase 1a/1b chunks extend this list; tests in
+Phase 1a/1b/2 chunks extend this list; tests in
 tests/anvil-sexp-cst-test.el gate their `skip-unless' on membership
 here so a half-shipped chunk never breaks CI.  The pseudo-tags
-`truncation', `circular', `drill', `byte-cap', `eieio', `purge'
-describe emitted *behaviors* rather than Emacs runtime types —
-they live on the same list so each test can self-describe its
-capability gate.")
+`truncation', `circular', `drill', `byte-cap', `eieio', `purge',
+and `cst-read' describe emitted *behaviors* rather than Emacs
+runtime types — they live on the same list so each test can
+self-describe its capability gate.")
 
 (defconst anvil-sexp-cst--real-type-tags
   '(integer nil symbol string list alist plist hash-table vector cons
@@ -74,6 +74,14 @@ emitted; the cursor value lives in the anvil-state KV under the
 (defcustom anvil-sexp-cst-top-limit 10
   "Number of top-level children surfaced per `anvil-inspect-object' call.
 Beyond this the output is truncated with a drill cursor."
+  :type 'integer
+  :group 'anvil-sexp-cst)
+
+(defcustom anvil-sexp-cst-read-max-depth 4
+  "Default recursion cap for `anvil-sexp-cst-read' (Phase 2a).
+Nodes at this depth are emitted with their raw source `text' rather
+than recursing into `children'.  Deeper drill requires a separate
+call with a smaller POSITION window or a larger MAX-DEPTH."
   :type 'integer
   :group 'anvil-sexp-cst)
 
@@ -730,6 +738,113 @@ MCP Parameters:
        (if (integerp n) n 0))))))
 
 
+;;;; --- sexp-cst-read (Phase 2a) ------------------------------------------
+
+(defun anvil-sexp-cst--grammar-usable-p ()
+  "Return non-nil when tree-sitter-elisp can actually parse in this Emacs.
+Same check `--maybe-warn-abi' uses but callable at handler time
+so the read tool can return a typed error rather than crashing
+when the grammar is missing."
+  (and (fboundp 'treesit-available-p) (treesit-available-p)
+       (fboundp 'treesit-ready-p)
+       (ignore-errors (treesit-ready-p 'elisp t))))
+
+(defun anvil-sexp-cst--pick-node (parser root position)
+  "Walk from POSITION up to the nearest named node; fall back to ROOT.
+When POSITION is nil, returns ROOT unchanged.  `treesit-node-at'
+may land on an anonymous token (paren, whitespace) so the upward
+walk is required to surface a structurally meaningful node."
+  (if (null position)
+      root
+    (let ((node (ignore-errors (treesit-node-at position parser))))
+      (while (and node (not (treesit-node-check node 'named)))
+        (setq node (treesit-node-parent node)))
+      (or node root))))
+
+(defun anvil-sexp-cst--node-to-plist (node depth max-depth)
+  "Serialize treesit NODE into a shape-locked plist.
+DEPTH is the current recursion level (0 at the entry node); once
+DEPTH reaches MAX-DEPTH the node emits its raw source text and an
+empty children array with `:truncated' = t when it had children
+that got pruned.  Leaf nodes (zero children) emit text regardless
+of depth."
+  (let* ((type (treesit-node-type node))
+         (start (treesit-node-start node))
+         (end (treesit-node-end node))
+         (named (and (treesit-node-check node 'named) t))
+         (child-count (treesit-node-child-count node))
+         (at-cap (>= depth max-depth)))
+    (cond
+     ((or (zerop child-count) at-cap)
+      (list :type type :start start :end end
+            :named (if named t :false)
+            :text (treesit-node-text node t)
+            :children (vector)
+            :truncated (if (and at-cap (> child-count 0)) t :false)))
+     (t
+      (let (kids)
+        (dotimes (i child-count)
+          (push (anvil-sexp-cst--node-to-plist
+                 (treesit-node-child node i)
+                 (1+ depth) max-depth)
+                kids))
+        (list :type type :start start :end end
+              :named (if named t :false)
+              :children (apply #'vector (nreverse kids))
+              :truncated :false))))))
+
+;;;###autoload
+(defun anvil-sexp-cst-read (file &optional position max-depth)
+  "Return a comment-preserving CST for FILE as shape-locked JSON.
+
+FILE        Path to an `.el' source file (absolute, or relative to
+            `default-directory').
+POSITION    Optional 1-based point offset; when given, the innermost
+            named node enclosing POSITION is returned.  Omit to get
+            the whole `source_file' root.
+MAX-DEPTH   Optional recursion cap (integer or digit string); defaults
+            to `anvil-sexp-cst-read-max-depth'.
+
+Output shape:
+  {type, start, end, named, text?, children[], truncated}
+
+Typed errors (envelope = {type:\"error\", truncated:false,
+error:{kind, message}}):
+  sexp-cst/missing-file        — FILE is nil or empty
+  sexp-cst/file-not-found      — path does not resolve
+  sexp-cst/grammar-unavailable — tree-sitter-elisp not loadable
+
+MCP Parameters:
+  FILE        Required elisp source path
+  POSITION    Optional 1-based point offset
+  MAX-DEPTH   Optional recursion cap"
+  (anvil-server-with-error-handling
+   (cond
+    ((not (and file (stringp file) (not (string-empty-p file))))
+     (anvil-sexp-cst--encode-error
+      'error "sexp-cst/missing-file"
+      "FILE argument is required."))
+    ((not (file-exists-p file))
+     (anvil-sexp-cst--encode-error
+      'error "sexp-cst/file-not-found"
+      (format "No such file: %s" file)))
+    ((not (anvil-sexp-cst--grammar-usable-p))
+     (anvil-sexp-cst--encode-error
+      'error "sexp-cst/grammar-unavailable"
+      "tree-sitter-elisp grammar is not loadable in this Emacs session."))
+    (t
+     (let* ((pos (anvil-sexp-cst--coerce-int position nil))
+            (depth-cap (anvil-sexp-cst--coerce-int
+                        max-depth anvil-sexp-cst-read-max-depth)))
+       (with-temp-buffer
+         (insert-file-contents file)
+         (let* ((parser (treesit-parser-create 'elisp))
+                (root (treesit-parser-root-node parser))
+                (node (anvil-sexp-cst--pick-node parser root pos))
+                (plist (anvil-sexp-cst--node-to-plist node 0 depth-cap)))
+           (json-serialize plist :false-object :false :null-object :null))))))))
+
+
 ;;;; --- module lifecycle --------------------------------------------------
 
 (defun anvil-sexp-cst--abi-ready-p ()
@@ -787,13 +902,27 @@ case where anvil-state is not loaded.  Read-only."
    :description
    "Delete every inspect-object cursor stored for CLIENT-ID.  Returns the
 deletion count.  Intended for session-end cleanup so stale state rows do
-not accumulate across long-running daemons.  Write tool."))
+not accumulate across long-running daemons.  Write tool.")
+  (anvil-server-register-tool
+   #'anvil-sexp-cst-read
+   :id "sexp-cst-read"
+   :server-id anvil-sexp-cst--server-id
+   :description
+   "Parse FILE with tree-sitter-elisp and return a comment-preserving CST
+as JSON.  Output shape: {type, start, end, named, text?, children[],
+truncated}.  POSITION zooms to the smallest named node enclosing that
+point offset; omit for the whole file.  MAX-DEPTH caps recursion (deeper
+children are replaced with text + truncated=t).  Typed errors:
+sexp-cst/missing-file, sexp-cst/file-not-found, sexp-cst/grammar-unavailable.
+Read-only."
+   :read-only t))
 
 (defun anvil-sexp-cst--unregister-tools ()
   "Remove every sexp-cst-* MCP tool."
   (dolist (id '("sexp-cst-inspect-object"
                 "sexp-cst-inspect-object-drill"
-                "sexp-cst-inspect-object-purge"))
+                "sexp-cst-inspect-object-purge"
+                "sexp-cst-read"))
     (anvil-server-unregister-tool id anvil-sexp-cst--server-id)))
 
 ;;;###autoload

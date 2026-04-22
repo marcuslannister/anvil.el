@@ -137,8 +137,11 @@ These are not loaded by default.  Available modules:
                 adds `inspect-object-drill' (cursor resolution with
                 offset/limit pagination), 4 KB byte-cap enforcement,
                 char-table + EIEIO handlers, and `inspect-object-purge'
-                for session-end namespace cleanup (Doc 31, requires
-                Emacs 29+ for later CST phases)"
+                for session-end namespace cleanup.  Phase 2a ships
+                `sexp-cst-read' — comment-preserving CST of an elisp
+                file via tree-sitter-elisp grammar, with depth cap
+                and typed errors (Doc 31, requires Emacs 29+ and the
+                tree-sitter-elisp grammar for Phase 2 tools)"
   :type '(repeat symbol)
   :group 'anvil)
 
