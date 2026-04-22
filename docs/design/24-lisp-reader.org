@@ -1,0 +1,296 @@
+#+title: anvil-lisp-reader — Reader-Based Structural Edits for the Lisp Family
+#+date: 2026-04-20
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope GENERIC
+
+* STATUS
+  :PROPERTIES:
+  :ID:       019daf00-0000-7000-0000-lisp-reader-000
+  :END:
+~DRAFT~ (2026-04-20) → ~DEFERRED~ (2026-04-22) — Phase 1 only
+covers the shared core + CL locators yet still needs SBCL +
+~anvil-offload~-style subprocess pool + JSON bridge + per-dialect
+fixture suite (~15 ERT).  Multi-day scope, system-installed
+interpreter dependencies (SBCL / Guile / babashka), and no concrete
+demand from the maintainer's own workflow (electrical-engineering
++ org-mode + Elisp + Python — no CL / Scheme / Clojure surface).
+Revisit when one of the following triggers fires:
+
+1. r/emacs / HN feedback after anvil's Tier-1 OSS push surfaces
+   non-elisp Lisp users wanting structural locate / edit.
+2. The maintainer's own workflow grows a CL component (e.g.
+   electrical-engineering simulation in CL via cl-cmu).
+3. Doc 12 (anvil-sexp) sees enough adoption that the gap to
+   "all reader-native Lisps" becomes a recurring feature request.
+
+Until then this doc stays as the recorded design so the day-1
+implementation cost is the README dust-off, not a re-architecture.
+
+Extends the Doc 12 anvil-sexp pattern to Common Lisp, Scheme, and
+Clojure.  These are all reader-native languages; the host
+implementation's own ~read~ produces a perfect tree, and
+tree-sitter adds nothing — Doc 21's approach is the wrong vehicle
+for this family.
+
+* Why not tree-sitter
+
+Grammars exist (~tree-sitter-scheme~, ~tree-sitter-commonlisp~,
+~tree-sitter-clojure~).  But:
+
+1. *The reader is the source of truth.*  S-expressions round-trip
+   through ~read~ and ~prin1~ as native data.  A grammar built on
+   top is always an approximation of the reader; reader macros
+   (CL), hash-syntax (Scheme ~#;~ comments / ~#!~ directives),
+   tagged literals (Clojure ~#inst~) bend any static grammar into
+   failure modes the host reader handles transparently.
+2. *Live reflection is cheap.*  A CL process can tell us whether
+   ~foo~ is a function, a macro, or a variable at edit time —
+   tree-sitter can't.  The same ~(fboundp 'foo)~ / ~(functionp 'foo)~
+   argument Doc 12 made for elisp applies to CL / Scheme / Clojure.
+3. *Dialect fragmentation would multiply the tree-sitter cost.*
+   CL vs Scheme R5 vs R6 vs R7 vs Chicken / Racket / Chez
+   extensions; Clojure vs ClojureScript vs babashka.  Each grammar
+   is its own maintenance surface.  Spawning the dialect's own REPL
+   once per session externalises that burden to the language
+   implementations that already solve it.
+
+Doc 12's elisp path ran entirely in-process because elisp /is/ the
+host language.  Doc 24 runs a separate REPL per dialect.  The
+tradeoff is one subprocess round-trip per parse, which for Phase 1
+locate operations is cheap relative to the round-trip Claude Code
+/ MCP caller already does.
+
+* Goals
+
+1. Read-only structural locators for the three dialects: list
+   top-level forms (~defun~ / ~define~ / ~defmacro~ / ~deftype~ /
+   ~defprotocol~ / ~defrecord~ / ~ns~ / ~in-package~), list function
+   / macro definitions, find call sites (best-effort, no macro
+   expansion).
+2. Rename / replace at the identifier level with reader-aware
+   comment / string exclusion.
+3. Reuse the Doc 12 preview / apply plan shape so callers compose
+   anvil-sexp and this module interchangeably.
+4. One MCP surface per dialect: ~cl-*~, ~scheme-*~, ~clj-*~.  The
+   shared infrastructure (REPL pool, parse-to-plist serializer, edit
+   plan) sits in ~anvil-lisp-reader.el~.
+
+* Non-goals
+
+- Macro-expanded rename (CL's ~defmacro~, Scheme ~syntax-rules~ /
+  ~syntax-case~, Clojure ~macroexpand~).  Best-effort only.  The
+  compiler knows more; we expose what the reader reveals.
+- Refactoring that needs whole-program analysis (dead-code
+  elimination, type-directed renames).  Out of scope; callers that
+  need this should use SLIME / Geiser / CIDER.
+- Clojure tooling-registry integration (nREPL middleware, tools.deps
+  path).  ~clj-kondo~ and ~clojure-lsp~ already do this.  We do NOT
+  replace them; we give AI a cheaper locate / edit path for cases
+  where starting an nREPL is overkill.
+- Common Lisp package gymnastics.  We expose ~in-package~ and
+  ~:export~ metadata; we do not manage export lists or do symbol
+  resolution across packages beyond what the reader says.
+
+* Architecture
+
+** REPL-per-dialect
+
+Each dialect gets a long-lived subprocess:
+
+- CL:       ~sbcl --non-interactive --noinform --disable-debugger~
+- Scheme:   ~guile --no-auto-compile~ or ~racket -e '(void)'~
+            (configurable)
+- Clojure:  ~clojure -M -e '(loop [x (read)] ...)'~ or ~babashka~
+            (babashka is preferred for cold-start speed)
+
+Spawned via ~make-process~, kept warm in ~anvil-lisp-reader--pool~.
+Same lifecycle story as ~anvil-offload~ (Doc 03 pipe REPL): the
+first call pays the cold-start cost, subsequent calls are
+sub-second.
+
+** Parse protocol
+
+Elisp sends the source file path plus an operation keyword.  The
+REPL reads the file with its own ~read~, maps over the resulting
+tree, and emits a machine-parseable report on stdout: either an
+s-expression (native to the REPL) or JSON (forced via the
+per-dialect helper installed at REPL start).  JSON is preferred —
+elisp's ~json-parse-string~ is cheap and avoids re-entering the
+elisp reader on trees that may contain dialect-specific atoms
+(Clojure keywords, Scheme symbols with reserved characters).
+
+Report shape:
+
+#+begin_src elisp
+  (:dialect "cl" / "scheme" / "clojure"
+   :file PATH
+   :forms ((:kind defun :name "foo" :start LINE :end LINE
+            :arity-min N :arity-max N :docstring-head STR)
+           ...)
+   :errors ((:kind reader-error :line N :message STR) ...))
+#+end_src
+
+** Edit model
+
+Same as Doc 12 anvil-sexp: byte-range replacement plans served
+through ~file-batch-across~ on apply.  Reader-aware exclusion is
+enforced by the REPL (the dialect's own reader knows what is a
+string / comment / reader-macro sub-form); elisp just trusts the
+byte ranges returned.
+
+** Shared core
+
+- ~anvil-lisp-reader.el~ — REPL pool, JSON bridge, parse-plist
+  serializer, edit-plan infrastructure.
+- ~anvil-cl.el~ — CL queries (defun, defmacro, defgeneric, defclass,
+  defmethod, defstruct, defvar / defparameter / defconstant,
+  in-package).
+- ~anvil-scheme.el~ — Scheme queries (define, define-syntax,
+  define-record-type, module / library forms — R6 / R7 variants).
+- ~anvil-clojure.el~ — Clojure queries (defn, defmacro, defprotocol,
+  defrecord, deftype, ns, def, reify).  Handles ~.clj~ / ~.cljs~ /
+  ~.cljc~ by routing to the appropriate REPL.
+
+Each dialect module registers its MCP tools through the same entry
+point as Doc 21's ~anvil-treesit.el~ for UX consistency.
+
+* Public API (Phase 1 draft)
+
+#+begin_src elisp
+  (anvil-cl-list-functions FILE)
+  (anvil-cl-list-macros FILE)
+  (anvil-cl-list-classes FILE)
+  (anvil-cl-list-packages FILE)
+  (anvil-cl-find-definition FILE NAME)
+
+  (anvil-scheme-list-definitions FILE)
+  (anvil-scheme-list-syntax-forms FILE)
+  (anvil-scheme-find-definition FILE NAME)
+
+  (anvil-clojure-list-defns FILE)
+  (anvil-clojure-list-macros FILE)
+  (anvil-clojure-list-protocols FILE)
+  (anvil-clojure-list-ns FILE)
+  (anvil-clojure-find-definition FILE NAME)
+#+end_src
+
+~anvil-*-surrounding-form~ matches Doc 12's shape: "nearest
+enclosing top-level form at POINT".
+
+* Public MCP tools
+
+| id                          | phase | dialect | args            | returns   | notes            |
+|-----------------------------+-------+---------+-----------------+-----------+------------------|
+| ~cl-list-functions~         |     1 | cl      | file            | list      | read-only        |
+| ~cl-list-macros~            |     1 | cl      | file            | list      | read-only        |
+| ~cl-list-classes~           |     1 | cl      | file            | list      | CLOS, read-only  |
+| ~cl-list-packages~          |     1 | cl      | file            | list      | in-package etc.  |
+| ~cl-find-definition~        |     1 | cl      | file, name      | form      | read-only        |
+| ~scheme-list-definitions~   |     1 | scheme  | file            | list      | read-only        |
+| ~scheme-list-syntax-forms~  |     1 | scheme  | file            | list      | define-syntax    |
+| ~scheme-find-definition~    |     1 | scheme  | file, name      | form      | read-only        |
+| ~clj-list-defns~            |     1 | clojure | file            | list      | read-only        |
+| ~clj-list-macros~           |     1 | clojure | file            | list      | defmacro         |
+| ~clj-list-protocols~        |     1 | clojure | file            | list      | read-only        |
+| ~clj-list-ns~               |     1 | clojure | file            | list      | ns forms         |
+| ~clj-find-definition~       |     1 | clojure | file, name      | form      | read-only        |
+| ~cl-replace-defun~          |     2 | cl      | file, name, new | plan      | preview default  |
+| ~cl-rename-symbol~          |     2 | cl      | old, new, scope | plan      | kinds filter     |
+| ~scheme-replace-define~     |     2 | scheme  | file, name, new | plan      |                  |
+| ~scheme-rename-symbol~      |     2 | scheme  | old, new, scope | plan      |                  |
+| ~clj-replace-defn~          |     2 | clojure | file, name, new | plan      |                  |
+| ~clj-rename-symbol~         |     2 | clojure | old, new, scope | plan      |                  |
+
+* Phases
+
+** Phase 1 — shared core + CL locators
+
+- ~anvil-lisp-reader.el~: REPL pool, JSON bridge helper scripts for
+  each dialect (dropped to a known location at daemon start via
+  ~anvil-state~-managed scratch dir).
+- ~anvil-cl.el~: CL Phase 1 locators.  SBCL is the default interpreter.
+- ERT 15+ tests against golden CL fixtures.  Smoke test: bootstrap
+  SBCL once, parse a 500-line CL file with ~defun~ /  ~defmacro~ /
+  ~defclass~ / ~defmethod~.
+- *Ship criterion*: ~cl-list-functions~ returns the expected names
+  for the fixture; SBCL cold-start is paid once per daemon session.
+
+** Phase 2 — Scheme + Clojure
+
+- ~anvil-scheme.el~ using Guile (~guile~) by default, Racket
+  (~racket~) as opt-in.
+- ~anvil-clojure.el~ using babashka (~bb~) by default, Clojure CLI
+  (~clojure~) as opt-in.
+- ERT +10 per dialect.
+- *Ship criterion*: parse-locate round-trip for each dialect
+  against fixture files; cold-start < 2 s for babashka and Guile.
+
+** Phase 3 — structural edits (rename-symbol + replace-defun)
+
+- Same shape as Doc 12 anvil-sexp Phase 2a / 2b.
+- The REPL handles reader-aware comment / string exclusion; elisp
+  just consumes byte ranges.
+- ERT +15 total across dialects.
+
+** Phase 4 — optional: macro-expand helpers
+
+- ~cl-macroexpand~ / ~scheme-macroexpand~ / ~clj-macroexpand~ tools
+  that invoke the REPL's own macroexpander and return the expansion
+  plus diagnostics.  Read-only; no apply.
+- Deferred decision on whether this merges into a tool category
+  shared with Doc 12's ~sexp-macroexpand~.
+
+* Testing strategy
+
+- Fixture per dialect under ~tests/fixtures/cl-sample/~,
+  ~tests/fixtures/scheme-sample/~, ~tests/fixtures/clj-sample/~.
+  Kept minimal — 1–2 files per dialect exercising the Phase 1
+  kinds.
+- Integration fixture per dialect: a public library pinned to a
+  known tag (alexandria for CL, SRFI-1 for Scheme, clojure.core
+  excerpt for Clojure).  Round-trip test: list → reparse → assert
+  stable.
+- Soak test (opt-in via ~ANVIL_SOAK=1~): parse a large real file
+  per dialect (~5000 LOC) and assert no memory growth across 100
+  invocations.
+
+* Platform notes
+
+- *Windows:* SBCL / Racket / babashka all ship native binaries.
+  ~anvil-host--run~'s pipe fix (issue #10 resolution) means
+  disowned / detached REPL children survive in the same
+  fashion as any other subprocess helper.
+- *macOS:* gatekeeper on first invocation of the downloaded
+  interpreter — documented in install notes.
+- *Linux:* no special handling.
+- Grammar install step from Doc 21 does NOT apply here —
+  interpreters are the "grammar".  Users install SBCL / Racket /
+  babashka via their OS package manager, same as any other
+  language runtime.
+
+* Out of scope / future
+
+- *Typed variants:* Coalton (CL), Typed Racket, Typed Clojure.
+  The reader still produces a parse tree; type-aware rename is
+  deferred.
+- *Persistent symbol index* akin to Doc 11 (anvil-defs) for each
+  dialect.  Value is real but bigger than Phase 1-3; revisit when
+  Phase 3 is in production.
+- *Inline / extract operations* (Doc 12 Phase 3).  Same reason —
+  layer once the base ships.
+- *Fennel / Janet / Hy / LFE / Joker.*  All reader-native, but the
+  interpreter / REPL bootstrapping cost doesn't justify a Phase 1
+  commitment without demand data.  Each can extend Doc 24 once
+  r/emacs feedback surfaces real users.
+
+* References
+
+- Doc 12 (~12-sexp-edits.org~): elisp reader-based pattern; Doc 24
+  is its non-elisp-Lisp counterpart.
+- Doc 21 (~21-treesit-edits.org~): tree-sitter pattern for
+  brace-keyword languages; explicitly excludes Lisp-family.
+- Doc 03 (~03-offload-framework.org~): pipe REPL pool pattern
+  reused here for the per-dialect interpreter.
+- Doc 11 (~11-defs-index.org~): symbol-index pattern a future
+  Phase could replicate per dialect.

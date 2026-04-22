@@ -1057,22 +1057,51 @@ MCP Parameters:
                                           (string-to-number start-line)
                                           (string-to-number end-line)))))
 
+(defun anvil-file--read-normalize-uri-args (path offset limit)
+  "Return (PATH OFFSET LIMIT) with `file://' citation URI expanded.
+When PATH is a `file://PATH[#L<s>[-<e>]]' URI the scheme is stripped,
+and if the URI carries a line range it seeds OFFSET (start-1) and
+LIMIT (end-start+1) when the caller did not supply explicit values."
+  (if (and (stringp path) (string-prefix-p "file://" path))
+      (let* ((parsed (and (fboundp 'anvil-uri-parse)
+                          (anvil-uri-parse path))))
+        (if parsed
+            (let* ((p  (plist-get parsed :path))
+                   (s  (plist-get parsed :line-start))
+                   (e  (plist-get parsed :line-end))
+                   (o  (or offset
+                           (and s (number-to-string (max 0 (1- s))))))
+                   (l  (or limit
+                           (and s e
+                                (number-to-string
+                                 (max 1 (1+ (- e s))))))))
+              (list p o l))
+          ;; Fallback: naive prefix strip.
+          (list (substring path (length "file://")) offset limit)))
+    (list path offset limit)))
+
 (defun anvil-file--tool-read (path &optional offset limit)
   "Read file at PATH and return its content.
-Supports optional line-based pagination.
+Supports optional line-based pagination.  PATH may also be a
+`file://PATH[#L<s>-<e>]' citation URI emitted by the disclosure
+Layer-1 / Layer-2 tools; the embedded line range seeds offset/limit
+when the caller did not supply them.
 
 MCP Parameters:
-  path - Absolute path to the file to read
+  path - Absolute path to the file to read (or `file://' citation URI)
   offset - Lines to skip from start (optional, 0-indexed, e.g. \"100\")
   limit - Maximum lines to return (optional, e.g. \"50\")"
   (anvil-server-with-error-handling
-    (let ((off (if (and offset (not (string-empty-p offset)))
-                   (string-to-number offset)
-                 nil))
-          (lim (if (and limit (not (string-empty-p limit)))
-                   (string-to-number limit)
-                 nil)))
-      (format "%S" (anvil-file-read path off lim)))))
+    (require 'anvil-uri nil t)
+    (pcase-let ((`(,p ,off-str ,lim-str)
+                 (anvil-file--read-normalize-uri-args path offset limit)))
+      (let ((off (if (and off-str (not (string-empty-p off-str)))
+                     (string-to-number off-str)
+                   nil))
+            (lim (if (and lim-str (not (string-empty-p lim-str)))
+                     (string-to-number lim-str)
+                   nil)))
+        (format "%S" (anvil-file-read p off lim))))))
 
 (defun anvil-file--tool-append (path content)
   "Append CONTENT to end of file at PATH.
@@ -2258,6 +2287,8 @@ avoiding shell + elisp-reader double-escaping of backslashes."
   (anvil-server-register-tool
    #'anvil-file--tool-replace-string
    :id "file-replace-string"
+   :intent '(file-edit)
+   :layer 'core
    :description
    "Replace literal text in a file.  Operates on the raw file via
 temp-buffer + write-region (no mount-layer issues on Windows).
@@ -2268,6 +2299,8 @@ Pass max-count \"1\" to assert exactly one match."
   (anvil-server-register-tool
    #'anvil-file--tool-replace-regexp
    :id "file-replace-regexp"
+   :intent '(file-edit)
+   :layer 'core
    :description
    "Replace regexp matches in a file.  The replacement string may use
 \\\\1 \\\\2 for capture groups.  Errors if no match found.
@@ -2277,6 +2310,8 @@ Safe for files over 1.2MB."
   (anvil-server-register-tool
    #'anvil-file--tool-insert-at-line
    :id "file-insert-at-line"
+   :intent '(file-edit)
+   :layer 'core
    :description
    "Insert text at a specific line number in a file (1-indexed).
 Line 1 inserts before the first line.  Safe for files over 1.2MB."
@@ -2285,6 +2320,8 @@ Line 1 inserts before the first line.  Safe for files over 1.2MB."
   (anvil-server-register-tool
    #'anvil-file--tool-delete-lines
    :id "file-delete-lines"
+   :intent '(file-edit)
+   :layer 'core
    :description
    "Delete a range of lines (inclusive, 1-indexed) from a file.
 Safe for files over 1.2MB."
@@ -2293,16 +2330,25 @@ Safe for files over 1.2MB."
   (anvil-server-register-tool
    #'anvil-file--tool-read
    :id "file-read"
+   :intent '(file-read structure)
+   :layer 'core
    :description
-   "Read file contents with optional line-based pagination.
-Returns the file content as a string.  For large files, use offset
-and limit to read specific sections."
+   "Layer 3 of anvil progressive disclosure (see `disclosure-help').
+Read file contents with optional line-based pagination.  Accepts
+either a plain absolute path or a `file://PATH[#L<start>[-<end>]]'
+citation URI emitted by Layer 1 (`file-outline') / Layer 2
+(`file-read-snippet') — the URI's line range becomes the default
+offset/limit.  Returns the file content as a string.  For large
+files, use `file-read-snippet' (Layer 2) or pass offset/limit to
+read specific sections."
    :read-only t
    :server-id anvil-file--server-id)
 
   (anvil-server-register-tool
    #'anvil-file--tool-append
    :id "file-append"
+   :intent '(file-edit)
+   :layer 'core
    :description
    "Append text to the end of a file.  A leading newline is added
 if the file does not end with one.  Safe for files over 1.2MB."
@@ -2311,6 +2357,8 @@ if the file does not end with one.  Safe for files over 1.2MB."
   (anvil-server-register-tool
    #'anvil-file--tool-batch
    :id "file-batch"
+   :intent '(file-edit batch)
+   :layer 'core
    :description
    "Execute multiple file operations in a single call.  Most token-efficient
 way to perform bulk edits: N operations in 1 round trip instead of N calls.
@@ -2323,6 +2371,8 @@ once atomically at the end.  Safe for files over 1.2MB."
   (anvil-server-register-tool
    #'anvil-file--tool-json-object-add
    :id "json-object-add"
+   :intent '(json-edit config)
+   :layer 'core
    :description
    "Add key-value pairs to a top-level JSON object while preserving
 existing formatting.  Designed for i18n dictionaries and config files
@@ -2339,6 +2389,8 @@ file-insert-at-line."
   (anvil-server-register-tool
    #'anvil-file--tool-ensure-import
    :id "file-ensure-import"
+   :intent '(file-edit)
+   :layer 'core
    :description
    "Idempotently ensure an import (or any header) line exists in a file.
 If the line already appears verbatim, returns already-present without
@@ -2351,6 +2403,8 @@ Position can be overridden: \"after-last-match\" (default),
   (anvil-server-register-tool
    #'anvil-file--tool-batch-across
    :id "file-batch-across"
+   :intent '(file-edit batch)
+   :layer 'core
    :description
    "Apply anvil-file-batch to multiple files in a single MCP call.
 The argument is a JSON array where each element has a path and an
@@ -2363,12 +2417,17 @@ coordinated multi-file refactors."
   (anvil-server-register-tool
    #'anvil-file--tool-outline
    :id "file-outline"
+   :intent '(file-read structure)
+   :layer 'core
    :description
-   "Return a compact structural outline of a file without reading
-its body.  Infers format from extension (.el / .org / .md) or accepts
-a format= override.  Emits (:kind :name :line) entries for Elisp
-def-forms, org headlines, or Markdown headings.  Use this to orient
-in large files before deciding what to Read."
+   "Layer 1 of anvil progressive disclosure (see `disclosure-help').
+Return a compact structural outline of a file without reading its
+body.  Infers format from extension (.el / .org / .md) or accepts a
+format= override.  Emits (:kind :name :line) entries for Elisp
+def-forms, org headlines, or Markdown headings.  Use this FIRST
+to orient in large files before deciding whether to escalate to
+Layer 2 (`file-read-snippet') or Layer 3 (`file-read').  Tool
+descriptions and disclosure-help cover the full contract."
    :read-only t
    :offload t
    :server-id anvil-file--server-id)
@@ -2376,6 +2435,8 @@ in large files before deciding what to Read."
   (anvil-server-register-tool
    #'anvil-file--tool-code-extract-pattern
    :id "code-extract-pattern"
+   :intent '(code-bulk-edit)
+   :layer 'core
    :description
    "Extract repeating structured records from a file using regexp patterns.
 For each match of `block-start' the tool finds the block's body via
@@ -2392,6 +2453,8 @@ the entire file would be wasteful.  Brace-balance skips strings."
   (anvil-server-register-tool
    #'anvil-file--tool-code-add-field-by-map
    :id "code-add-field-by-map"
+   :intent '(code-bulk-edit)
+   :layer 'core
    :description
    "Add a field to TS/JS object literals by mapping from another field's value.
 For each occurrence of `LOOKUP-KEY: \"VALUE\"' inside a single-line `{...}'

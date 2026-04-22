@@ -2,12 +2,28 @@
 #+date: 2026-04-19
 #+author: zawatton
 #+property: status DRAFT
+#+property: scope WINDOWS-ONLY
 
 * STATUS
   :PROPERTIES:
   :ID:       3ce1c404-1907-4091-92b1-35420ffa5906
   :END:
-~DRAFT~ (2026-04-19)
+~DRAFT~ (2026-04-19) → ~DEFERRED~ (2026-04-22) — Windows-only
+scope.  Doc 20 adds bidirectional raw-mode TTY + xterm decoder +
+session detach/attach over the existing TCP broker; substantial
+implementation surface.  Working alternative already in production
+per memory =reference_eat_claude_ssh_tt_solution.md~: native
+Windows OpenSSH server (port 2222) + ~ssh -tt~ + key auth gives
+fully interactive claude / vim / TUI.  The maintainer's primary
+workflow is Linux native; Windows is the secondary host where
+Linux-via-SSH covers the gap.  Re-trigger criteria:
+
+1. The OpenSSH-based solution breaks on a future Windows update
+   and fails to recover after a reasonable workaround attempt.
+2. The maintainer fully migrates to Windows native and the
+   ssh hop friction becomes a daily-cost issue.
+3. An external Windows-only user requests anvil for native TUI
+   work where SSH is unavailable (corporate restrictions etc.).
 
 Tier 3 of Week-2 roadmap.  Extends the shipped Phase 1 broker (memory:
 =project_anvil_pty_broker_phase1.md~) with interactive TUI semantics

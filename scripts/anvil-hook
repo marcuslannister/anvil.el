@@ -1,0 +1,77 @@
+#!/bin/sh
+# anvil-hook — Claude Code lifecycle hook wrapper for anvil-session (Doc 17).
+#
+# Usage:
+#   anvil-hook EVENT [ARG1 [ARG2 [ARG3 …]]]
+#
+# Events (see `anvil-session-hook-dispatch' docstring for the full
+# contract):
+#   pre-compact     SESSION-ID [TASK-SUMMARY]
+#   session-start   SESSION-ID
+#   post-tool-use   SESSION-ID TOOL-NAME [SUMMARY]
+#   user-prompt     SESSION-ID PROMPT-EXCERPT
+#   session-end     SESSION-ID
+#
+# Forwards every call to `emacsclient -e' so the running Emacs
+# daemon (where anvil lives) performs the snapshot / event-log
+# work.  On `session-start' the returned preamble string is
+# unquoted + unescaped before printing so Claude Code sees raw
+# prose rather than elisp-syntax `"…"'.
+#
+# Environment:
+#   ANVIL_EMACSCLIENT  override the emacsclient binary (default
+#                      `emacsclient').  Useful when multiple
+#                      Emacs versions are on PATH.
+#
+# Exit status: forwards emacsclient's exit code.  Emacs errors
+# surface as non-zero so Claude Code's hook framework can decide
+# how to surface the failure.
+
+set -eu
+
+event="${1-}"
+if [ -z "$event" ]; then
+  echo 'anvil-hook: EVENT argument required' >&2
+  exit 2
+fi
+shift
+
+emacsclient="${ANVIL_EMACSCLIENT:-emacsclient}"
+
+# Build the trailing " \"a1\" \"a2\" …" fragment for the elisp call.
+# Escape backslashes and double-quotes so anything Claude Code
+# passes through (prompts, tool names with spaces) lands inside
+# an elisp string literal unmolested.
+args=""
+for a in "$@"; do
+  # shellcheck disable=SC2039
+  esc=$(printf '%s' "$a" | sed -e 's/\\/\\\\\\\\/g' -e 's/"/\\\\"/g')
+  args="$args \"$esc\""
+done
+
+out=$("$emacsclient" -e "(anvil-session-hook-dispatch '$event$args)" 2>&1) || {
+  status=$?
+  printf '%s\n' "$out" >&2
+  exit "$status"
+}
+
+# emacsclient -e prints `prin1' of the dispatch return value.
+# For `session-start' the value is a plain string — unwrap so the
+# stdout the Claude Code hook receives is literal preamble text,
+# not elisp-syntax with surrounding quotes.
+first=$(printf '%s' "$out" | cut -c1)
+last=$(printf '%s' "$out" | awk '{
+  n = length($0);
+  if (n > 0) {
+    printf "%s", substr($0, n, 1);
+  }
+}')
+
+if [ "$first" = '"' ] && [ "$last" = '"' ]; then
+  inner=${out#\"}
+  inner=${inner%\"}
+  # Unescape \n, \", \\ — matches Emacs' prin1 output for strings.
+  printf '%b' "$inner"
+else
+  printf '%s' "$out"
+fi

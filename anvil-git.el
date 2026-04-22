@@ -25,12 +25,59 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'json)
 (require 'subr-x)
 (require 'anvil-host)
 (require 'anvil-server)
 
 (defconst anvil-git--server-id "emacs-eval"
   "MCP server id that git-* tools register under.")
+
+;;;; --- MCP serialization --------------------------------------------------
+;;
+;; All git helpers return elisp-native shapes (strings, plists, lists of
+;; plists, keywords like :null / :empty-array).  anvil-server requires
+;; tool handlers to return `string' or `nil' — anything else trips
+;; `Tool handler must return string or nil'.  The small encoder below
+;; converts our shapes to JSON, keeping :null / :empty-array sentinels
+;; semantically meaningful (→ JSON null / empty array respectively).
+
+(defun anvil-git--plist-p (x)
+  "Return non-nil when X looks like a plist (keyword head)."
+  (and (listp x) (keywordp (car-safe x))))
+
+(defun anvil-git--to-json-value (x)
+  "Recursively convert X into a shape `json-encode' renders sensibly.
+Plists become alists with symbol keys (leading colon stripped).
+Plain lists (non-plist) become vectors so they emit as JSON arrays.
+The sentinels :null and :empty-array map to nil / empty vector."
+  (cond
+   ((eq x :null) nil)
+   ((eq x :empty-array) (vector))
+   ((or (null x) (eq x t) (numberp x) (stringp x)) x)
+   ((keywordp x) (substring (symbol-name x) 1))
+   ((symbolp x) (symbol-name x))
+   ((vectorp x)
+    (vconcat (mapcar #'anvil-git--to-json-value x)))
+   ((anvil-git--plist-p x)
+    (cl-loop for (k v) on x by #'cddr
+             collect (cons (intern (substring (symbol-name k) 1))
+                           (anvil-git--to-json-value v))))
+   ((and (consp x) (not (proper-list-p x)))
+    ;; Dotted pair — emit as [car, cdr] to survive improper-list mapcar.
+    (vector (anvil-git--to-json-value (car x))
+            (anvil-git--to-json-value (cdr x))))
+   ((listp x)
+    (vconcat (mapcar #'anvil-git--to-json-value x)))
+   (t (format "%S" x))))
+
+(defun anvil-git--mcp-encode (value)
+  "Encode VALUE as a JSON string for MCP return.
+Strings and nil pass through — both are valid direct returns."
+  (cond
+   ((null value) nil)
+   ((stringp value) value)
+   (t (json-encode (anvil-git--to-json-value value)))))
 
 ;;;; --- internal: shell wrapper --------------------------------------------
 
@@ -419,7 +466,7 @@ Keys: :ref (commit-ish to check out, default \"HEAD\"),
 MCP Parameters:
   path - Directory or file path inside the repo."
   (anvil-server-with-error-handling
-   (or (anvil-git-repo-root path) :null)))
+   (or (anvil-git-repo-root path) "null")))
 
 (defun anvil-git--tool-head-sha (path &optional short)
   "Return HEAD SHA for the repo containing PATH.
@@ -429,7 +476,7 @@ MCP Parameters:
   short - Truthy → return the abbreviated SHA."
   (anvil-server-with-error-handling
    (or (anvil-git-head-sha path (and short (not (equal short ""))))
-       :null)))
+       "null")))
 
 (defun anvil-git--tool-branch-current (path)
   "Return the current branch for PATH, or nil when detached.
@@ -437,7 +484,7 @@ MCP Parameters:
 MCP Parameters:
   path - Directory inside the repo."
   (anvil-server-with-error-handling
-   (or (anvil-git-branch-current path) :null)))
+   (or (anvil-git-branch-current path) "null")))
 
 (defun anvil-git--tool-log (path &optional limit)
   "Return recent commits for repo at PATH.
@@ -451,7 +498,7 @@ MCP Parameters:
                         (string-match "\\`[0-9]+\\'" limit))
                    (string-to-number limit))
                   (t nil))))
-     (or (anvil-git-log path n) :empty-array))))
+     (or (anvil-git-log path n) "[]"))))
 
 (defun anvil-git--tool-diff-names (path &optional from to)
   "Return changed paths between FROM and TO in repo at PATH.
@@ -463,7 +510,7 @@ MCP Parameters:
   (anvil-server-with-error-handling
    (let ((f  (and (stringp from) (not (string-empty-p from)) from))
          (t* (and (stringp to)   (not (string-empty-p to))   to)))
-     (or (anvil-git-diff-names path f t*) :empty-array))))
+     (or (anvil-git-diff-names path f t*) "[]"))))
 
 (defun anvil-git--tool-diff-stats (path &optional rev)
   "Return structured diff counts for repo at PATH.
@@ -471,17 +518,19 @@ MCP Parameters:
 MCP Parameters:
   path - Directory inside the repo.
   rev  - Optional revision (e.g. \"HEAD~1\" or \"main..HEAD\")."
-  (anvil-server-with-error-handling
-   (let ((r (and (stringp rev) (not (string-empty-p rev)) rev)))
-     (anvil-git-diff-stats path r))))
+  (anvil-git--mcp-encode
+   (anvil-server-with-error-handling
+    (let ((r (and (stringp rev) (not (string-empty-p rev)) rev)))
+      (anvil-git-diff-stats path r)))))
 
 (defun anvil-git--tool-status (path)
   "Return porcelain status + branch info for repo at PATH.
 
 MCP Parameters:
   path - Directory inside the repo."
-  (anvil-server-with-error-handling
-   (anvil-git-status path)))
+  (anvil-git--mcp-encode
+   (anvil-server-with-error-handling
+    (anvil-git-status path))))
 
 (defun anvil-git--tool-worktree-list (path)
   "Return attached worktrees for repo at PATH.
@@ -489,15 +538,17 @@ MCP Parameters:
 MCP Parameters:
   path - Directory inside the repo."
   (anvil-server-with-error-handling
-   (or (anvil-git-worktree-list path) :empty-array)))
+   (or (anvil-git-worktree-list path) "[]")))
 
 ;;;; --- module lifecycle ---------------------------------------------------
 
 (defun anvil-git--register-tools ()
   "Register git-* MCP tools under `anvil-git--server-id'."
   (anvil-server-register-tool
-   #'anvil-git--tool-repo-root
+   (anvil-server-encode-handler #'anvil-git--tool-repo-root)
    :id "git-repo-root"
+   :intent '(git read)
+   :layer 'workflow
    :server-id anvil-git--server-id
    :description
    "Return the git top-level directory for PATH, or nil when PATH is
@@ -505,8 +556,10 @@ not inside a repository."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-git--tool-head-sha
+   (anvil-server-encode-handler #'anvil-git--tool-head-sha)
    :id "git-head-sha"
+   :intent '(git read)
+   :layer 'workflow
    :server-id anvil-git--server-id
    :description
    "Return the HEAD commit SHA for the repo containing PATH.  Pass
@@ -514,16 +567,20 @@ short=1 for the abbreviated form."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-git--tool-branch-current
+   (anvil-server-encode-handler #'anvil-git--tool-branch-current)
    :id "git-branch-current"
+   :intent '(git read)
+   :layer 'workflow
    :server-id anvil-git--server-id
    :description
    "Return the current branch name, or nil when HEAD is detached."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-git--tool-log
+   (anvil-server-encode-handler #'anvil-git--tool-log)
    :id "git-log"
+   :intent '(git read)
+   :layer 'workflow
    :server-id anvil-git--server-id
    :description
    "Return recent commits as (hash, date, author, subject) plists.
@@ -531,8 +588,10 @@ limit defaults to 20."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-git--tool-diff-names
+   (anvil-server-encode-handler #'anvil-git--tool-diff-names)
    :id "git-diff-names"
+   :intent '(git read)
+   :layer 'workflow
    :server-id anvil-git--server-id
    :description
    "Return the paths differing between FROM and TO (defaults
@@ -540,8 +599,10 @@ unstaged-vs-HEAD)."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-git--tool-diff-stats
+   (anvil-server-encode-handler #'anvil-git--tool-diff-stats)
    :id "git-diff-stats"
+   :intent '(git read)
+   :layer 'workflow
    :server-id anvil-git--server-id
    :description
    "Return structured diff counts (files, insertions, deletions)
@@ -549,8 +610,10 @@ for REV or unstaged-vs-HEAD."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-git--tool-status
+   (anvil-server-encode-handler #'anvil-git--tool-status)
    :id "git-status"
+   :intent '(git read)
+   :layer 'workflow
    :server-id anvil-git--server-id
    :description
    "Return porcelain status + branch/upstream/ahead/behind counts
@@ -558,8 +621,10 @@ as one plist.  Buckets: staged / modified / untracked / unmerged."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-git--tool-worktree-list
+   (anvil-server-encode-handler #'anvil-git--tool-worktree-list)
    :id "git-worktree-list"
+   :intent '(git read)
+   :layer 'workflow
    :server-id anvil-git--server-id
    :description
    "Return attached git worktrees as plists (path, head, branch,

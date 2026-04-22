@@ -4,7 +4,7 @@
 
 ;; Author: zawatton
 ;; Keywords: comm, tools, ai, mcp
-;; Version: 0.3.1
+;; Version: 0.4.0
 ;; Package-Requires: ((emacs "28.2"))
 ;; URL: https://github.com/zawatton21/anvil.el
 
@@ -77,6 +77,9 @@ These are not loaded by default.  Available modules:
 - `cron'   — Scheduled task runner with worker dispatch
 - `sqlite'    — Read-only SQLite query tool (requires Emacs 29+)
 - `elisp'     — Elisp development tools: ERT runner, byte-compile, describe
+- `sexp'      — Reader-based structural edits for elisp: sexp-read-file,
+                sexp-surrounding-form, sexp-replace-defun, sexp-wrap-form,
+                sexp-macroexpand, sexp-verify (Doc 12 Phase 1)
 - `org-index' — Persistent SQLite index of org files (requires Emacs 29+)
 - `buffer'    — Explicit buffer-* MCP tools (read/save/list-modified)
 - `dev'       — Developer helpers: `anvil-self-sync-check' for dev/installed
@@ -89,6 +92,15 @@ These are not loaded by default.  Available modules:
 - `state'     — Persistent SQLite-backed KV store shared across modules
                 (ns / TTL / Lisp prin1 values, requires Emacs 29+,
                 Doc 08 Phase 1)
+- `session'   — Session snapshot / resume + Claude Code lifecycle
+                hook dispatch.  `session-snapshot' captures branch
+                + task-summary + notes into anvil-state ns=session
+                (TTL 14d) and returns a `preamble-suggested' resume
+                block; `session-resume' / -list / -delete round out
+                the primitive set.  Phase 3 hooks (PreCompact,
+                SessionStart, PostToolUse, UserPromptSubmit,
+                SessionEnd) and the anvil-hook install command ship
+                under the same module (Doc 17, requires `state')
 - `http'      — HTTP client via `url-retrieve-synchronously' with a
                 state-backed ETag/TTL cache (Doc 09 Phase 1a)
 - `orchestrator' — Parallel AI CLI dispatcher (claude today, more
@@ -97,8 +109,127 @@ These are not loaded by default.  Available modules:
                    tabulated-list dashboard (Doc 10 Phase 1a)
 - `pty-broker' — node-pty TCP broker for TUI programs; moves PTY
                  handling out of the Emacs daemon to avoid filter
-                 starvation / ConPTY stdin quirks (Doc 04 Phase 1,
-                 requires node + `npm install node-pty')"
+                 starvation / ConPTY stdin quirks.  Phase 2b adds
+                 `pty-read-filtered' — streaming read that routes
+                 pty output through a named shell-filter handler
+                 (docker-logs / pytest / …) with a per-pty tail
+                 cursor so consecutive calls see only new bytes.
+                 Soft-deps on `shell-filter'; raw text is returned
+                 when the filter module is not loaded (Doc 04
+                 Phase 1 + Doc 27 Phase 2b, requires node +
+                 `npm install node-pty')
+- `defs'      — SQLite-backed elisp symbol index (defs, refs,
+                requires/provides) with defs-search /
+                defs-references / defs-signature etc.
+                (Doc 11 Phase 1+2, requires Emacs 29+)
+- `bisect'    — Test-driven git bisect that pins a failing ERT
+                test to the introducing commit via worktree-
+                isolated emacs --batch steps (Doc 13 Phase 1)
+- `treesit'   — Tree-sitter shared core for per-language structural
+                editing modules (Doc 21).  Registers no tools
+                itself; language modules depend on it.
+- `py'        — Python read-only structural locators: py-list-imports
+                / py-list-functions / py-list-classes / py-list-methods
+                / py-list-decorators / py-find-definition /
+                py-surrounding-form.  Requires Emacs 29+ treesit and
+                tree-sitter-python grammar (Doc 21 Phase 1a)
+- `ts'        — TypeScript / TSX read-only structural locators:
+                ts-list-imports / ts-list-exports / ts-list-functions
+                / ts-list-classes / ts-list-methods / ts-list-interfaces
+                / ts-list-type-aliases / ts-find-definition /
+                ts-surrounding-form.  Dispatches `.ts' to the typescript
+                grammar and `.tsx' to the tsx grammar.  Requires the
+                tree-sitter-typescript grammar (Doc 21 Phase 1b).
+- `js'        — JavaScript / JSX / MJS / CJS read-only structural
+                locators: js-list-imports / js-list-exports /
+                js-list-functions / js-list-classes / js-list-methods /
+                js-find-definition / js-surrounding-form.  Requires the
+                tree-sitter-javascript grammar.  Shares internal
+                helpers with `ts' so `.ts' must not be handed to JS
+                tools and vice versa (Doc 21 Phase 1b).
+- `manifest'  — Per-session tools/list filter driven by
+                `ANVIL_PROFILE' (ultra / nav / core / lean / full).
+                Handlers remain live regardless of profile; only the
+                advertised manifest shrinks.  Opt-in: primarily useful
+                for orchestrator child sessions where per-session
+                manifest cost dominates (Doc 26 Phase 1).  Add
+                `manifest' last in the module list so it sees every
+                earlier registration.
+- `discovery' — Intent-based MCP tool discovery.  Adds the
+                `anvil-tools-by-intent' tool that answers
+                \"which registered tools match intent X / layer Y?\"
+                queries without requiring the caller to read
+                CLAUDE.md.  Reads `:intent' / `:layer' /
+                `:stability' metadata attached by modules at
+                register time; tools without metadata fall back
+                to default values and still surface (Doc 34
+                Phase A)
+- `disclosure' — Layer-1 (slim index) + disclosure-help tools that
+                formalise the 3-layer read contract documented in
+                docs/design/28-progressive-disclosure.org.  Depends on
+                `anvil-org-index' for the org-index-index handler
+                (Doc 28 Phase 1)
+- `shell-filter' — Per-command shell output compression + tee +
+                gain statistics.  Adds MCP tools shell-run,
+                shell-filter, shell-tee-get, shell-gain that
+                transparently filter verbose stdout (git status /
+                git log / git diff / rg / find / ls / pytest /
+                ert-batch / emacs-batch / make) before returning
+                to the caller.  Raw bytes are stashed under the
+                `shell-tee' namespace with a TTL so callers can
+                recover the full output on demand.  Requires
+                `anvil-state' (Emacs 29+ SQLite).  Doc 27 Phase 1.
+- `sexp-cst'  — Tree-sitter CST + runtime `inspect-object' tool:
+                token-bounded JSON view of any live Lisp value.
+                Phase 1a ships 9 core types + record stub + truncation
+                cursor + circular-reference typed error.  Phase 1b
+                adds `inspect-object-drill' (cursor resolution with
+                offset/limit pagination), 4 KB byte-cap enforcement,
+                char-table + EIEIO handlers, and `inspect-object-purge'
+                for session-end namespace cleanup.  Phase 2a ships
+                `sexp-cst-read' — comment-preserving CST of an elisp
+                file via tree-sitter-elisp grammar, with depth cap
+                and typed errors.  Phase 2b-a adds `sexp-cst-edit'
+                (dry-run replacement of the node at a point offset;
+                re-parsed for structural integrity before returning
+                the new file content).  Phase 2b-b adds
+                `sexp-cst-edit-write' — same validation plus a
+                timestamped backup copy of the original before the
+                patched content lands on disk.  Phase 3a adds
+                `sexp-cst-repair' — parinfer-less close-paren
+                balancing that appends missing `)' at EOF (or
+                prepends `(' at BOF when closes exceed opens) and
+                re-parses to verify ERROR nodes are gone; returns a
+                dry-run `repaired-content' for the caller to apply
+                via a separate write tool.  Phase 3c extends repair
+                with an unterminated-string detector: when the scan
+                ends inside a `\"'-literal, the missing quote is
+                appended before paren balancing runs (Doc 31,
+                requires Emacs 29+ and the tree-sitter-elisp grammar
+                for Phase 2/3 tools)
+- `lint'      — Repo hygiene scanner family.  Phase 1 ships a
+                pluggable registry plus three org scanners:
+                conflict-markers (error) detects unresolved git
+                merge markers, orphan-ids (info) flags `:ID:'
+                properties no `[[id:...]]' link points at, and
+                broken-scheduled (warning) catches SCHEDULED /
+                DEADLINE timestamps with unparseable repeaters.
+                Run via `lint' / `lint-scanners' MCP tools or
+                `M-x anvil-lint' (Doc 16 Phase 1)
+- `memory'    — Auto-memory metadata index + per-type TTL audit +
+                access tracker.  Opens a SQLite DB at
+                `anvil-memory-db-path' and walks every memory/
+                directory under ~/.claude/projects/*/ (or
+                `anvil-memory-roots') to index ~.md files with
+                inferred type (feedback / project / reference /
+                user / memo).  Adds MCP tools memory-scan /
+                memory-audit / memory-access / memory-list that
+                surface stale rows to the memory-pruner skill
+                without touching memory file contents (non-
+                destructive).  Doc 29 Phase 1a, requires Emacs
+                29+.  Phase 1b (FTS5 + contradiction detection +
+                URL HEAD) and Phase 2 (decay + promote) stay
+                DRAFT."
   :type '(repeat symbol)
   :group 'anvil)
 

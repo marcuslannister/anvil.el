@@ -1,0 +1,603 @@
+#+title: anvil-memory-engine — Bayesian Validity + TTL + ROI + Contradiction
+#+date: 2026-04-20
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope CONVENTION-COUPLED
+
+* STATUS
+  :PROPERTIES:
+  :ID:       c6f05c1e-72a6-4e3b-87a6-d0a6a3b7c004
+  :END:
+~Phase 1a + 1b + 2a + 2b (i/ii/iii) + 3 (a/b/c) SHIPPED~ (2026-04-22、
+9 stacked feat branches) — Week-3 Ship 4、競合 token-savior の
+"memory engine" を anvil + Claude Code auto-memory に統合する完成
+実装。非 destructive (metadata layer のみ SQLite、memory =.md=
+files の rename 以外は不変) で foundation + 検出 + ranking &
+lifecycle + tokenizer swap + LLM verdict + MDL distillation +
+static HTML viewer + live TCP server + contradiction store & graph
+を全カバー。Phase 4 (cross-project) のみ optional / 未着手。
+
+*Phase 1a (feat/doc-29-memory-engine-phase1a):* =anvil-memory.el=
+metadata 索引 + scan + per-type TTL audit + access tracker + 4
+MCP tool (=memory-scan= / =memory-audit= / =memory-access= /
+=memory-list=)。17 ERT。
+
+*Phase 1b (feat/doc-29-memory-engine-phase1b):* FTS5 virtual table
+=memory_body_fts=、scan で body 自動投入。3 新 MCP tool
+(=memory-search= / =memory-save-check= / =memory-duplicates=) +
+既存 =memory-audit= に =with_urls= 拡張 (reference-type row に対し
+=anvil-http-head= で 404 検知、opt-in)。Jaccard + FTS5 rank の
+keyword ベース類似度、LLM 判定は Phase 2b 送り。16 ERT (合計 33)。
+
+*Phase 2a (feat/doc-29-memory-engine-phase2a):* decay-score 計算
+(=0.4 * recency + 0.3 * access + 0.3 * type-weight=、30d half-life
++ 10 saturation + type-weight alist)、=memory-list= に =:with-decay=
+/ =:sort 'decay= 追加、=memory-promote= (rename + 索引 update、
+refuse missing / overwrite)、=memory-regenerate-index= (=MEMORY.md=
+本文を decay-desc で生成、frontmatter name/description 解析、
+fallback 名は prefix strip + =_= → 空白)。2 新 MCP tool +
+=memory-list= 拡張。16 ERT (合計 49)。
+
+*Phase 2b-i (feat/doc-29-memory-engine-phase2b-i):* FTS5 trigram
+tokenizer swap (SQLite 3.34+)。=anvil-memory-fts-tokenizer= defcustom
+(=auto= / =trigram= / =unicode61=)、新 =memory-reindex-fts= MCP
+tool、既存 DB は opt-in で rebuild (auto-migrate しない)。日本語
+3-char 以上 substring が unicode61 で hit しない問題を解消。
+11 ERT (合計 60)。
+
+*Phase 2b-ii (feat/doc-29-memory-engine-phase2b-ii):*
+=memory-save-check= を =:with-llm t= で LLM 判定拡張。
+=anvil-orchestrator-submit-and-collect= を candidate 毎に single-
+shot 呼び出し、reply を =duplicate= / =contradicting= / =orthogonal=
+に分類 (case-insensitive + 句読点ゆるやか)。0 candidate は
+orchestrator 呼び出しなし (miss cost 0)。=cl-defun= に signature
+変更 (backward-compat 維持、positional subject/body/top-n はそのまま、
+keyword =:with-llm= / =:provider= / =:model= / =:timeout-sec= 追加)。
+MCP tool は =with_llm= / =provider= / =model= keyword。module 側は
+=anvil-orchestrator= を require せず =declare-function= guard で
+optional 依存を保つ。11 ERT (合計 71)。
+
+*Phase 2b-iii (feat/doc-29-memory-engine-phase2b-iii):*
+=memory-mdl-distill= 追加。N 本の indexed memory を 1 本の
+"convention memory" に distil する提案機能。FILES を明示で受け、
+orchestrator に labelled source block (===--- FILE: path ---===
+区切り) を投げ、reply を =:draft= として verbatim 返却 (parser
+しない)。書き込みなしの read-only (memory-pruner skill / 人間が
+採用判断)。empty / unindexed FILES は =user-error= で事前 reject、
+LLM call を無駄にしない。新 MCP tool =memory-mdl-distill= は
+colon-separated files param。10 ERT (合計 81)。
+
+*Phase 3a (feat/doc-29-memory-engine-phase3a):*
+=memory-export-html= 追加。=anvil-memory-export-html ROOT &key
+out-path title= で self-contained HTML snapshot を生成 (inline
+CSS + 外部 CDN 非依存、offline file:// OK)。type facet (user /
+feedback / project / reference / memo) で section 分割、各
+section は decay-score desc で sort。render 対象は frontmatter の
+name / description、filename、decay (数値 + 3 段階 color bar)、
+access_count、last-accessed。memory body は embed しない (.html 漏洩
+時の session text 保護)。新 MCP tool =memory-export-html=
+(root / out_path / title)。10 ERT (合計 91)。
+
+*Phase 3b (feat/doc-29-memory-engine-phase3b):*
+=anvil-memory-serve-start &key host port root= で localhost
+HTTP/1.0 サーバ起動 (=make-network-process :server t=)。routes:
+=GET /= → Phase 3a HTML、=GET /api/list= → JSON metadata 配列、
+=GET /api/decay-heatmap= → per-type (count, mean_decay) 集計。
+HTTP/1.0 + =Connection: close= で 1 request = 1 socket、
+per-client filter state は client process plist の
+=:request-buffer= に分離。loopback default (=127.0.0.1=)、
+ephemeral port は =:port t=。stop は idempotent。新 MCP tool 2 本
+(=memory-serve-start= / =memory-serve-stop=)。11 ERT (合計 102)。
+
+*Phase 3c (feat/doc-29-memory-engine-phase3c):* 永続
+contradiction layer + viewer 拡張。新 SQLite table
+=memory_contradictions= (file_a / file_b PK、canonical pair
+ordering、verdict / score / checked_at)。
+=anvil-memory-scan-contradictions &key threshold mode= で
+=anvil-memory-duplicates= の候補を upsert — mode =keyword=
+(default) は全 candidate を verdict =candidate= で store、
+mode =llm= は orchestrator verdict が =contradicting= の pair
+のみ store。read API =anvil-memory-contradictions= + route
+=GET /api/contradictions=。viewer HTML (Phase 3a
+=--render-page=) に =<fieldset class="facets">= 型 checkbox +
+inline 6 行 JS で CSS filter、contradiction section を
+=<section data-section="contradictions">= で埋め込み (rows が
+page ROOT 以下の両端点の場合のみ render)。htmx は諦めて
+server-side rendered 化、self-contained rule 維持。
+新 MCP tool 2 本 (=memory-scan-contradictions= /
+=memory-contradictions=)。13 ERT (合計 115)。
+
+*module placement:* =anvil-optional-modules= の =memory= (Emacs 29+
+SQLite 依存、opt-in)。=with_urls= audit は =anvil-http= を別途
+load した session でのみ URL HEAD 実行、未 load は nil 返却で
+graceful。
+
+* Motivation
+
+現在の Claude Code auto-memory は file-based + 手動キュレーション:
+
+- =~/.claude/projects/.../memory/= 配下に 1 memory = 1 .md file。
+- =MEMORY.md= に pointer list (= session 開始時に全量 load)。
+- 矛盾 / 陳腐化の検出は =memory-pruner= skill が periodic に走る。
+
+痛みポイント:
+
+1. *陳腐化*: 「昔そうだった」memory が silently 生き残る。=feedback_*=
+   は基本永続化だが =project_*= / =reference_*= は修正すべき。
+2. *矛盾*: 「案 A で実装」した後「案 B に変更」した記録が両方残り、
+   LLM が混乱する。
+3. *優先度*: すべての memory が同 priority で MEMORY.md に並び、
+   コンテキスト先頭 200 行 (truncate limit) 付近に無意味な記録が
+   押し込まれる。
+4. *検証コスト*: 毎回 memory を読んでから file 実体を grep して
+   stale チェック。人間も LLM も高コスト。
+
+token-savior は *Bayesian validity + per-type TTL + ROI + MDL
+distillation* で同じ痛みに対処している。その概念を anvil に移植する。
+
+ただし auto-memory の file layout を捨てて DB に一本化すると、
+git で diff/review できない & 人間が grep できない問題が生じる。
+なので **hybrid**: memory file は source of truth を維持、
+=anvil-state= に *scoring layer* を追加して promote / demote / flag
+を表現する。
+
+* Goals
+
+1. 各 memory に *metadata* を付与: =created=, =accessed-count=,
+   =last-accessed=, =validity-prior=, =ttl-policy=, =contradicts=。
+2. *保存時 contradiction 検出*: 新 memory が既存 memory の内容と
+   矛盾する場合、= 対立候補 =を返して human 判断を仰ぐ (skill から
+   MCP tool 経由)。
+3. *ROI 追跡*: 参照されない memory は =decay-score= を下げ、MEMORY.md
+   表示順で後退。高 ROI は昇格。
+4. *per-type TTL*:
+   - feedback: 永続 (180 d 以上経過で re-validate prompt)。
+   - project: 90 d で =validity-check= flag 必須。
+   - reference: 30 d で URL/path を再検証。
+   - user: 永続 (但し opposing 情報があれば flag)。
+5. *auto-promotion*: skill で =MEMO= として付けた note が 5 回以上
+   AI から参照されたら =feedback= に promote 提案。
+6. *MDL distillation*: 重複内容を検出して「これは既出では?」と
+   skill 実行時に warning。
+7. Claude Code auto-memory の file layout / MEMORY.md index は
+   *維持* (人間が git で読める)。scoring は =anvil-state= 側。
+
+* Non-goals
+
+- Vector embedding での semantic duplicate: Doc 18 anvil-rag の
+  scope。ここは FTS5 + Levenshtein で keyword-based 重複のみ。
+- Memory の全文 DB 化 (file 廃止): git diff を失うので反対。
+- Multi-user memory: anvil は single-user 前提。
+- LLM auto-extraction from tool output (token-savior の
+  =TS_AUTO_EXTRACT=): 保存するか否かは人間判断を維持。誤抽出の
+  cost > 手入力の cost。
+
+* Architecture
+
+** Data model
+
+=anvil-state= namespace =memory-meta= に 1 memory = 1 row:
+
+#+begin_src elisp
+(:file "feedback_journal_org_edit_body_timeout.md"
+ :type feedback                   ; auto-memory type
+ :created "2026-02-11T09:00:00Z"
+ :last-accessed "2026-04-19T21:33:10Z"
+ :access-count 17
+ :validity-prior 0.95             ; 0.0-1.0, 初回 0.9 固定
+ :ttl-policy feedback             ; keyword, per-type TTL lookup
+ :contradicts nil                 ; or list of conflicting files
+ :decay-score 0.87                ; recency * access * type weight
+ :tags ("org-mode" "emacs-eval" "timeout"))
+#+end_src
+
+=validity-prior= は Bayesian update:
+- 参照されて "これは今でも正しい" と human/LLM 確認したら *0.05
+  increment* (cap at 1.0)。
+- Live grep で言及先が消えていたら *0.2 decrement*。
+- opposing memory 保存時に両方とも *0.1 decrement*。
+
+** Contradiction detection
+
+=anvil-memory-save-with-check= 相当の wrapper MCP tool:
+
+1. Draft memory の subject / body を =anvil-org-index-search=
+   + FTS5 で既存 memory に対し hybrid search。
+2. Top 3 similar memories を返却。
+3. 類似度 > 0.7 の場合:
+   - 内容が orthogonal なら duplicate 警告。
+   - 内容が contradicting (LLM 判定) なら *既存 memory の
+     =contradicts= field に draft pointer を登録* し human に flag。
+4. Human 判断で resolve / merge / keep-both を skill から指示。
+
+FTS5 は anvil-sqlite で既にサポート。anvil-memory-index を
+新 sqlite DB ~~/.emacs.d/anvil-memory-index.db~ に per-memory row
+として保持。
+
+** Per-type TTL policy
+
+=defconst anvil-memory-ttl-policies=:
+
+| Type      | Hard TTL | Soft warning | Re-validate trigger          |
+|-----------+----------+--------------+------------------------------|
+| user      | ∞        | -            | opposing memory saved        |
+| feedback  | ∞        | 180d         | 180d 経過 + 5 access         |
+| project   | 90d      | 60d          | hard TTL で auto-flag        |
+| reference | 30d      | 21d          | URL/path を HEAD check       |
+
+=anvil-memory-audit= MCP tool (Periodic、daily cron 推奨):
+- Hard TTL 超過 → =:expired= flag。
+- Soft warning → =:needs-recheck= flag。
+- Reference type → =http-head= で 404 検知。
+- Flag 結果を =memory-audit-report= として org table で返す。
+
+** ROI / decay
+
+毎回 memory が使用されたら =access-count += 1=, =last-accessed= 更新。
+=decay-score= は:
+
+#+begin_src
+decay = 0.4 * recency(last-accessed)
+      + 0.3 * normalize(access-count)
+      + 0.3 * type-weight(type)
+
+recency(t) = exp(-days-since(t) / 30)   ; 30-day half-life
+type-weight: user=1.0, feedback=0.9, project=0.7, reference=0.5
+#+end_src
+
+MEMORY.md の pointer 並びは decay-score 降順で generate (既存
+memory-pruner skill を拡張)。
+
+** Auto-promotion
+
+=MEMO= (= 非永続 note) が 5 回以上 AI から参照されたら:
+- skill 実行時に "promote to feedback?" prompt。
+- 承諾なら file を =feedback_*.md= に rename、metadata 更新、
+  MEMORY.md index 再生成。
+
+=memory-pruner= / =memory-audit= が promotion candidate を検出。
+
+** MDL distillation (Phase 2)
+
+重複 memory の検出だけでなく、複数 memory の *共通項* を抽出して
+新 convention memory を生成する提案機能。token-savior の
+"note ×5 → convention" と類似。
+
+Phase 1 は skeleton のみ、Phase 2 で LLM 呼び出しで distillation。
+
+* Public MCP tools
+
+| id                   | args                              | notes                     |
+|----------------------+-----------------------------------+---------------------------|
+| ~memory-save-check~  | type, file, subject, body         | contradiction 検査        |
+| ~memory-access~      | file                              | access-count +=1 (内部用) |
+| ~memory-audit~       | type?                             | TTL / URL check レポート  |
+| ~memory-promote~     | file, new-type                    | MEMO→feedback 等 rename   |
+| ~memory-decay-score~ | file                              | 現在 decay-score 返却     |
+| ~memory-duplicates~  | file?                             | 類似 memory list          |
+
+既存の auto-memory 保存フロー (system prompt 内 instruction) に
+=memory-save-check= を通すよう skill 側で update。
+
+* Phases
+
+** Phase 1a — metadata + audit + access (~SHIPPED~ 2026-04-22)
+
+1. =anvil-memory-index.db= schema + 初期化 SHIPPED。=memory_meta=
+   テーブル (file PK / type / created / last_accessed /
+   access_count / validity_prior / ttl_policy / decay_score /
+   tags) + type index。=INSERT ... ON CONFLICT DO NOTHING= で
+   re-scan 時 access_count 保持。
+2. =memory-scan= tool SHIPPED。=anvil-memory-roots= (default は
+   =~/.claude/projects/*/memory/= auto-detect) を walk、MEMORY.md は
+   skip、filename prefix から type 推論 (=feedback_= /
+   =project_= / =reference_= / =user_= / fallback =memo=)。
+3. =memory-audit= tool SHIPPED (TTL 判定のみ、reference URL HEAD
+   は Phase 1b)。per-type policy: user/memo 永続、feedback 180d
+   soft、project 90d hard / 60d soft、reference 30d hard / 21d
+   soft。
+4. =memory-access= tool SHIPPED (access_count++ + last_accessed
+   更新、未 index file は nil 返却で graceful)。
+5. =memory-list= tool SHIPPED (metadata plist dump、type filter 可)。
+
+commit: =9a853d4= (test-lock、17 ERT) → =9be37fb= (impl、460 行
++ anvil.el docstring)。
+
+** Phase 1b — FTS5 + save-check + duplicates + URL HEAD (~SHIPPED~ 2026-04-22)
+
+1. =memory-search= tool SHIPPED。SQLite FTS5 virtual table
+   =memory_body_fts= を schema に追加、scan で body を投入。
+   tokenizer は unicode61 default (英語 + URL 断片は OK、日本語
+   hit は弱く Phase 2 で trigram に差し替え予定)。=:type= filter /
+   =:limit= (default 20)、snippet は =«»= marker。
+2. =memory-save-check= tool SHIPPED (top-N = 3、FTS5 で短冊、
+   jaccard で再ランク、各 :similarity ∈ [0,1])。Levenshtein の
+   LLM 判定は Phase 2 送り (現状はあくまで候補返却、skill / 人間が
+   classify)。
+3. =memory-audit= の =with_urls= 拡張 SHIPPED (reference-type 行
+   の body から最初の =https?://= を抽出して =anvil-http-head=、
+   200-399 → =ok= / 400+ → =broken= / それ以外 → nil)。default
+   off、opt-in。=anvil-http= module 未 load session では
+   =fboundp= ガードで nil 返却、graceful fall-through。
+4. =memory-duplicates= tool SHIPPED (O(N²) pairwise jaccard、
+   threshold default 0.6、:pair + :similarity を返す)。
+5. =memory-pruner= skill 側の metadata 参照 update は
+   =~/.claude/skills/= 配下で user 管轄、anvil 本体では扱わない。
+
+commit: =e5a29fc= (test-lock、16 ERT) → =c9f509e= (impl、+320 行)。
+
+** Phase 2a — decay + promote + regenerate-index (~SHIPPED~ 2026-04-22)
+
+6. =decay-score= 計算 SHIPPED。純関数 =anvil-memory--compute-decay=
+   (0.4 * recency + 0.3 * access + 0.3 * type-weight、30d half-
+   life、access cap 10)。defcustom =anvil-memory-decay-half-
+   life-days= / =-access-saturation= / =-type-weights= でチューン
+   可。row の stored =decay_score= column は未 update in-place、
+   代わりに =anvil-memory-list :with-decay t= で on-demand 計算
+   (=plist-put= で stale な 0.0 を上書き)。
+7. =memory-promote OLD-FILE NEW-TYPE= SHIPPED。file rename +
+   =memory_meta= UPDATE + =memory_body_fts= UPDATE を 1 transaction
+   相当で。Source missing / unindexed / destination exists は
+   =user-error= で refuse、on-disk state consistent。body 不変。
+8. =memory-regenerate-index ROOT= SHIPPED。=:with-decay + :sort
+   'decay= で降順 list → frontmatter =name:= / =description:= を
+   line-level regexp で抽出 (no YAML lib)、fallback は filename
+   prefix strip + =_= → space。=`- [NAME](BASE) — DESC'= 行を
+   =mapconcat= で join。読み取り専用 — 書き出しは caller (memory-
+   pruner skill) 責任。
+
+commit: =0b3b31c= (test-lock、16 ERT) → =fdbaf3e= (impl、+296 行)。
+
+** Phase 2b-i — FTS5 trigram tokenizer (~SHIPPED~ 2026-04-22)
+
+9. Trigram tokenizer (SQLite 3.34+): 日本語 3-char substring が
+   unicode61 で hit しない問題の解消。
+   - =anvil-memory-fts-tokenizer= defcustom: =auto= (default) /
+     =trigram= / =unicode61=。=auto= は build probe で決定
+     (=anvil-memory--sqlite-supports-trigram-p=、throwaway virtual
+     table を create+drop)。
+   - =anvil-memory--create-fts-table= に factored、
+     =anvil-memory--ensure-schema= が resolved tokenizer を使う。
+   - =anvil-memory-reindex-fts [TOKENIZER]=: DROP + CREATE +
+     per-file body INSERT で in-place rebuild。明示的 TOKENIZER
+     は =trigram= / =unicode61= のみ (invalid は =user-error=)。
+   - =memory-reindex-fts= MCP tool (opt-in)。auto-migrate しない —
+     既存 unicode61 DB は user / skill が明示 rebuild。
+   - =anvil-memory--current-fts-tokenizer= は sqlite_master の
+     CREATE SQL を regex match で判定。
+
+commit: =55265b0= (test-lock、11 ERT) → =89f0372= (impl、+157 行)。
+
+** Phase 2b-ii — LLM save-check verdict (~SHIPPED~ 2026-04-22)
+
+10. =memory-save-check= を opt-in で LLM 判定拡張:
+    - =cl-defun= signature に変更 (backward-compat: 3 positional
+      =SUBJECT BODY &optional TOP-N=、追加 keyword =:with-llm= /
+      =:provider= / =:model= / =:timeout-sec=)。
+    - =:with-llm t= 時、残った candidate 毎に
+      =anvil-orchestrator-submit-and-collect= を呼び、reply を
+      =anvil-memory--parse-verdict= で =duplicate= /
+      =contradicting= / =orthogonal= に分類
+      (case-insensitive + 句読点ゆるやか)。
+    - success: candidate に =:verdict= 付加。
+    - unparseable: =:verdict nil :verdict-raw STRING=。
+    - failed / pending: =:verdict nil :verdict-error STRING=。
+    - 0 candidate は orchestrator call 0 (miss cost 0)。
+    - defcustom: =anvil-memory-llm-provider= (default "claude") /
+      =llm-model= (nil = provider default) / =llm-timeout-sec=
+      (default 30)。
+    - MCP tool =memory-save-check= に =with_llm= / =provider= /
+      =model= param 追加。
+    - =anvil-memory= は =anvil-orchestrator= を require せず
+      =declare-function= guard で optional 依存を保つ (orchestrator
+      未 load でも keyword path は動く)。
+    - ERT は =cl-letf= で =submit-and-collect= stub、network-less
+      11 test (parse / verdict path / error / call count / MCP
+      roundtrip)。
+
+commit: =d31d86a= (test-lock、11 ERT) → =51900de= (impl、+196 行)。
+
+** Phase 2b-iii — MDL distillation (~SHIPPED~ 2026-04-22)
+
+11. =memory-mdl-distill= 追加: N 本の indexed memory を 1 本の
+    "convention memory" draft に distil する提案機能。
+    - 入力: FILES (明示 list)、各 path は =memory_meta= に
+      存在していないと =user-error= で reject。empty list も
+      user-error (LLM call を無駄にしない)。
+    - =anvil-memory--distill-prompt= が各 body を
+      ===--- FILE: path ---=== の labelled block として連結、
+      frontmatter (name / description / type) + body ≤50 行の
+      出力を要求する prompt を生成。
+    - =anvil-orchestrator-submit-and-collect= に一括投げ、
+      =:summary= を verbatim で =:draft= に入れて返す (parser
+      しない、採用判断は skill / 人間)。
+    - 失敗時: =:status failed= → =:error STRING=、
+      =:pending t= → =:error "orchestrator pending (timeout)"=。
+      =:sources= は常に FILES verbatim を保存 (rescued log 用)。
+    - 書き込みなしの read-only: source .md / MEMORY.md を一切
+      触らない。=mdl-distill-does-not-write-disk= fixture で
+      mtime 前後同値を assert。
+    - defcustom 再利用: Phase 2b-ii の =anvil-memory-llm-
+      provider= / =-llm-model= / =-llm-timeout-sec= をそのまま。
+    - 新 MCP tool =memory-mdl-distill= (colon-separated files /
+      provider / model)。=anvil-orchestrator= は =declare-
+      function= guard で optional (未 load でも module 自身は
+      load できる、MDL path だけ使えない)。
+
+commit: =e8c1bd8= (test-lock、10 ERT) → =8e2d863= (impl、+150 行)。
+
+** Phase 3a — static HTML export (~SHIPPED~ 2026-04-22)
+
+=anvil-memory-export-html ROOT &key out-path title= を新設。
+self-contained HTML snapshot (inline CSS のみ、=<link>= /
+=<script src=...>= 無し)、file:// で開ける。構造:
+
+- =<body>= に =<h1>= + summary line (total count / root path)
+- 各 type section =<section data-type="TYPE">=、user / feedback /
+  project / reference / memo の順 (=anvil-memory--html-type-order=
+  定数)
+- section 内 =<table>= は memory / decay / access / last column、
+  row は =data-decay="<float>"= attribute + 3 段階 color bar
+  (hot >=0.66 / warm >=0.33 / cold)
+- body は emit しない (.html 漏洩時の session text 保護)
+
+非 obvious 設計:
+- =anvil-memory--group-by-type=: decay-sorted rows を type 別 bucket
+  に分け、=anvil-memory--html-type-order= 順に並べ替え。key 順が
+  安定 (=memo= は最後)。bucket 内 row 順 = caller (decay desc)
+  そのまま preserve。
+- =anvil-memory--html-escape=: 5 entity (=&= =<= =>= =\"= ='=)
+  順序固定 (=&= 先頭、以降は既に置換済文字を触らない)。
+- =out-path= UTF-8 固定: =(let ((coding-system-for-write 'utf-8))
+  (with-temp-file ... (insert html)))= で OS locale 非依存。
+- 返り値は常に HTML 文字列、=out-path= は副作用。
+
+新 MCP tool =memory-export-html=: root / out_path / title (string
+coerce、empty → nil)、return =(:html STR :written PATH-OR-NIL)=。
+read-only flag 付き。
+
+commit: =f3ce484= (test-lock、10 ERT) → =a724206= (impl、+223 行)。
+
+** Phase 3b — live TCP server (~SHIPPED~ 2026-04-22)
+
+=anvil-memory-serve-start &key host port root= で
+=make-network-process :server t= の HTTP/1.0 server 起動。
+stop は idempotent な =anvil-memory-serve-stop= (前回 bind port
+を返す、nil = 既に停止)。defcustom =anvil-memory-serve-host=
+(default =127.0.0.1=) と =anvil-memory-serve-port= (default
+8729、=t= 指定で kernel 任意 free port)。
+
+routes:
+- =GET /= → Phase 3a HTML (live rebuild、decay desc sort)
+- =GET /api/list= → JSON array、row: =file= / =type= / =access_
+  count= / =last_accessed= / =decay_score=
+- =GET /api/decay-heatmap= → JSON array、=type= / =count= /
+  =mean_decay= の per-type 集計
+- other methods → 405、unknown paths → 404、malformed request
+  line → 400、handler error → 500
+
+設計:
+- =Connection: close= + HTTP/1.0 で keep-alive 無し、1 request =
+  1 socket。per-connection filter state (=:request-buffer=) は
+  *client process* の plist に乗るので concurrent でもぶつからない。
+- =--serve-dispatch METHOD PATH= は pure function、REPL
+  debugging 容易。
+- JSON encode は built-in =json.el= (= require 済)。symbol は
+  =(symbol-name type)= で文字列化、=:null= で JSON null。
+- server auth は無し (local only)。non-loopback bind は defcustom
+  docstring で明示警告。
+
+新 MCP tool 2 本: =memory-serve-start= (host / port / root 全
+string coerce、port "0" → ephemeral) / =memory-serve-stop=
+(idempotent、:stopped = was-bound port or nil)。
+
+test fixture で HTTP client を =make-network-process= で書き、
+=:port t= で ephemeral port を受ける (=process-contact proc
+:service= で assigned port を取得)。3s timeout + unwind-protect
+delete-process で hang safe。
+
+commit: =a6ca5f0= (test-lock、11 ERT) → =79fa6a6= (impl、+290 行)。
+
+** Phase 3c — contradiction store + graph viewer (~SHIPPED~ 2026-04-22)
+
+htmx を諦めて代わりに *server-side rendered* の contradiction
+section + CSS-filterable type checkboxes (inline JS 6 行) で同等の
+UX を実装。htmx の CDN / external script dep を避けて、Phase 3a
+の "self-contained HTML" rule を維持したまま interactive にした。
+
+新 SQLite table =memory_contradictions= を Phase 1a/1b/2a の既存
+schema に追加:
+- =file_a= / =file_b= (canonical ordering: =string-lessp= で sort、
+  PK = =(file_a, file_b)=)
+- =verdict= (=candidate= / =contradicting= / =duplicate= / ...)
+- =score= (jaccard similarity at candidate 検出時)
+- =checked_at= (unix timestamp)
+
+populator: =anvil-memory-scan-contradictions &key threshold mode
+provider model timeout-sec=。
+- =mode 'keyword= (default): =anvil-memory-duplicates= で candidate
+  pair を取得、verdict =candidate= + jaccard score を verbatim
+  store。
+- =mode 'llm=: candidate 毎に =anvil-orchestrator-submit-and-
+  collect= + =--verdict-prompt= で verdict 判定、=contradicting=
+  のみ store。=provider= / =model= / =timeout-sec= は既存
+  =anvil-memory-llm-*= defcustom を default に再利用。
+- upsert は =ON CONFLICT(file_a, file_b) DO UPDATE SET verdict,
+  score, checked_at=。rescan で row 数不変、最新 verdict を反映。
+
+read: =anvil-memory-contradictions= (nil-safe、plist list 返却、
+verdict asc + score desc)。
+
+route: =GET /api/contradictions= JSON (=file_a= / =file_b= /
+=verdict= / =score= / =checked_at=)。
+
+HTML 強化 (Phase 3a =--render-page=):
+- =<fieldset class="facets">= の type checkbox + inline
+  =<script>= (6 行) で section 表示切り替え。external JS 依存なし
+  (Phase 3a =export-html-is-self-contained= fixture は引き続き
+  pass)。
+- =<section data-section="contradictions">= を contradictions が
+  存在する時のみ挿入。page ROOT 以下の両端点 row だけ display。
+
+MCP tool 2 本: =memory-scan-contradictions= (threshold / mode /
+provider / model、全 string coerce) / =memory-contradictions=
+(read-only)。
+
+非 obvious: canonical pair ordering を upsert 側で決める。caller
+が =(file_b, file_a)= で呼んでも同じ row に着地。PK 衝突での
+duplicate 蓄積を防ぐ最短 pattern。
+
+commit: =dd83c36= (test-lock、13 ERT) → =cf6cbae= (impl、+262 行)。
+
+** Phase 4 — cross-project memory
+
+現状 memory は project 単位 (=~/.claude/projects/<proj-hash>/=)。
+共通 memory (user 型) を promote して global layer に移す機能。
+
+* Testing strategy
+
+- Unit: TTL policy table × 境界日付で flag 生成確認。
+- Integration: 2 つの opposing memory を保存 → contradiction 検出 +
+  両方の validity-prior decrement。
+- Corpus: 既存 auto-memory 全 60+ ファイルを取り込み、audit を
+  走らせて =:expired= が妥当な件数出ることを確認。
+- Round-trip: memory-access → decay-score 更新 → MEMORY.md 並び順
+  変化を snapshot。
+
+* Platform notes
+
+- SQLite FTS5 は Emacs 29+ の built-in sqlite module で使用可、
+  Windows でも OK (既存 anvil-sqlite で実証済)。
+- =anvil-memory-index.db= は =~/.emacs.d/= 配下で OS 不問。
+- memory file の encoding は UTF-8 固定 (既存 auto-memory 慣習)。
+
+* Out of scope / future
+
+- LLM auto-extraction (tool 出力から観察を勝手に保存): 誤抽出の
+  cost が高く、human-in-the-loop を崩す。
+- Memory sharing (別ユーザーと memory 共有): single-user 前提。
+- PII scrubbing: auto-memory には PII を書かない運用なので不要。
+
+* Review Questions
+
+1. Q. =anvil-memory-index.db= と既存 =anvil-state-db=
+   (Doc 08 =anvil-state=) を同一ファイルに統合すべき?
+   → 分離推奨。memory index は FTS5 前提で sqlite-vec も将来
+   入れる可能性があり、state は軽量 KV。schema を分けて管理。
+2. Q. Contradiction 判定を LLM に委ねるか regex/keyword ベースで
+   初期実装するか? → Phase 1 は keyword + Levenshtein、Phase 2 で
+   LLM (local orchestrator-dispatch)。
+3. Q. MEMORY.md 並び替えは auto commit で良いか? → No。sort 結果を
+   propose するが commit は skill が human 承諾後に行う。
+4. Q. Decay-score weights (0.4/0.3/0.3) は default で良いか?
+   → 初期値として。3 ヶ月実運用してから調整。
+
+* References
+
+- token-savior README: "Memory engine" section (Bayesian validity /
+  contradiction / TTL / ROI の詳細)。
+  https://github.com/Mibayy/token-savior
+- Memory ~project_my_cc_helpers.md~: 旧 memory 管理実装。
+- Memory ~feedback_agent_model_routing.md~: dispatch policy の
+  参考 (contradiction 判定時に使う)。
+- Claude Code auto-memory system prompt (CLAUDE.md 参照)。

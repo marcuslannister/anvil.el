@@ -1,0 +1,101 @@
+#+title: Doc 31 Phase 3b — ROI eval for sexp-cst-repair
+#+date: 2026-04-22
+
+* Purpose
+
+Phase 3a (=sexp-cst-repair=) shipped parinfer-less close-paren
+balancing: append `)` at EOF when opens exceed closes, prepend `(`
+at BOF when closes exceed opens, verify via tree-sitter-elisp
+re-parse.  Phase 3b asks the ROI question:
+
+  How many typical LLM paren-break failures does it actually rescue?
+
+Phase 0 G3 set the acceptance bar at =≥ 60%= repair rate on 5 hand-
+traced LLM misprints.  Phase 3b widens that to 30 synthetic cases
+across 5 categories and runs them through the live tool end-to-end.
+
+* Method
+
+- *Dataset* ([[file:dataset.el][dataset.el]]): 30 elisp snippets, each plist-tagged with
+  =:category=, =:input=, =:expected-kind=, =:expected-added=.  No
+  real LLM is queried — the inputs are hand-authored analogs of the
+  observed failure modes (trailing `)` drop, leading `)` excess,
+  deep-nested miss, multi-form interaction, structural damage).
+- *Runner* ([[file:run.el][run.el]]): writes each =:input= to a temp file, invokes
+  =(anvil-sexp-cst-repair FILE)=, parses the JSON, classifies against
+  the expected label.  Prints an org-flavored report to stdout (see
+  [[file:report-2026-04-22.org][report-2026-04-22.org]] for the captured run).
+
+Run it:
+
+#+begin_src sh
+  emacs --batch -L . \
+    -l benchmarks/doc31-phase3b/dataset.el \
+    -l benchmarks/doc31-phase3b/run.el > /tmp/phase3b.org
+#+end_src
+
+The runner does *not* fail on unexpected outcomes — drift in the
+=matches-expected= column is the interesting signal and gets
+amplified by the aggregate table.
+
+* Categories
+
+| Category        | N  | What it models                                       |
+|-----------------+----+------------------------------------------------------|
+| trailing-close  | 10 | LLM truncates output before the final `)`            |
+| leading-excess  |  5 | LLM over-closes, emits spurious `)` past the form    |
+| deep-nested     |  5 | Body is deep (let inside cond inside defun) and miss |
+| multi-form      |  5 | Good forms before / after a broken one               |
+| string-repair   |  2 | Truncated mid-`"'-literal (Phase 3c)                 |
+| unfixable       |  3 | Damage outside paren/string count (swap, reader)     |
+
+The =unfixable= bucket is the honesty check: neither close-paren
+balancing nor string-close can claim a repair it cannot prove, so
+a high =expected-match= there means the tool correctly refused.
+
+* Interpreting the aggregate
+
+- *Expected-match*: cases where =actual-kind= (and =added= count,
+  when checkable) equals the dataset label.  Measures precision of
+  the repair tool against the failure taxonomy.
+- *Repair success*: cases where the tool returned
+  =repair-result= (=close-paren-added= / =open-paren-prepended= /
+  =noop=).  Counts a =repair-failed= on an unfixable case as
+  `not repaired' — which is the intended outcome.
+- *Retry-rate reduction*: the headline ROI number.  Without the
+  tool, any non-parseable file forces the LLM to retry; with the
+  tool, only the residual unfixable cases need a retry.  Phase 0 G3
+  budget was =≥ 60%= reduction.
+
+* 2026-04-22 results summary (Phase 3a + 3c)
+
+- *Expected-match: 30/30 (100%)* — every dataset label matches the
+  tool's live output, including `added` count on the 27 repairable
+  cases.
+- *Repair success: 27/30 (90%)* — 25 paren-balanced (Phase 3a) + 2
+  unterminated-string closed (Phase 3c) + 3 correctly refused.
+- *Retry-rate reduction: 90%* of broken cases rescued (vs Phase 0
+  G3's 60% bar; Phase 3a alone hit 83%, Phase 3c +7 points).
+
+The bar is met with margin.  Phase 3a close-paren balancing +
+Phase 3c unterminated-string close are both worth keeping.  The
+residual 10% (3 cases) is damage outside paren/string count —
+swapped parens (`)foo(`), unreadable reader syntax
+(`#<void>`), stray reader macros (trailing backtick).  No
+rule-based repair can fix those without risking false positives;
+they remain `sexp-cst/repair-failed' by design.
+
+See [[file:report-2026-04-22.org][report-2026-04-22.org]] for the full per-case table.
+
+* When to re-run
+
+- After any change to `anvil-sexp-cst--paren-delta' (char-literal
+  handling, string escape logic, comment tracker).
+- After any change to `anvil-sexp-cst--repair-compute' strategy
+  (ordering of close-vs-open prepend, error-kind wording).
+- Before claiming a Phase 3c or extended repair strategy: diff the
+  two reports to quantify the gain / regression.
+
+The =run.el= output is deterministic given the dataset, so a bit-
+exact diff against the saved report doubles as a smoke regression.
+#+end:

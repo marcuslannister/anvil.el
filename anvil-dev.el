@@ -209,7 +209,9 @@ Returns a result plist with :file :ok :exit :elapsed-ms :total
                  (apply #'call-process
                         anvil-dev-emacs-bin nil buf nil
                         (append
-                         (list "--batch" "-L" root)
+                         (list "--batch"
+                               "--eval" "(setq load-prefer-newer t)"
+                               "-L" root)
                          (and (file-directory-p tests-dir)
                               (list "-L" tests-dir))
                          (list "-l" "ert" "-l" file
@@ -609,42 +611,278 @@ plists `(:file NAME :line N :defun SYM :args ARGS)'."
   (anvil-dev--audit-scan-missing-params-section-in-files
    (anvil-dev--audit-module-files root)))
 
+(defconst anvil-dev--audit-plist-return-exempt-marker
+  ";;; anvil-audit: tools-wrapped-at-registration"
+  "File-header comment that exempts a file from the plist-return scanner.
+Modules that intentionally return plists from `--tool-*' bodies and
+wrap them at registration time (e.g. anvil-orchestrator's
+`anvil-orchestrator--encode-handler' pattern) must include this
+line in the first 2 KB of the file.  See the scanner docstring for
+the one-line comment format.")
+
+(defun anvil-dev--audit-file-exempts-plist-return-p (file)
+  "Return non-nil when FILE carries the plist-return exemption marker.
+The marker must appear within the first 2 KB of the file on a line
+starting with `anvil-dev--audit-plist-return-exempt-marker'."
+  (with-temp-buffer
+    (insert-file-contents file nil 0 2000)
+    (goto-char (point-min))
+    (re-search-forward
+     (concat "^" (regexp-quote anvil-dev--audit-plist-return-exempt-marker))
+     nil t)))
+
+(defconst anvil-dev--audit-sequencing-forms
+  '(let let* progn
+    save-excursion save-restriction save-match-data save-current-buffer
+    unwind-protect
+    when unless
+    with-current-buffer with-temp-buffer with-temp-file
+    anvil-server-with-error-handling)
+  "Forms whose logical terminal value is the last of their body.
+Used by `anvil-dev--audit-terminal-form' to unwrap trivial
+sequencing constructs when deciding whether a `--tool-*' defun
+actually returns a plist literal.")
+
+(defun anvil-dev--audit-terminal-form (form)
+  "Return the logical terminal value of FORM.
+Unwraps `let' / `let*' / `progn' / `save-*' / `unwind-protect' /
+`when' / `unless' / `anvil-server-with-error-handling' /
+`with-current-buffer' / `with-temp-{buffer,file}' recursively so
+that e.g. `(let (...) (list :K ...))' resolves to `(list :K ...)'.
+Non-sequencing cons forms return themselves; atoms return themselves."
+  (if (and (consp form)
+           (memq (car form) anvil-dev--audit-sequencing-forms))
+      (anvil-dev--audit-terminal-form (car (last form)))
+    form))
+
+(defun anvil-dev--audit-defun-terminal-form (defun-form)
+  "Return the logical terminal form of DEFUN-FORM's body.
+DEFUN-FORM is a parsed `(defun NAME ARGS ...BODY)'.  The leading
+docstring and any `(declare ...)' / `(interactive ...)' directives
+are skipped, then `anvil-dev--audit-terminal-form' is applied to
+the last remaining body form."
+  (let ((body (cdddr defun-form)))
+    (while (and body
+                (let ((f (car body)))
+                  (or (stringp f)
+                      (and (consp f)
+                           (memq (car f) '(declare interactive))))))
+      (setq body (cdr body)))
+    (anvil-dev--audit-terminal-form (car (last body)))))
+
+(defun anvil-dev--audit-plist-return-form-p (form)
+  "Non-nil when FORM is a `(list :KEYWORD ...)' literal.
+Used as the end-criterion in the plist-return scanner."
+  (and (consp form)
+       (eq (car form) 'list)
+       (keywordp (cadr form))))
+
+(defun anvil-dev--audit-scan-plist-return-in-files (files)
+  "Scan FILES for `--tool-*' wrappers whose body terminates in a plist literal.
+
+An MCP tool handler must return a string or nil per the
+`anvil-server' contract; returning a raw Lisp plist trips a
+runtime error on every MCP call (the class of bug v0.3.1 shipped
+a hotfix for).  The scanner reads each `--tool-*' defun as a
+sexp, unwraps common sequencing forms (let / progn / save-* /
+with-error-handling / with-temp-buffer / ...) and flags the defun
+when the logical terminal form is `(list :KEYWORD ...)'.
+
+Files tagged with `anvil-dev--audit-plist-return-exempt-marker' in
+their first 2 KB are skipped wholesale — the exemption is the
+supported way for a module to declare that its tool bodies
+intentionally return rich plists because something else encodes
+them at registration time.
+
+Returns a list of plists `(:file NAME :line N :defun SYM)'."
+  (let (findings)
+    (dolist (file files)
+      (unless (anvil-dev--audit-file-exempts-plist-return-p file)
+        (with-temp-buffer
+          (insert-file-contents file)
+          (goto-char (point-min))
+          (while (re-search-forward
+                  "^(defun \\([a-zA-Z0-9-]+--tool-[a-zA-Z0-9-]+\\)"
+                  nil t)
+            (let ((name  (match-string 1))
+                  (start (match-beginning 0))
+                  (line  (line-number-at-pos (match-beginning 0))))
+              (when (anvil-dev--audit-wrapper-name-p name)
+                (let ((form (save-excursion
+                              (goto-char start)
+                              (ignore-errors (read (current-buffer))))))
+                  (when (and form (consp form) (eq (car form) 'defun))
+                    (let ((term (anvil-dev--audit-defun-terminal-form form)))
+                      (when (anvil-dev--audit-plist-return-form-p term)
+                        (push (list :file (file-name-nondirectory file)
+                                    :line line
+                                    :defun name)
+                              findings)))))))))))
+    (nreverse findings)))
+
+(defun anvil-dev--audit-scan-plist-return (root)
+  "Scan ROOT for MCP tool wrappers that terminate with a plist literal.
+Returns a list of plists `(:file NAME :line N :defun SYM)'."
+  (anvil-dev--audit-scan-plist-return-in-files
+   (anvil-dev--audit-module-files root)))
+
+(defcustom anvil-dev-audit-issue-fix-commit-depth 20
+  "How many recent commits `anvil-dev--audit-scan-issue-fix-without-test' inspects.
+20 commits covers a typical two-week anvil push cadence.  Set to a
+larger value before the release cut, or to 0 to disable the scan
+(useful in environments where git history is shallow or absent, e.g.
+a fresh CI clone with fetch-depth=1)."
+  :type 'integer
+  :group 'anvil-dev)
+
+(defconst anvil-dev--audit-issue-fix-regex
+  "\\(?:Fixes\\|Closes\\|Resolves\\) +#\\([0-9]+\\)"
+  "Regex that detects an issue-closing commit-message keyword.
+Case-sensitive on purpose — matches the GitHub-canonical verbs
+that auto-close the referenced issue.  Lower-cased variants
+(\"fix #12\") do not auto-close on GitHub and are intentionally
+not flagged; anvil commits that truly close an issue spell the
+verb in title case by convention.")
+
+(defun anvil-dev--audit--git-available-p (root)
+  "Return non-nil when ROOT looks like a git worktree with history."
+  (and (file-directory-p (expand-file-name ".git" root))
+       (executable-find "git")))
+
+(defun anvil-dev--audit--git-commit-info (root sha)
+  "Return (:sha :subject :body :files) for SHA inside ROOT.
+Uses two `git show' calls so parsing stays format-agnostic:
+`--format=%s%n%b' for the human-readable message and a separate
+`--name-only' call for the file list.  Slightly chattier than one
+big `git log' invocation but much easier to keep correct when
+commit messages contain arbitrary text (including blank lines)."
+  (let ((default-directory (file-name-as-directory root)))
+    (let ((msg (with-temp-buffer
+                 (when (eq 0 (call-process "git" nil t nil "show" "-s"
+                                           "--format=%s%n%b" sha))
+                   (buffer-string))))
+          (files (with-temp-buffer
+                   (when (eq 0 (call-process "git" nil t nil "show"
+                                             "--name-only" "--format=" sha))
+                     (split-string (buffer-string) "\n" t "[ \t]+")))))
+      (when msg
+        (let* ((lines (split-string msg "\n" nil))
+               (subject (car lines))
+               (body (mapconcat #'identity (cdr lines) "\n")))
+          (list :sha sha
+                :subject (or subject "")
+                :body (or body "")
+                :files files))))))
+
+(defun anvil-dev--audit--git-log-commits (root depth)
+  "Return DEPTH most recent commits as a list of (:sha :subject :body :files).
+Returns nil when ROOT is not a usable git worktree or DEPTH <= 0."
+  (when (and (anvil-dev--audit--git-available-p root)
+             (integerp depth) (> depth 0))
+    (let ((default-directory (file-name-as-directory root)))
+      (let ((shas (with-temp-buffer
+                    (when (eq 0 (call-process "git" nil t nil "log"
+                                              (format "-n%d" depth)
+                                              "--format=%H"))
+                      (split-string (buffer-string) "\n" t "[ \t]+")))))
+        (delq nil
+              (mapcar (lambda (sha)
+                        (anvil-dev--audit--git-commit-info root sha))
+                      shas))))))
+
+(defun anvil-dev--audit-scan-issue-fix-without-test (root)
+  "Scan the last N commits (N=`anvil-dev-audit-issue-fix-commit-depth').
+Flag any commit whose subject or body contains `Fixes #N', `Closes
+#N', or `Resolves #N' but did not add / modify any file under
+`tests/'.  Catches the shape of the v0.3.1 hotfix (37fcc52) where a
+hastily-shipped fix skipped the regression guard.  Does not catch the
+harder case where a test was added but misses the reporter's
+scenario — that one needs human review.
+
+Returns a list of plists `(:sha SHA :issue N :subject STR)'."
+  (let ((commits (anvil-dev--audit--git-log-commits
+                  root anvil-dev-audit-issue-fix-commit-depth))
+        findings)
+    (dolist (c commits)
+      (let* ((sha (plist-get c :sha))
+             (subject (plist-get c :subject))
+             (body (plist-get c :body))
+             (text (concat subject "\n" body))
+             (files (plist-get c :files))
+             (issue (when (and (stringp text)
+                               (string-match anvil-dev--audit-issue-fix-regex
+                                             text))
+                      (string-to-number (match-string 1 text))))
+             (has-test (cl-some (lambda (f)
+                                  (and (stringp f)
+                                       (string-match-p "\\`tests/" f)))
+                                files)))
+        (when (and issue (not has-test))
+          (push (list :sha (substring sha 0 (min 10 (length sha)))
+                      :issue issue
+                      :subject subject)
+                findings))))
+    (nreverse findings)))
+
 (defun anvil-dev--audit-design-doc-status (file)
-  "Extract the first non-blank line of FILE's `* STATUS' section.
-Returns the trimmed string or nil when the file has no STATUS
-heading or the section is empty.  The org heading and the
-PROPERTIES drawer are skipped; `~...~' verbatim delimiters are
-stripped so the caller sees the plain status text."
+  "Return cons (FIRST-LINE . FULL-BODY) of FILE's `* STATUS' section.
+FIRST-LINE is the first non-blank, non-drawer line trimmed and stripped of
+`~...~' verbatim delimiters (used as the human-readable summary in
+reports).  FULL-BODY is the whole STATUS section text used to detect
+status keywords that may appear on a later line such as
+`DRAFT → SHIPPED' progressions.  Returns nil when the file has no
+STATUS heading."
   (with-temp-buffer
     (insert-file-contents file)
     (goto-char (point-min))
     (when (re-search-forward "^\\* STATUS" nil t)
       (forward-line 1)
-      (let ((end (save-excursion
-                   (or (and (re-search-forward "^\\* " nil t)
-                            (match-beginning 0))
-                       (point-max)))))
-        (catch 'found
-          (while (< (point) end)
-            (let ((line (buffer-substring-no-properties
-                         (line-beginning-position)
-                         (line-end-position))))
-              (unless (or (string-match-p "\\`[[:space:]]*\\'" line)
-                          (string-match-p "\\`[[:space:]]*:PROPERTIES:" line)
-                          (string-match-p "\\`[[:space:]]*:ID:" line)
-                          (string-match-p "\\`[[:space:]]*:END:" line))
-                (throw 'found
-                       (string-trim
-                        (replace-regexp-in-string "\\`[[:space:]]*~\\|~[[:space:]]*\\'"
-                                                  "" line)))))
-            (forward-line 1))
-          nil)))))
+      (let* ((start (point))
+             (end (save-excursion
+                    (or (and (re-search-forward "^\\* " nil t)
+                             (match-beginning 0))
+                        (point-max))))
+             (body (buffer-substring-no-properties start end))
+             first-line)
+        (save-excursion
+          (goto-char start)
+          (catch 'found
+            (while (< (point) end)
+              (let ((line (buffer-substring-no-properties
+                           (line-beginning-position)
+                           (line-end-position))))
+                (unless (or (string-match-p "\\`[[:space:]]*\\'" line)
+                            (string-match-p "\\`[[:space:]]*:PROPERTIES:" line)
+                            (string-match-p "\\`[[:space:]]*:ID:" line)
+                            (string-match-p "\\`[[:space:]]*:END:" line))
+                  (setq first-line
+                        (string-trim
+                         (replace-regexp-in-string
+                          "\\`[[:space:]]*~\\|~[[:space:]]*\\'" "" line)))
+                  (throw 'found nil)))
+              (forward-line 1))))
+        (when first-line (cons first-line body))))))
+
+(defun anvil-dev--audit-status-shipped-p (body)
+  "Return non-nil when STATUS BODY counts as non-blocking for master gate.
+Looks for the all-caps status keywords `SHIPPED' (work merged),
+`DEFERRED' (postponed by decision), or `AUDIT' (research-only memo)
+anywhere in the body, with case-sensitive matching so that incidental
+narrative words like \"the shipped Phase 1 broker\" do not satisfy
+the gate.  Multi-step progressions like `~DRAFT~ → ~APPROVED~ →
+~SHIPPED~' therefore pass once the final keyword appears anywhere
+in the body."
+  (and body
+       (let ((case-fold-search nil))
+         (string-match-p "\\bSHIPPED\\b\\|\\bDEFERRED\\b\\|\\bAUDIT\\b" body))))
 
 (defun anvil-dev--audit-scan-design-docs (root)
-  "Scan ROOT/docs/design/*.org for STATUS lines that do not contain `SHIPPED'.
+  "Scan ROOT/docs/design/*.org for STATUS sections that block master merge.
+A doc is blocking when its STATUS body contains none of `SHIPPED',
+`DEFERRED', or `AUDIT' (i.e. still DRAFT / APPROVED / mid-phase).
 Returns a list of plists `(:file NAME :status LINE)' in lexical
-order, surfacing DRAFT / APPROVED / partial-phase docs so the
-reader can judge the master-integration gate criterion."
+order, where LINE is the human-readable first line of STATUS used
+in reports."
   (let ((design-dir (expand-file-name "docs/design" root))
         findings)
     (when (file-directory-p design-dir)
@@ -657,8 +895,8 @@ reader can judge the master-integration gate criterion."
                ((null status)
                 (push (list :file base :status "(no STATUS section)")
                       findings))
-               ((not (string-match-p "SHIPPED" status))
-                (push (list :file base :status status) findings))))))))
+               ((not (anvil-dev--audit-status-shipped-p (cdr status)))
+                (push (list :file base :status (car status)) findings))))))))
     (nreverse findings)))
 
 (defun anvil-dev--audit-filter-by-scope (files scope)
@@ -678,29 +916,95 @@ SCOPE nil returns FILES unchanged.  Non-existent SCOPE returns nil."
                         files)))
    (t nil)))
 
-(cl-defun anvil-dev-release-audit (&optional project-dir &key scope)
+(defun anvil-dev--audit-scan-unused-tools (days)
+  "Return tool-ids whose last dispatch was more than DAYS ago.
+Reads the Doc 34 Phase C counter from `anvil-state' namespace
+`discovery-usage'.  Returns a list of plists
+`(:id :reason :last-called :days-ago :count)'.  :reason is
+`never-called' when the tool has no counter row, `stale' when
+the counter exists but is older than DAYS.  Returns nil (no
+findings) when anvil-state / anvil-discovery are not loaded so
+the audit still runs on machines where Phase C is not enabled."
+  (when (and (featurep 'anvil-state)
+             (featurep 'anvil-discovery)
+             (fboundp 'anvil-state-get))
+    (condition-case nil
+        (let* ((ns      (bound-and-true-p anvil-discovery--usage-ns))
+               (now     (truncate (float-time)))
+               (cutoff  (- now (* days 86400)))
+               registered results)
+          (when (hash-table-p (bound-and-true-p anvil-server--tools))
+            (maphash
+             (lambda (_sid table)
+               (when (hash-table-p table)
+                 (maphash (lambda (id _t) (push id registered)) table)))
+             anvil-server--tools))
+          (setq registered (cl-remove-duplicates registered :test #'equal))
+          (dolist (id registered)
+            (let ((entry (and ns (anvil-state-get id :ns ns :default nil))))
+              (cond
+               ((null entry)
+                (push (list :id id :reason 'never-called) results))
+               (t
+                (let ((last (plist-get entry :last-called)))
+                  (when (and (numberp last) (< last cutoff))
+                    (push (list :id id
+                                :reason 'stale
+                                :last-called last
+                                :days-ago (/ (- now last) 86400)
+                                :count (or (plist-get entry :count) 0))
+                          results)))))))
+          (sort results
+                (lambda (a b)
+                  (string-lessp (plist-get a :id)
+                                (plist-get b :id)))))
+      (error nil))))
+
+(cl-defun anvil-dev-release-audit (&optional project-dir &key scope unused-since)
   "Audit the anvil tree at PROJECT-DIR for pre-release hazards.
 
-Runs three cheap scanners (see the `release audit' section for
+Runs five cheap scanners (see the `release audit' section for
 details) and returns a plist:
 
   :arglist-strip    — list of wrapper plists hit by the Emacs 30
                       underscore-strip regression
   :missing-params   — list of wrapper plists with real args but
                       no `MCP Parameters:' docstring section
+  :plist-return     — list of wrapper plists whose body ends with
+                      a `(list :K ...)' form (MCP contract violation
+                      unless the file opts out via the
+                      `tools-wrapped-at-registration' marker)
+  :issue-fix-no-test — list of commit plists whose message closes
+                      an issue but whose diff does NOT touch
+                      `tests/' (guards against the 37fcc52 pattern —
+                      ship a fix without a regression test).  Skipped
+                      when git history is unavailable (shallow clone).
   :non-shipped-docs — list of `(:file :status)' plists for design
                       docs whose STATUS line lacks `SHIPPED'
-  :clean-p          — t iff all three scans returned empty
+  :unused-tools     — Doc 34 Phase C.  Populated only when
+                      UNUSED-SINCE is a positive integer; list of
+                      plists `(:id :reason :last-called :days-ago
+                      :count)' for tools whose counter is stale
+                      (>UNUSED-SINCE days) or absent.  Requires
+                      `anvil-state' + `anvil-discovery' loaded.
+                      Advisory — does not affect `:clean-p'.
+  :clean-p          — t iff the five release-blocker scans returned
+                      empty (unused-tools excluded by design)
   :root             — absolute directory that was audited
   :scope            — SCOPE value when supplied, else nil
+  :unused-since     — UNUSED-SINCE value when supplied, else nil
   :audited-at       — ISO timestamp when the scan ran
 
-:SCOPE limits the source scanners (arglist-strip / missing-params)
-to a single file or directory path.  When SCOPE names a regular
-file, only that file is audited; when it names a directory, files
-under it are audited.  The design-docs scanner is always run on
-the project tree — whole-tree doc state is cheap and independent
-of the scope in question."
+:SCOPE limits the source scanners (arglist-strip / missing-params /
+plist-return) to a single file or directory path.  When SCOPE names
+a regular file, only that file is audited; when it names a
+directory, files under it are audited.  The design-docs, issue-fix,
+and unused-tools scanners always run against the whole project /
+registry state.
+
+:UNUSED-SINCE N (integer days) activates the Phase C unused-tools
+scanner.  Typical values: 14 (biweekly review) or 30 (monthly
+deprecation candidate list).  Omit or pass nil to skip."
   (interactive)
   (let* ((root (or project-dir (anvil-dev--audit-default-root)))
          (_    (unless (and root (file-directory-p root))
@@ -715,17 +1019,28 @@ of the scope in question."
                           scanner-files))
          (missing-params (anvil-dev--audit-scan-missing-params-section-in-files
                           scanner-files))
+         (plist-return   (anvil-dev--audit-scan-plist-return-in-files
+                          scanner-files))
+         (issue-fix-no-test (anvil-dev--audit-scan-issue-fix-without-test root))
          (non-shipped    (anvil-dev--audit-scan-design-docs root))
+         (unused-tools   (when (and (integerp unused-since) (> unused-since 0))
+                           (anvil-dev--audit-scan-unused-tools unused-since)))
          (clean-p        (and (null arglist-strip)
                               (null missing-params)
+                              (null plist-return)
+                              (null issue-fix-no-test)
                               (null non-shipped)))
          (result
           (list :arglist-strip arglist-strip
                 :missing-params missing-params
+                :plist-return plist-return
+                :issue-fix-no-test issue-fix-no-test
                 :non-shipped-docs non-shipped
+                :unused-tools unused-tools
                 :clean-p clean-p
                 :root (file-name-as-directory (expand-file-name root))
                 :scope scope
+                :unused-since unused-since
                 :audited-at (format-time-string "%Y-%m-%d %H:%M:%S"))))
     (when (called-interactively-p 'any)
       (message "%s" (anvil-dev--audit-format-report result)))
@@ -747,6 +1062,8 @@ return a one-line string."
   "Render RESULT as a human-readable release audit report."
   (let ((arglist (plist-get result :arglist-strip))
         (params  (plist-get result :missing-params))
+        (plists  (plist-get result :plist-return))
+        (issue-fix (plist-get result :issue-fix-no-test))
         (docs    (plist-get result :non-shipped-docs))
         (clean-p (plist-get result :clean-p)))
     (concat
@@ -773,6 +1090,22 @@ return a one-line string."
                    (plist-get f :line)
                    (plist-get f :defun)
                    (plist-get f :args))))
+        (anvil-dev--audit-format-findings
+         "FAIL plist-return (tool body returns `(list :K ...)'; wrap at\n     registration or opt-out via\n     `;;; anvil-audit: tools-wrapped-at-registration' header)"
+         plists
+         (lambda (f)
+           (format "%s:%d  %s"
+                   (plist-get f :file)
+                   (plist-get f :line)
+                   (plist-get f :defun))))
+        (anvil-dev--audit-format-findings
+         "FAIL issue-fix shipped without a test change (Fixes / Closes /\n     Resolves #N but no file under `tests/' in the same commit)"
+         issue-fix
+         (lambda (f)
+           (format "%s  #%d  %s"
+                   (plist-get f :sha)
+                   (plist-get f :issue)
+                   (plist-get f :subject))))
         (anvil-dev--audit-format-findings
          "WARN design docs not yet SHIPPED (master-gate informational)"
          docs
@@ -803,6 +1136,8 @@ MCP Parameters:
   (anvil-server-register-tool
    #'anvil-dev--tool-self-sync-check
    :id "anvil-self-sync-check"
+   :intent '(dev audit)
+   :layer 'dev
    :server-id anvil-dev--server-id
    :description
    "Report the installed anvil clone's git HEAD + branch + dirty
@@ -813,6 +1148,8 @@ causes a silent \"old code loaded\" bug after a daemon restart."
   (anvil-server-register-tool
    #'anvil-dev--tool-test-run-all
    :id "anvil-test-run-all"
+   :intent '(dev test)
+   :layer 'dev
    :server-id anvil-dev--server-id
    :description
    "Run every tests/anvil-*-test.el in the anvil checkout via
@@ -823,6 +1160,8 @@ verification across every test file."
   (anvil-server-register-tool
    #'anvil-dev--tool-scaffold-module
    :id "anvil-scaffold-module"
+   :intent '(dev scaffold)
+   :layer 'dev
    :server-id anvil-dev--server-id
    :description
    "Create a new anvil-NAME.el module plus tests/anvil-NAME-test.el
@@ -833,13 +1172,20 @@ any real code lives in it."
   (anvil-server-register-tool
    #'anvil-dev--tool-release-audit
    :id "anvil-release-audit"
+   :intent '(dev audit)
+   :layer 'dev
    :server-id anvil-dev--server-id
    :description
-   "Scan the anvil tree for three pre-release hazard classes:
+   "Scan the anvil tree for five pre-release hazard classes:
 Emacs 30 `_arg' arglist-strip regressions in MCP tool wrappers,
 wrappers with real args but no `MCP Parameters:' docstring
-section, and docs/design/*.org files whose STATUS text lacks
-`SHIPPED'.  Returns a formatted report; `clean' when empty."
+section, wrappers whose body ends with a `(list :K ...)' plist
+literal (MCP string-or-nil contract violation, unless the file
+opts out via `;;; anvil-audit: tools-wrapped-at-registration'),
+issue-closing commits whose diff does not touch `tests/' (the
+37fcc52 pattern — ship a fix with no regression guard), and
+docs/design/*.org files whose STATUS text lacks `SHIPPED'.
+Returns a formatted report; `clean' when empty."
    :read-only t))
 
 (defun anvil-dev-disable ()

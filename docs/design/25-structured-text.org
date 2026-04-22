@@ -1,0 +1,204 @@
+#+title: anvil structured-text editor family — HTML / CSS / YAML / TOML / JSON / Markdown / SQL
+#+date: 2026-04-20
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope GENERIC
+
+* STATUS
+  :PROPERTIES:
+  :ID:       019daf00-0000-7000-0000-structured-text
+  :END:
+~DRAFT~ (2026-04-20) → ~DEFERRED~ (2026-04-22) — Index / concept
+doc.  Self-described above as "not itself an implementation
+roadmap"; all real implementation lives in per-format sibling docs.
+Doc 25 fulfils its role by documenting the common pattern and the
+sequencing rule; it does not itself ship code.
+
+Sibling-doc numbering note: at the time of writing this doc reserved
+"Doc 26 / 27 / 28 / 29 / 30" for HTML / CSS / YAML+TOML+JSON /
+Markdown / SQL.  Those slots have since been taken by other specs
+(Doc 26 manifest-profile, Doc 27 shell-filter, Doc 28
+progressive-disclosure, Doc 29 memory-engine, Doc 30 acp-bridge),
+so any sibling that ships uses the next free number (Doc 33+).
+The structured-text /family/ contract in this doc still applies —
+only the doc numbers move.
+
+Index / concept doc for the non-code structured text editor family.
+These formats have rich structure, but the anvil-sexp / anvil-treesit
+model (function / class / import / call) doesn't transfer cleanly.
+They need their own MCP surfaces — path-based, selector-based, or
+heading-based depending on the format.
+
+/This doc is not itself an implementation roadmap./  It sketches the
+common pattern and carves up the family into per-format sibling docs.
+Each sibling is written and ships only when real user demand surfaces.
+
+* Why a separate family
+
+Doc 21 (anvil-treesit) is function / class / import-oriented.  That
+shape fits Python / TS / JS / Rust / Go because those languages have
+functions and classes as their organisational primitives.
+
+HTML / CSS / YAML / TOML / JSON / Markdown / SQL have structure
+too, but the primitives are different:
+
+| Format    | Primitive                       | Natural MCP operation shape        |
+|-----------+---------------------------------+------------------------------------|
+| HTML      | element tree with attributes    | CSS-selector based locate / edit    |
+| CSS       | selector + property declarations| selector-match, property-set        |
+| YAML      | hierarchical map / sequence     | dotted-path get / set / delete      |
+| TOML      | hierarchical map                | dotted-path get / set / delete      |
+| JSON      | hierarchical map                | JSONPath get / set / delete         |
+| Markdown  | heading tree + prose blocks     | heading-path replace / append       |
+| SQL       | statement family                | statement-extract, clause-replace   |
+
+Trying to force these under a single "list-functions" API produces
+bad fits.  Path-based access is the common abstraction across most
+of them (YAML / TOML / JSON / Markdown / HTML-via-selector), but
+each concrete API surface is format-specific enough to warrant its
+own doc.
+
+* Common pattern
+
+All sibling docs in this family share:
+
+1. *Preview by default, ~:apply t~ is the write gate.*  Same as
+   Doc 06 (~code-add-field-by-map~), Doc 12 (anvil-sexp), Doc 21
+   (anvil-treesit).
+2. *Edit plan as plist.*  ~(:ops ((:file :range :replacement
+   :reason) ...) :summary :diff-preview)~.
+3. *Apply routed through ~file-batch-across~.*  One audit point.
+4. *Path semantics explicit.*  Every locate / edit operation names
+   the path syntax it accepts (CSS selector, dotted path, JSONPath,
+   heading path).  No ambiguity at the MCP boundary.
+5. *Format-specific tool-id prefix.*  ~html-~, ~css-~, ~yaml-~,
+   ~toml-~, ~json-~, ~md-~, ~sql-~.  No shared catch-all
+   ~structured-get~ — callers know which format they have.
+
+* Per-format sketches
+
+** HTML (Doc 26 candidate)
+
+- Backend: tree-sitter-html grammar; parse into a node tree.
+- Path syntax: CSS selectors (e.g. ~main article h1~).
+- Representative tools:
+  - ~html-select-text~ selector → text content list
+  - ~html-find-attr~ selector, attr-name → list
+  - ~html-set-attr~ selector, attr-name, value, apply?
+  - ~html-wrap~ selector, wrapper-html, apply?
+  - ~html-unwrap~ selector, apply?
+  - ~html-replace-inner~ selector, new-inner, apply?
+- Existing overlap: ~anvil-browser--tool-fetch~ returns an
+  accessibility tree that partly solves the "get text content"
+  need.  This doc is for /mutation/, not reading rendered pages.
+
+** CSS (Doc 27 candidate)
+
+- Backend: tree-sitter-css.
+- Path syntax: selector strings.
+- Representative tools:
+  - ~css-list-rules~ → list of selectors
+  - ~css-get-property~ selector, property → value
+  - ~css-set-property~ selector, property, value, apply?
+  - ~css-add-rule~ selector, properties, apply?
+  - ~css-remove-rule~ selector, apply?
+- Deliberately avoids preprocessor parsing (Sass / Less) — those
+  grow their own doc if needed.
+
+** YAML / TOML / JSON (Doc 28 candidate)
+
+One doc for the three because the operation surface is the same —
+hierarchical map access by dotted / indexed path.
+
+- Backends: built-in Emacs ~yaml.el~ / ~toml.el~-equivalent +
+  ~json-parse-string~ for JSON.  tree-sitter-yaml / tree-sitter-toml
+  remain available as fallbacks for when the Emacs package can't
+  preserve formatting.
+- Path syntax: dotted with array indices (~foo.bar[0].baz~).  JSONPath
+  is a superset; we accept the simple form by default.
+- Representative tools (same names across formats, different
+  prefixes):
+  - ~yaml-get-path~ file, path → value
+  - ~yaml-set-path~ file, path, value, apply?
+  - ~yaml-delete-path~ file, path, apply?
+  - ~yaml-list-keys~ file, path? → list of keys
+- Shared concern: *preserving formatting / comments*.  YAML and
+  TOML allow comments that the parse-and-rewrite cycle can drop.
+  Phase 1 of this sub-doc should either (a) preserve comments
+  (prefer) or (b) loudly refuse to apply when comments exist.
+  ~json-object-add~ already ships as a partial solution for JSON;
+  Doc 28 would extend to get / delete / path-traverse.
+
+** Markdown (Doc 29 candidate)
+
+- Backend: pandoc via ~anvil-offload~ for accurate parsing, or
+  ~markdown-mode~'s heading regex for cheap locates.  Decision
+  deferred to when the doc is written.
+- Path syntax: heading-path (~Chapter 2 > Section 3~).
+- Representative tools:
+  - ~md-list-headings~ file → list with levels
+  - ~md-find-section~ file, heading-path → range
+  - ~md-replace-section~ file, heading-path, new-body, apply?
+  - ~md-append-to-section~ file, heading-path, text, apply?
+  - ~md-extract-code-blocks~ file, lang? → list
+  - ~md-update-frontmatter~ file, yaml-path, value, apply?
+    (routes through Doc 28)
+
+** SQL (Doc 30 candidate)
+
+- Backend: tree-sitter-sql (dialect-tagged).
+- Path syntax: statement index + clause name.
+- Representative tools:
+  - ~sql-list-statements~ file → list of (:kind :start :end)
+  - ~sql-extract-where~ file, stmt-index → clause text
+  - ~sql-replace-clause~ file, stmt-index, clause, new-text, apply?
+  - ~sql-find-tables~ file → list of referenced tables
+- Dialect hazard: MySQL / PostgreSQL / SQLite have diverging
+  grammars.  Doc 30 picks one as the default and documents the
+  others as explicit opt-in via ~:dialect~ keyword.
+
+* Non-goals
+
+- *Unifying all seven formats under one MCP tool.*  Callers carry
+  file-extension knowledge; the routing is explicit, not
+  auto-detected at the tool-id level.
+- *Formatting preservation beyond what the parser supports.*  Each
+  sibling doc documents its own formatting behaviour.  Round-trip
+  that would reformat the file is out of scope at the anvil layer
+  — we refuse to apply when that would happen, and point the
+  caller at a formatter (prettier / yq / jq / dprint) as a
+  post-step.
+- *Schema validation.*  Doc 28 (YAML / TOML / JSON) does not
+  validate against JSON Schema / OpenAPI / TOML schemas.  Callers
+  that need that run their own validator pre-apply.
+
+* Priority / sequencing
+
+None of Docs 26 / 27 / 28 / 29 / 30 are in the current ship
+queue.  They get written when:
+
+1. r/emacs post reaction indicates demand for one of them, or
+2. The author's own electrical-engineering workflow surfaces a
+   concrete need (likeliest: YAML / JSON for config files).
+
+The expected order if all of them ship is:
+
+1. *Doc 28* (YAML / TOML / JSON) — highest operational utility;
+   every anvil user will edit these.
+2. *Doc 29* (Markdown) — AI-output / docs editing.
+3. *Doc 26* (HTML) — web-dev users.
+4. *Doc 27* (CSS) — web-dev users.
+5. *Doc 30* (SQL) — niche but valuable for data workflows.
+
+* References
+
+- Doc 06 (~06-code-transform-tools.org~): preview / apply plan
+  convention.
+- Doc 12 (~12-sexp-edits.org~): elisp reader-based sibling
+  approach.
+- Doc 21 (~21-treesit-edits.org~): brace-keyword tree-sitter
+  sibling.  Explicitly excludes the structured-text family.
+- Doc 24 (~24-lisp-reader.org~): Lisp-family reader-based sibling.
+- ~anvil-file--tool-outline~ already exposes heading lists for
+  org / elisp / md; extending to the other formats in this family
+  is a cheap incremental step ahead of the per-format docs above.

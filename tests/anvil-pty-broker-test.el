@@ -117,6 +117,98 @@
       (should-error (anvil-pty-broker--tool-spawn "bash")
                     :type 'error))))
 
+;;; --- Phase 2b: pty-read-filtered (tail + shell-filter integration) ------
+
+(defun anvil-pty-broker-test--shell-filter-loaded-p ()
+  "Return non-nil when anvil-shell-filter is loaded in this process."
+  (and (require 'anvil-shell-filter nil t)
+       (fboundp 'anvil-shell-filter-apply)))
+
+(ert-deftest anvil-pty-broker-test/read-filtered-applies-filter ()
+  "pty-read-filtered routes raw output through a named shell-filter and
+reports raw-size vs filtered-size.  When shell-filter is loaded the
+compressed size must be strictly smaller than the raw for a filter
+that's expected to help (docker-logs on a deduplicable sample)."
+  (skip-unless (anvil-pty-broker-test--shell-filter-loaded-p))
+  (anvil-pty-broker-test--with-clean-state
+    (puthash "p1"
+             (list :output
+                   "2026-04-22T10:00:00Z app started
+2026-04-22T10:00:01Z heartbeat
+2026-04-22T10:00:02Z heartbeat
+2026-04-22T10:00:03Z heartbeat
+2026-04-22T10:00:04Z heartbeat
+"
+                   :events nil
+                   :tail-cursor 0)
+             anvil-pty-broker--ptys)
+    (let ((r (anvil-pty-read-filtered "p1" 'docker-logs nil nil)))
+      (should (equal (plist-get r :id) "p1"))
+      (should (equal (plist-get r :filter) "docker-logs"))
+      (should (integerp (plist-get r :raw-size)))
+      (should (integerp (plist-get r :filtered-size)))
+      (should (< (plist-get r :filtered-size)
+                 (plist-get r :raw-size)))
+      (should (stringp (plist-get r :output))))))
+
+(ert-deftest anvil-pty-broker-test/read-filtered-tail-advances-cursor ()
+  "With TAIL non-nil each call returns only output appended since the
+previous tail read, advancing the per-pty tail-cursor.  Models the
+streaming log-tail use case that Phase 2b was cut out for."
+  (anvil-pty-broker-test--with-clean-state
+    (puthash "p2"
+             (list :output "chunk-1\n" :events nil :tail-cursor 0)
+             anvil-pty-broker--ptys)
+    (let ((r1 (anvil-pty-read-filtered "p2" nil t nil)))
+      (should (equal (plist-get r1 :output) "chunk-1\n"))
+      (should (= (plist-get r1 :tail-cursor) (length "chunk-1\n"))))
+    ;; Simulate the broker appending a new chunk between reads.
+    (let ((row (gethash "p2" anvil-pty-broker--ptys)))
+      (plist-put row :output "chunk-1\nchunk-2\n"))
+    (let ((r2 (anvil-pty-read-filtered "p2" nil t nil)))
+      ;; Only the new slice is returned, cursor advanced to new end.
+      (should (equal (plist-get r2 :output) "chunk-2\n"))
+      (should (= (plist-get r2 :raw-size) (length "chunk-2\n")))
+      (should (= (plist-get r2 :tail-cursor)
+                 (length "chunk-1\nchunk-2\n"))))))
+
+(ert-deftest anvil-pty-broker-test/read-filtered-nil-filter-passthrough ()
+  "A nil / empty filter returns the raw text unchanged, with
+filtered-size == raw-size.  Lets callers use tail-cursor bookkeeping
+without requiring a shell-filter handler."
+  (anvil-pty-broker-test--with-clean-state
+    (puthash "p3"
+             (list :output "abc" :events nil :tail-cursor 0)
+             anvil-pty-broker--ptys)
+    (let ((r (anvil-pty-read-filtered "p3" nil nil nil)))
+      (should (equal (plist-get r :output) "abc"))
+      (should (= (plist-get r :raw-size) 3))
+      (should (= (plist-get r :filtered-size) 3))
+      (should (null (plist-get r :filter))))
+    (let ((r (anvil-pty-read-filtered "p3" "" nil nil)))
+      (should (equal (plist-get r :output) "abc"))
+      (should (null (plist-get r :filter))))))
+
+(ert-deftest anvil-pty-broker-test/read-filtered-missing-pty-signals ()
+  "Unknown pty ids raise — the tool is honest about not silently
+returning empty strings for ids that never existed."
+  (anvil-pty-broker-test--with-clean-state
+    (should-error (anvil-pty-read-filtered "no-such" nil nil nil))))
+
+(ert-deftest anvil-pty-broker-test/read-filtered-consume-resets-cursor ()
+  "CONSUME=t drains :output and resets the tail cursor, matching
+`anvil-pty-read' semantics but on the filtered variant."
+  (anvil-pty-broker-test--with-clean-state
+    (puthash "p4"
+             (list :output "hello" :events nil :tail-cursor 3)
+             anvil-pty-broker--ptys)
+    (let ((r (anvil-pty-read-filtered "p4" nil nil t)))
+      (should (equal (plist-get r :output) "hello"))
+      (should (plist-get r :consumed)))
+    (let ((row (gethash "p4" anvil-pty-broker--ptys)))
+      (should (equal (plist-get row :output) ""))
+      (should (= (plist-get row :tail-cursor) 0)))))
+
 ;;; --- live integration (requires node + node-pty) ------------------------
 
 (ert-deftest anvil-pty-broker-test/live-enable-disable-roundtrip ()

@@ -2,12 +2,26 @@
 #+date: 2026-04-19
 #+author: zawatton
 #+property: status DRAFT
+#+property: scope GENERIC
 
 * STATUS
   :PROPERTIES:
   :ID:       7016882a-6cc2-484e-b13d-d28386ac2a07
   :END:
-~DRAFT~ (2026-04-19)
+~DRAFT~ (2026-04-19) → ~DEFERRED~ (2026-04-22) — Pure UX sugar
+over Doc 10 Phase 1b (`:depends-on' DAG) + Phase 4b (judge
+primitive); both already shipped.  Today the pattern composes by
+hand via `orchestrator-submit' calls and the cost is acceptable
+for the rare "actually needs paired review" task.  Re-trigger
+criteria:
+
+1. The maintainer composes the pair-review pattern by hand 3+
+   times in a single session (signal that it's worth packaging).
+2. External user reports the pattern as a missing first-class
+   workflow on r/emacs / GitHub issues.
+3. Doc 10 grows additional reviewer/judge knobs that would be
+   awkward to expose individually but natural inside one
+   `pair-review' tool.
 
 Tier 3 of Week-2 roadmap.  Extends anvil-orchestrator with a
 peer-review primitive: one Claude's output is reviewed by another AI

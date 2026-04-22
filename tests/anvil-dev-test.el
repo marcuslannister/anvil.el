@@ -436,6 +436,67 @@ Non-git `call-process' calls still signal exit-status 1."
             (should (null (plist-get r :non-shipped-docs)))))
       (delete-directory d t))))
 
+(ert-deftest anvil-dev-test-audit-accepts-shipped-on-later-line ()
+  "STATUS first line `~DRAFT~ → ~SHIPPED~' style passes — keyword
+appears anywhere in the body, not only on the first line."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "docs/design/17-session.org" d)
+           (concat
+            "* STATUS\n"
+            "~DRAFT~ (2026-04-19, extended 2026-04-20 with Phase 3-4) →\n"
+            "~SHIPPED~ (2026-04-22, develop branch).\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :non-shipped-docs)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-accepts-deferred-as-non-blocker ()
+  "DEFERRED specs are intentional non-blockers and must not appear
+in the master-merge gate report."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "docs/design/30-acp.org" d)
+           (concat
+            "* STATUS\n"
+            "~DRAFT~ (2026-04-21) → ~DEFERRED~ (2026-04-22 after research).\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :non-shipped-docs)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-accepts-audit-research-memo ()
+  "AUDIT memos are research-only, treated as non-blockers."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "docs/design/32-rhblind.org" d)
+           "* STATUS\n~AUDIT~ (2026-04-22) — research memo only.\n")
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :non-shipped-docs)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-rejects-lowercase-shipped-narrative ()
+  "Lowercase `shipped' inside narrative prose must not pass the gate.
+Only the all-caps status keyword counts."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "docs/design/20-pty2.org" d)
+           (concat
+            "* STATUS\n"
+            "~DRAFT~ (2026-04-19)\n\n"
+            "Extends the shipped Phase 1 broker with TUI semantics.\n"))
+          (let* ((r (anvil-dev-release-audit d))
+                 (docs (plist-get r :non-shipped-docs)))
+            (should (= 1 (length docs)))
+            (should (equal "20-pty2.org" (plist-get (car docs) :file)))))
+      (delete-directory d t))))
+
 (ert-deftest anvil-dev-test-audit-skips-properties-drawer ()
   "The status extractor must skip the :PROPERTIES: drawer before
 picking up the status line itself."
@@ -554,5 +615,295 @@ picking up the status line itself."
               (should (= 3 (plist-get r :total)))
               (should (= 3 (plist-get r :passed)))))
         (delete-directory default-directory t)))))
+
+;;;; --- plist-return scanner (v0.3.1-class regression guard) --------------
+
+(ert-deftest anvil-dev-test-audit-flags-plist-return ()
+  "A wrapper whose body ends with `(list :K ...)' is flagged."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            "(defun anvil-foo--tool-send (id text)\n"
+            "  \"Send.\n\nMCP Parameters:\n  id - x\n  text - y\"\n"
+            "  (foo id text)\n"
+            "  (list :sent (length text)))\n"))
+          (let* ((r (anvil-dev-release-audit d))
+                 (hits (plist-get r :plist-return)))
+            (should (= 1 (length hits)))
+            (should (equal "anvil-foo--tool-send"
+                           (plist-get (car hits) :defun)))
+            (should-not (plist-get r :clean-p))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-allows-string-return ()
+  "A wrapper whose body ends with a string is NOT flagged."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            "(defun anvil-foo--tool-echo (text)\n"
+            "  \"Echo.\n\nMCP Parameters:\n  text - x\"\n"
+            "  (format \"received: %s\" text))\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :plist-return)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-allows-json-encode-return ()
+  "A wrapper ending in `(json-encode ...)' is NOT flagged."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            "(defun anvil-foo--tool-probe (id)\n"
+            "  \"Probe.\n\nMCP Parameters:\n  id - x\"\n"
+            "  (json-encode `((id . ,id) (ok . t))))\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :plist-return)))) )
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-respects-plist-return-exemption-marker ()
+  "A file tagged `tools-wrapped-at-registration' is not scanned for plist return."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            ";;; anvil-foo.el --- test -*- lexical-binding: t; -*-\n"
+            ";;; anvil-audit: tools-wrapped-at-registration\n\n"
+            "(defun anvil-foo--tool-send (id text)\n"
+            "  \"Send.\n\nMCP Parameters:\n  id - x\n  text - y\"\n"
+            "  (list :sent (length text)))\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :plist-return)))) )
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-plist-return-ignores-non-terminal-list ()
+  "A `(list :K ...)' form that is NOT the last expression is not flagged."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            "(defun anvil-foo--tool-submit (payload)\n"
+            "  \"Submit.\n\nMCP Parameters:\n  payload - x\"\n"
+            "  (let ((slim (list :payload payload :ok t)))\n"
+            "    (foo slim)\n"
+            "    (format \"submitted %S\" slim)))\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :plist-return)))) )
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-plist-return-ignores-nested-in-format ()
+  "A `(list :K ...)' nested as an arg of `format' is not flagged
+— the defun's terminal value is the `format' string, not the list."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            "(defun anvil-foo--tool-outline (path)\n"
+            "  \"Outline.\n\nMCP Parameters:\n  path - x\"\n"
+            "  (anvil-server-with-error-handling\n"
+            "   (let ((items (foo path)))\n"
+            "     (format \"%S\" (list :path path :items items)))))\n"))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :plist-return)))) )
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-plist-return-catches-wrapped-let ()
+  "A `(let (...) (list :K ...))' wrapped in `anvil-server-with-error-handling'
+must still be flagged — sequencing forms are unwrapped before the
+terminal check so the real plist return is visible."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-foo.el" d)
+           (concat
+            "(defun anvil-foo--tool-run (id)\n"
+            "  \"Run.\n\nMCP Parameters:\n  id - x\"\n"
+            "  (anvil-server-with-error-handling\n"
+            "   (let* ((raw (foo id)))\n"
+            "     (list :id id :raw raw))))\n"))
+          (let* ((r (anvil-dev-release-audit d))
+                 (hits (plist-get r :plist-return)))
+            (should (= 1 (length hits)))
+            (should (equal "anvil-foo--tool-run"
+                           (plist-get (car hits) :defun)))
+            (should-not (plist-get r :clean-p))) )
+      (delete-directory d t))))
+
+;;;; --- issue-fix-no-test scanner (37fcc52-class guard) ------------------
+
+(defun anvil-dev-test--audit-make-git-repo ()
+  "Return a fresh temp dir initialised as a git repo with an empty tests/ dir."
+  (let ((d (make-temp-file "anvil-dev-audit-git-" t)))
+    (make-directory (expand-file-name "docs/design" d) t)
+    (make-directory (expand-file-name "tests" d) t)
+    (let ((default-directory (file-name-as-directory d)))
+      (call-process "git" nil nil nil "init" "-q" "-b" "master")
+      (call-process "git" nil nil nil "config" "user.email" "t@example.com")
+      (call-process "git" nil nil nil "config" "user.name"  "Tester")
+      (call-process "git" nil nil nil "config" "commit.gpgsign" "false"))
+    d))
+
+(defun anvil-dev-test--audit-git-commit (d message &rest files)
+  "Create FILES with `path→content' pairs inside D and commit with MESSAGE."
+  (let ((default-directory (file-name-as-directory d)))
+    (while files
+      (let ((path (pop files))
+            (content (pop files)))
+        (let ((abs (expand-file-name path d)))
+          (make-directory (file-name-directory abs) t)
+          (with-temp-file abs (insert content)))))
+    (call-process "git" nil nil nil "add" "-A")
+    (call-process "git" nil nil nil "commit" "-q" "--allow-empty" "-m" message)))
+
+(ert-deftest anvil-dev-test-audit-issue-fix-without-test-flags-hit ()
+  "A commit `Fixes #N' that touches only source (not tests/) is flagged."
+  (let ((d (anvil-dev-test--audit-make-git-repo)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-git-commit
+           d "initial"
+           "anvil-foo.el" "(provide 'anvil-foo)\n")
+          (anvil-dev-test--audit-git-commit
+           d "fix(foo): guard against NPE\n\nFixes #42"
+           "anvil-foo.el" ";; edited\n(provide 'anvil-foo)\n")
+          (let* ((r (anvil-dev-release-audit d))
+                 (hits (plist-get r :issue-fix-no-test)))
+            (should (= 1 (length hits)))
+            (should (= 42 (plist-get (car hits) :issue)))
+            (should-not (plist-get r :clean-p))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-issue-fix-with-test-is-clean ()
+  "A commit `Fixes #N' that touches tests/ is NOT flagged."
+  (let ((d (anvil-dev-test--audit-make-git-repo)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-git-commit
+           d "initial" "anvil-foo.el" "(provide 'anvil-foo)\n")
+          (anvil-dev-test--audit-git-commit
+           d "fix(foo): guard against NPE\n\nFixes #42"
+           "anvil-foo.el" ";; fix\n(provide 'anvil-foo)\n"
+           "tests/anvil-foo-test.el"
+           "(require 'ert)\n(ert-deftest anvil-foo-guards-npe () (should t))\n")
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :issue-fix-no-test)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-issue-fix-ignores-regular-commits ()
+  "Commits without `Fixes|Closes|Resolves #N' are never flagged, even
+if they don't touch tests."
+  (let ((d (anvil-dev-test--audit-make-git-repo)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-git-commit
+           d "initial" "anvil-foo.el" "(provide 'anvil-foo)\n")
+          (anvil-dev-test--audit-git-commit
+           d "feat(foo): a feature without tests, not an issue fix"
+           "anvil-foo.el" ";; feature\n(provide 'anvil-foo)\n")
+          (let ((r (anvil-dev-release-audit d)))
+            (should (null (plist-get r :issue-fix-no-test)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-issue-fix-depth-0-disables-scan ()
+  "Setting `anvil-dev-audit-issue-fix-commit-depth' to 0 turns the scan off."
+  (let ((d (anvil-dev-test--audit-make-git-repo)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-git-commit
+           d "initial" "anvil-foo.el" "(provide 'anvil-foo)\n")
+          (anvil-dev-test--audit-git-commit
+           d "fix(foo): Fixes #7"
+           "anvil-foo.el" ";; fix\n(provide 'anvil-foo)\n")
+          (let ((anvil-dev-audit-issue-fix-commit-depth 0))
+            (let ((r (anvil-dev-release-audit d)))
+              (should (null (plist-get r :issue-fix-no-test))))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-issue-fix-non-git-root-is-safe ()
+  "A directory that is not a git worktree simply returns an empty list."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (let ((r (anvil-dev-release-audit d)))
+          (should (null (plist-get r :issue-fix-no-test))))
+      (delete-directory d t))))
+
+
+;;;; --- Phase C: :unused-since scanner (Doc 34) ----------------------------
+
+(require 'anvil-state)
+(require 'anvil-discovery)
+
+(ert-deftest anvil-dev-test-audit-unused-since-omitted-is-nil ()
+  "Without :unused-since the Phase C scanner does not run."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (let ((r (anvil-dev-release-audit d)))
+          (should (null (plist-get r :unused-tools)))
+          (should (null (plist-get r :unused-since))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-unused-since-reports-stale-and-never ()
+  "With :unused-since the scanner reports stale counters and
+never-called tools against the current registry."
+  (let ((d (anvil-dev-test--audit-make-root))
+        (anvil-server--tools (make-hash-table :test #'equal))
+        (anvil-state-db-path (make-temp-file "anvil-dev-audit-" nil ".db"))
+        (anvil-state--db nil))
+    (unwind-protect
+        (progn
+          (anvil-state-enable)
+          (anvil-server-register-tool
+           (lambda () "ok") :id "recent-tool"
+           :description "r" :intent '(file-edit) :layer 'core)
+          (anvil-server-register-tool
+           (lambda () "ok") :id "stale-tool"
+           :description "s" :intent '(file-edit) :layer 'core)
+          (anvil-server-register-tool
+           (lambda () "ok") :id "never-tool"
+           :description "n" :intent '(file-edit) :layer 'core)
+          (let ((now (truncate (float-time))))
+            (anvil-state-set
+             "recent-tool"
+             (list :count 1 :last-called now :first-seen now
+                   :server-id "default")
+             :ns anvil-discovery--usage-ns)
+            (anvil-state-set
+             "stale-tool"
+             (list :count 3
+                   :last-called (- now (* 45 86400))
+                   :first-seen (- now (* 45 86400))
+                   :server-id "default")
+             :ns anvil-discovery--usage-ns))
+          (let* ((r (anvil-dev-release-audit d :unused-since 30))
+                 (found (plist-get r :unused-tools))
+                 (ids (mapcar (lambda (p) (plist-get p :id)) found))
+                 (reasons (mapcar (lambda (p) (cons (plist-get p :id)
+                                                   (plist-get p :reason)))
+                                  found)))
+            (should (equal 30 (plist-get r :unused-since)))
+            (should-not (member "recent-tool" ids))
+            (should (member "stale-tool" ids))
+            (should (member "never-tool" ids))
+            (should (eq 'stale (cdr (assoc "stale-tool" reasons))))
+            (should (eq 'never-called (cdr (assoc "never-tool" reasons))))
+            (should (plist-get r :clean-p))))
+      (anvil-discovery-usage-clear)
+      (anvil-state-disable)
+      (ignore-errors (delete-file anvil-state-db-path))
+      (delete-directory d t))))
 
 ;;; anvil-dev-test.el ends here

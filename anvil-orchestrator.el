@@ -1,4 +1,5 @@
 ;;; anvil-orchestrator.el --- Parallel AI CLI dispatcher for anvil -*- lexical-binding: t; -*-
+;;; anvil-audit: tools-wrapped-at-registration
 
 ;; Copyright (C) 2025-2026 zawatton
 
@@ -46,6 +47,17 @@
 (require 'anvil-server)
 (require 'anvil-state)
 (require 'anvil-git)
+
+(declare-function anvil-orchestrator-select-provider "anvil-orchestrator-routing"
+                  (&rest args))
+(declare-function anvil-orchestrator-routing--register-tools
+                  "anvil-orchestrator-routing")
+(declare-function anvil-orchestrator-routing--unregister-tools
+                  "anvil-orchestrator-routing")
+(declare-function anvil-orchestrator--preset-resolve
+                  "anvil-orchestrator-presets"
+                  (preset caller-providers caller-overrides
+                          caller-timeout-sec caller-budget-usd))
 
 ;;;; --- configuration ------------------------------------------------------
 
@@ -203,6 +215,50 @@ support.  Override per task with `:no-worktree t'."
   :type 'boolean
   :group 'anvil-orchestrator)
 
+(defcustom anvil-orchestrator-manifest-profile nil
+  "Active `anvil-manifest' profile for orchestrator child sessions.
+Symbol (one of `ultra', `nav', `core', `lean', `agent', `edit') or
+nil (Phase 1b disabled).
+
+When non-nil AND `anvil-orchestrator-manifest-stdio-command' is
+populated, each provider that supports MCP config injection (claude
+today) generates a per-task JSON file pointing at the virtual
+server-id `emacs-eval-PROFILE', and appends `--mcp-config FILE' to
+its argv.  The result: child sessions see only the PROFILE-filtered
+`tools/list' without the user hand-editing `~/.claude.json'.
+
+The Phase 0 ROI measurement (2026-04-20) concluded main-session
+applications save <1% tokens, so this is *opt-in* — leave nil for
+main-session main-daemon behavior unchanged.
+
+Doc 34 Phase B added `agent' (orchestrator / session / memory /
+browser + edit tools, layer=core+workflow) and `edit' (file / org /
+code / json / db only, layer=core).  For long-running orchestrator
+tasks, `agent' is the recommended default — child sessions get
+enough surface to plan + edit but drop bench / meta / experimental
+layers.
+
+Override per task with `:no-manifest-override t' on the task plist
+(useful for tasks that need the full MCP surface — debugging
+orchestrator, running `manifest-cost' against the unfiltered
+server, etc.)."
+  :type '(choice (const :tag "Disabled" nil)
+                 (const :tag "Agent (Doc 34 Phase B, recommended)" agent)
+                 (const :tag "Edit (Doc 34 Phase B)" edit)
+                 (const ultra) (const nav) (const core) (const lean)
+                 (symbol :tag "Other profile"))
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-manifest-stdio-command nil
+  "Absolute path to the user's `anvil-stdio.sh' wrapper (or equivalent).
+Used by Phase 1b manifest injection to build the `mcpServers' entry
+in the generated MCP config file.  When nil or the file does not
+exist, manifest injection is a no-op — protects users from shipping
+a broken `--mcp-config' to their child sessions."
+  :type '(choice (const :tag "Autodetect / disabled" nil)
+                 (file :tag "Path to anvil-stdio.sh"))
+  :group 'anvil-orchestrator)
+
 (defcustom anvil-orchestrator-output-size-cap (* 1024 1024)
   "Per-task stdout / stderr byte ceiling before head + tail truncation."
   :type 'integer
@@ -337,6 +393,100 @@ Collapses the `(setq cmd (append cmd (list ...)))' pattern that
 every provider build-cmd repeats.  Does not mutate CMD."
   (if test (append cmd items) cmd))
 
+;;;; --- Phase 1b manifest auto-inject helpers (Doc 26) ---------------------
+
+(defconst anvil-orchestrator--manifest-virtual-server-prefix "emacs-eval-"
+  "Prefix for the virtual server-id derived from the manifest profile.
+`anvil-manifest' installs aliases of the form `emacs-eval-PROFILE'
+in `anvil-server-id-aliases' at `anvil-manifest-enable' time; this
+constant must agree with that convention.")
+
+(defun anvil-orchestrator--manifest-config-file-path (task-id)
+  "Return a deterministic temp path for TASK-ID's manifest MCP config.
+Keying on the task id lets the sentinel clean up the same file
+`--claude-build-cmd' wrote to without stashing state on the process
+object.  The file lives under `temporary-file-directory' with a
+fixed prefix so accidental collisions with unrelated temp files are
+vanishingly unlikely."
+  (expand-file-name
+   (format "anvil-orch-manifest-%s.json"
+           (or task-id "anon"))
+   temporary-file-directory))
+
+(defun anvil-orchestrator--manifest-active-profile (task)
+  "Return the manifest profile symbol to apply to TASK, or nil to skip.
+Checks the opt-out first (`:no-manifest-override t') then falls back
+to `anvil-orchestrator-manifest-profile'.  The stdio-command is
+validated by the caller, not here — callers who only need to know
+`do we inject?' can combine this with `--manifest-stdio-ready-p'."
+  (and (not (plist-get task :no-manifest-override))
+       anvil-orchestrator-manifest-profile
+       (symbolp anvil-orchestrator-manifest-profile)
+       anvil-orchestrator-manifest-profile))
+
+(defun anvil-orchestrator--manifest-stdio-ready-p ()
+  "Return non-nil when the stdio-command customization is usable.
+Phase 1b degrades gracefully when the path is unset or missing so a
+half-configured user does not end up shipping broken MCP config to
+claude."
+  (let ((cmd anvil-orchestrator-manifest-stdio-command))
+    (and (stringp cmd)
+         (not (string-empty-p cmd))
+         (file-exists-p cmd))))
+
+(defun anvil-orchestrator--manifest-write-config (task profile)
+  "Write a per-task MCP config file for PROFILE, return its path.
+TASK's `:id' keys the path; the file contains a single `mcpServers'
+entry named `emacs-eval-PROFILE' pointing at
+`anvil-orchestrator-manifest-stdio-command' with `--server-id=' +
+`--init-function=anvil-enable' args.
+
+Signals if the write fails — build-cmd's caller handles the
+downstream error in the usual orchestrator failure envelope."
+  (let* ((task-id     (or (plist-get task :id) "anon"))
+         (virtual-id  (concat anvil-orchestrator--manifest-virtual-server-prefix
+                              (symbol-name profile)))
+         (path        (anvil-orchestrator--manifest-config-file-path task-id))
+         (entry       (list :type "stdio"
+                            :command anvil-orchestrator-manifest-stdio-command
+                            :args (vector (concat "--server-id=" virtual-id)
+                                          "--init-function=anvil-enable")
+                            :env (make-hash-table)))
+         (servers     (let ((h (make-hash-table :test 'equal)))
+                        (puthash virtual-id entry h)
+                        h))
+         (payload     (let ((h (make-hash-table :test 'equal)))
+                        (puthash "mcpServers" servers h)
+                        h)))
+    (with-temp-file path
+      (insert (json-serialize payload
+                              :false-object :false
+                              :null-object :null)))
+    path))
+
+(defun anvil-orchestrator--manifest-inject-mcp-config (cmd task)
+  "Append `--mcp-config FILE' to CMD when Phase 1b should fire for TASK.
+Returns CMD unchanged when the profile is disabled, the task opts
+out, or the stdio command customization is not usable.  The
+generated file is removed by the sentinel — see
+`--manifest-cleanup-config' further down."
+  (let ((profile (anvil-orchestrator--manifest-active-profile task)))
+    (cond
+     ((null profile) cmd)
+     ((not (anvil-orchestrator--manifest-stdio-ready-p)) cmd)
+     (t
+      (let ((path (anvil-orchestrator--manifest-write-config task profile)))
+        (append cmd (list "--mcp-config" path)))))))
+
+(defun anvil-orchestrator--manifest-cleanup-config (task-id)
+  "Remove the manifest MCP config file that belonged to TASK-ID.
+Called from the sentinel path; silently no-ops when the file is
+already gone (file not created because manifest injection was
+disabled for this task)."
+  (let ((path (anvil-orchestrator--manifest-config-file-path task-id)))
+    (when (and path (file-exists-p path))
+      (ignore-errors (delete-file path)))))
+
 ;;;; --- claude provider (built-in) -----------------------------------------
 
 (defconst anvil-orchestrator--claude-price-table
@@ -404,6 +554,12 @@ provider natively supports it)."
                cmd bare     "--bare"))
     (setq cmd (anvil-orchestrator--argv-append-when
                cmd wt-name  "--worktree" wt-name))
+    ;; Phase 1b (Doc 26): auto-inject --mcp-config pointing at the
+    ;; virtual server-id so the child session sees a profile-filtered
+    ;; tools/list without user-side config edits.  No-op when the
+    ;; profile is disabled, the task opts out, or the stdio command
+    ;; customization is not usable.
+    (setq cmd (anvil-orchestrator--manifest-inject-mcp-config cmd task))
     ;; Prompt is the positional argument; CLI treats remaining argv as prompt.
     (append cmd (list prompt))))
 
@@ -1454,6 +1610,10 @@ stream-json NDJSON survives round-trip."
       (with-current-buffer err-buf
         (write-region (point-min) (point-max) stderr nil 'silent))
       (kill-buffer err-buf))
+    ;; Phase 1b cleanup: remove the per-task MCP config file generated
+    ;; by `--manifest-inject-mcp-config'.  No-op when injection was
+    ;; disabled for this task (file never existed).
+    (anvil-orchestrator--manifest-cleanup-config id)
     (let ((out-orig (and stdout
                          (anvil-orchestrator--truncate-output-file stdout)))
           (err-orig (and stderr
@@ -1776,7 +1936,28 @@ Signals `user-error' on missing / malformed fields."
         (user-error "anvil-orchestrator: task :provider missing (%s)"
                     (plist-get task :name)))
       (when (stringp prov)
-        (setq task (plist-put task :provider (intern prov)))))
+        (setq prov (intern prov))
+        (setq task (plist-put task :provider prov)))
+      (when (eq prov 'auto)
+        (require 'anvil-orchestrator-routing)
+        (let* ((policy (plist-get task :policy))
+               (decision (anvil-orchestrator-select-provider
+                          :prompt (plist-get task :prompt)
+                          :policy policy))
+               (chosen (plist-get decision :provider)))
+          (unless chosen
+            (user-error
+             "anvil-orchestrator: :provider auto selected nil (%s) — %s"
+             (plist-get task :name)
+             (plist-get decision :reason)))
+          (setq task (plist-put task :provider chosen))
+          (setq task (plist-put task :routing-policy
+                                (plist-get decision :policy)))
+          (setq task (plist-put task :routing-chose chosen))
+          (setq task (plist-put task :routing-candidates
+                                (plist-get decision :candidates)))
+          (setq task (plist-put task :routing-cold-start
+                                (plist-get decision :cold-start))))))
     (unless (and (stringp (plist-get task :prompt))
                  (not (string-empty-p (plist-get task :prompt))))
       (user-error "anvil-orchestrator: task :prompt missing (%s)"
@@ -2098,7 +2279,7 @@ fallbacks per task (each per-provider override wins over a default)."
 
 ;;;###autoload
 (cl-defun anvil-orchestrator-submit-consensus
-    (&key prompt providers overrides timeout-sec budget-usd)
+    (&key prompt preset providers overrides timeout-sec budget-usd)
   "Dispatch PROMPT to each provider in PROVIDERS and return a plist.
 Result: (:consensus-id STR :batch-id STR :providers (SYM...) :task-ids (STR...)).
 
@@ -2106,32 +2287,54 @@ PROVIDERS must be a list of registered provider symbols with
 length >= 2.  OVERRIDES is an alist ((provider . (:key val ...)))
 whose per-provider plist is merged into the corresponding task
 (e.g. per-provider :model).  TIMEOUT-SEC and BUDGET-USD apply as
-defaults for every fan-out task unless already set in OVERRIDES."
+defaults for every fan-out task unless already set in OVERRIDES.
+
+PRESET (optional symbol) names a registered consensus preset
+(see `anvil-orchestrator-consensus-preset-set', Doc 23).  When
+supplied, any of the other keywords the caller omits are filled
+from the preset — caller-supplied keywords always win.  Unknown
+preset names signal `user-error'.  Phase 3 of Doc 23 will extend
+preset resolution with an auto-judge opt-in."
   (unless (and (stringp prompt) (not (string-empty-p prompt)))
     (user-error "consensus: prompt must be a non-empty string"))
-  (unless (and (listp providers) (>= (length providers) 2))
-    (user-error "consensus: providers must be a list of length >= 2"))
-  (dolist (p providers)
-    (unless (anvil-orchestrator--provider p)
-      (user-error "consensus: unknown provider %S" p)))
-  (let* ((consensus-id (anvil-orchestrator--uuid))
-         (defaults (append
-                    (and timeout-sec (list :timeout-sec timeout-sec))
-                    (and budget-usd  (list :budget-usd budget-usd))))
-         (tasks    (anvil-orchestrator--consensus-build-tasks
-                    prompt providers overrides defaults))
-         (batch-id (anvil-orchestrator-submit tasks))
-         (task-ids (gethash batch-id anvil-orchestrator--batches))
-         (meta     (list :batch-id batch-id
-                         :providers providers
-                         :task-ids task-ids
-                         :created-at (float-time))))
-    (puthash consensus-id meta anvil-orchestrator--consensus-groups)
-    (anvil-orchestrator--consensus-persist consensus-id meta)
-    (list :consensus-id consensus-id
-          :batch-id batch-id
-          :providers providers
-          :task-ids task-ids)))
+  (let* ((resolved (if preset
+                       (progn (require 'anvil-orchestrator-presets)
+                              (anvil-orchestrator--preset-resolve
+                               preset providers overrides
+                               timeout-sec budget-usd))
+                     (list :providers providers
+                           :overrides overrides
+                           :timeout-sec timeout-sec
+                           :budget-usd budget-usd
+                           :preset-name nil)))
+         (providers   (plist-get resolved :providers))
+         (overrides   (plist-get resolved :overrides))
+         (timeout-sec (plist-get resolved :timeout-sec))
+         (budget-usd  (plist-get resolved :budget-usd)))
+    (unless (and (listp providers) (>= (length providers) 2))
+      (user-error "consensus: providers must be a list of length >= 2"))
+    (dolist (p providers)
+      (unless (anvil-orchestrator--provider p)
+        (user-error "consensus: unknown provider %S" p)))
+    (let* ((consensus-id (anvil-orchestrator--uuid))
+           (defaults (append
+                      (and timeout-sec (list :timeout-sec timeout-sec))
+                      (and budget-usd  (list :budget-usd budget-usd))))
+           (tasks    (anvil-orchestrator--consensus-build-tasks
+                      prompt providers overrides defaults))
+           (batch-id (anvil-orchestrator-submit tasks))
+           (task-ids (gethash batch-id anvil-orchestrator--batches))
+           (meta     (list :batch-id batch-id
+                           :providers providers
+                           :task-ids task-ids
+                           :preset (plist-get resolved :preset-name)
+                           :created-at (float-time))))
+      (puthash consensus-id meta anvil-orchestrator--consensus-groups)
+      (anvil-orchestrator--consensus-persist consensus-id meta)
+      (list :consensus-id consensus-id
+            :batch-id batch-id
+            :providers providers
+            :task-ids task-ids))))
 
 (defun anvil-orchestrator--consensus-similarity-matrix (tasks)
   "Return an alist ((\"PROV_A x PROV_B\" . SCORE) ...) for TASKS.
@@ -2359,7 +2562,10 @@ Errors when no judge has been submitted for the consensus."
 (defun anvil-orchestrator--to-json-value (x)
   "Recursively convert X into a value that `json-encode' renders sensibly.
 Plists become alists with symbol keys (leading colon stripped).
-Plain lists of scalars become vectors so they emit as JSON arrays."
+Plain lists of scalars become vectors so they emit as JSON arrays.
+Dotted pairs (e.g. alist entries like `(\"key\" . VAL)') become
+2-element vectors so they survive `json-encode' without the
+improper-list `mapcar' crashing on `1.0'-style cdrs."
   (cond
    ((or (null x) (eq x t) (numberp x)) x)
    ((stringp x) x)
@@ -2371,6 +2577,11 @@ Plain lists of scalars become vectors so they emit as JSON arrays."
     (cl-loop for (k v) on x by #'cddr
              collect (cons (intern (substring (symbol-name k) 1))
                            (anvil-orchestrator--to-json-value v))))
+   ((and (consp x) (not (proper-list-p x)))
+    ;; Dotted pair — emit as [car, cdr] array.  Recurse into both
+    ;; halves so alist values like 1.0 or nested plists still encode.
+    (vector (anvil-orchestrator--to-json-value (car x))
+            (anvil-orchestrator--to-json-value (cdr x))))
    ((listp x)
     (apply #'vector (mapcar #'anvil-orchestrator--to-json-value x)))
    (t x)))
@@ -2388,10 +2599,10 @@ through `anvil-orchestrator--to-json-value' then `json-encode'."
 
 Keeps the underlying tool body returning a rich plist for direct
 Elisp / ERT callers while the MCP transport receives a JSON string.
-HANDLER is called with whatever positional/rest arguments the
-wrapper receives."
-  (lambda (&rest args)
-    (anvil-orchestrator--encode-for-mcp (apply handler args))))
+Schema extraction and MCP argument binding continue to use HANDLER's
+raw signature/docstring via `anvil-server--make-encoded-handler'."
+  (anvil-server--make-encoded-handler
+   handler #'anvil-orchestrator--encode-for-mcp))
 
 ;;;; --- MCP tool wrappers --------------------------------------------------
 
@@ -2956,7 +3167,7 @@ majority of single-turn responses."
 ;;;###autoload
 (cl-defun anvil-orchestrator-submit-one
     (&key provider prompt model name cwd budget-usd timeout-sec
-          preamble-ref stream on-event)
+          preamble-ref stream on-event policy)
   "Submit a single task and return its task-id (not the batch-id).
 
 A light convenience over `anvil-orchestrator-submit' for the
@@ -2966,6 +3177,10 @@ arguments except :provider and :prompt are optional.  Behaviour
 is identical to passing a one-element list through `submit':
 the task enters the global pool with the same concurrency,
 retry, and budget rules as any other batch.
+
+:provider accepts the sentinel `auto' (Doc 22) to defer selection
+to `anvil-orchestrator-select-provider'.  When used, `:policy'
+overrides the configured default policy for this task only.
 
 :preamble-ref accepts a preamble key string (or list of strings)
 registered via `anvil-orchestrator-preamble-set'; the stored text
@@ -2996,7 +3211,8 @@ event; the callback lives in-memory only and is not persisted."
                        (when preamble-ref
                          (list :preamble-ref preamble-ref))
                        (when stream      (list :stream t))
-                       (when on-event    (list :on-event on-event))))
+                       (when on-event    (list :on-event on-event))
+                       (when policy      (list :policy policy))))
          (batch-id (anvil-orchestrator-submit (list task)))
          (ids      (gethash batch-id anvil-orchestrator--batches)))
     (car ids)))
@@ -3004,7 +3220,7 @@ event; the callback lives in-memory only and is not persisted."
 ;;;###autoload
 (cl-defun anvil-orchestrator-submit-and-collect
     (&key provider prompt model name cwd budget-usd timeout-sec
-          preamble-ref stream on-event
+          preamble-ref stream on-event policy
           (collect-timeout-sec 180) (poll-interval-sec 0.5) full)
   "Submit a single task and wait (non-blocking) for its result.
 
@@ -3039,7 +3255,8 @@ re-collect via `extract-result' later."
                    :timeout-sec timeout-sec
                    :preamble-ref preamble-ref
                    :stream stream
-                   :on-event on-event))
+                   :on-event on-event
+                   :policy policy))
          (deadline (+ (float-time) collect-timeout-sec)))
     (while (let ((task (anvil-orchestrator--task-get task-id)))
              (and task
@@ -3104,16 +3321,21 @@ MCP Parameters:
      (anvil-orchestrator--coerce-truthy-string full))))
 
 (defun anvil-orchestrator--tool-submit-one (provider prompt
-                                            &optional model name)
+                                            &optional model name policy)
   "MCP wrapper for `anvil-orchestrator-submit-one'.
 
 MCP Parameters:
   provider - Provider name string (e.g. \"claude\", \"codex\",
              \"gemini\", \"aider\", \"ollama\").  Coerced to symbol.
+             Pass \"auto\" (Doc 22) to defer selection to the
+             routing layer.
   prompt   - Prompt text string.  Required.
   model    - Optional provider-specific model id override.
   name     - Optional human-readable task label; auto-generated
-             from provider + HHMMSS when omitted."
+             from provider + HHMMSS when omitted.
+  policy   - Optional routing policy name (\"speed\" / \"cost\" /
+             \"balanced\" / \"quality\") used only when
+             provider=\"auto\"."
   (anvil-server-with-error-handling
     (unless (and (stringp provider) (not (string-empty-p provider)))
       (user-error "submit-one: provider required"))
@@ -3123,17 +3345,21 @@ MCP Parameters:
                     :provider (intern provider)
                     :prompt   prompt
                     :model    (and model (not (string-empty-p model)) model)
-                    :name     (and name  (not (string-empty-p name))  name))))
+                    :name     (and name  (not (string-empty-p name))  name)
+                    :policy   (and policy (not (string-empty-p policy))
+                                   (intern policy)))))
       (list :task-id task-id))))
 
 (defun anvil-orchestrator--tool-submit-and-collect
     (provider prompt
      &optional model name cwd budget_usd timeout_sec
-     collect_timeout_sec full)
+     collect_timeout_sec full policy)
   "MCP wrapper for `anvil-orchestrator-submit-and-collect'.
 
 MCP Parameters:
   provider - Provider name string (e.g. \"claude\", \"codex\").
+             Pass \"auto\" (Doc 22) to defer selection to the
+             routing layer.
   prompt   - Prompt text string.  Required.
   model    - Optional provider-specific model id override.
   name     - Optional human-readable task label.
@@ -3149,7 +3375,10 @@ MCP Parameters:
                          the task.
   full                 - Truthy string (\"t\" / \"true\") asks
                          extract-result to re-parse without
-                         summary truncation."
+                         summary truncation.
+  policy               - Optional routing policy name used only
+                         when provider=\"auto\" (\"speed\" /
+                         \"cost\" / \"balanced\" / \"quality\")."
   (anvil-server-with-error-handling
     (unless (and (stringp provider) (not (string-empty-p provider)))
       (user-error "submit-and-collect: provider required"))
@@ -3168,7 +3397,9 @@ MCP Parameters:
        :budget-usd          (num budget_usd)
        :timeout-sec         (num timeout_sec)
        :collect-timeout-sec (or (num collect_timeout_sec) 180)
-       :full (anvil-orchestrator--coerce-truthy-string full)))))
+       :full (anvil-orchestrator--coerce-truthy-string full)
+       :policy (and policy (not (string-empty-p policy))
+                    (intern policy))))))
 
 (defun anvil-orchestrator--tool-tail (task_id &optional stream bytes)
   "MCP wrapper for `anvil-orchestrator-tail'.
@@ -3413,6 +3644,8 @@ MCP Parameters:
 (defconst anvil-orchestrator--preamble-tool-specs
   `((,(anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-preamble-set)
      :id "orchestrator-preamble-set"
+     :intent '(orchestrator preamble)
+     :layer 'workflow
      :description
      "Register reusable context TEXT under KEY (Phase 7b).  Tasks
 referring to the same KEY via :preamble-ref have TEXT prepended
@@ -3421,23 +3654,31 @@ verbatim to their prompt at submit time, so a common preamble
 state rather than being re-typed into every prompt.")
     (,(anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-preamble-get)
      :id "orchestrator-preamble-get"
+     :intent '(orchestrator preamble)
+     :layer 'workflow
      :description
      "Return the preamble text registered under KEY, plus :found
 boolean.  Empty text when KEY is absent."
      :read-only t)
     (,(anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-preamble-list)
      :id "orchestrator-preamble-list"
+     :intent '(orchestrator preamble)
+     :layer 'workflow
      :description
      "List every registered preamble key and its stored text length.
 Read-only snapshot, sorted by key."
      :read-only t)
     (,(anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-preamble-delete)
      :id "orchestrator-preamble-delete"
+     :intent '(orchestrator preamble)
+     :layer 'workflow
      :description
      "Remove the preamble registered under KEY.  Returns
 :deleted t when a row existed, :deleted nil when KEY was absent.")
     (,(anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-preamble-set-from-file)
      :id "orchestrator-preamble-set-from-file"
+     :intent '(orchestrator preamble)
+     :layer 'workflow
      :description
      "Register a preamble whose body lives in a file the daemon
 can read directly.  Saves the caller from loading the file into
@@ -3604,6 +3845,8 @@ cursor line."
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-submit)
    :id "orchestrator-submit"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Submit a batch of AI CLI tasks (claude today, more providers
@@ -3617,6 +3860,8 @@ default 4000) come back by default.")
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-status)
    :id "orchestrator-status"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Return the status of a batch or a single task.  For a batch:
@@ -3626,6 +3871,8 @@ counts and slim task summaries (no full stdout / prompt)."
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-collect)
    :id "orchestrator-collect"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Return the slim task plist list for a batch.  Pass wait=\"t\" to
@@ -3636,6 +3883,8 @@ block until every task reaches a terminal state (done / failed
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-cancel)
    :id "orchestrator-cancel"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Cancel a running or queued task (SIGTERM, then SIGKILL after
@@ -3644,6 +3893,8 @@ block until every task reaches a terminal state (done / failed
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-retry)
    :id "orchestrator-retry"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Re-submit a task under a new id (same batch, same prompt /
@@ -3653,6 +3904,8 @@ non-auto-retryable failure.")
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-consensus-submit)
    :id "orchestrator-consensus-submit"
+   :intent '(orchestrator consensus)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Dispatch the same prompt to >= 2 providers (cross-model
@@ -3663,6 +3916,8 @@ via `orchestrator-consensus-collect' to get a verdict (unanimous
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-consensus-collect)
    :id "orchestrator-consensus-collect"
+   :intent '(orchestrator consensus)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Return the consensus verdict for a consensus id.  Includes
@@ -3674,6 +3929,8 @@ until every fan-out task reaches a terminal state."
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-consensus-judge)
    :id "orchestrator-consensus-judge"
+   :intent '(orchestrator consensus)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Run a meta-LLM judge (Phase 4b) over a consensus batch.  The
@@ -3686,6 +3943,8 @@ Returns the judge-task-id; poll with
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-consensus-judge-collect)
    :id "orchestrator-consensus-judge-collect"
+   :intent '(orchestrator consensus)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Return the judge task summary for a consensus id.  Pass
@@ -3696,6 +3955,8 @@ state."
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-stats)
    :id "orchestrator-stats"
+   :intent '(orchestrator admin)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Return aggregated task statistics from the in-memory task table:
@@ -3706,6 +3967,8 @@ p50/p95, and total cost-usd sum.  Read-only snapshot."
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-extract-result)
    :id "orchestrator-extract-result"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Return the minimum result plist for a task — summary, cost,
@@ -3719,6 +3982,8 @@ three-tool glue dance (Read stdout-path + python3 json extract
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-submit-one)
    :id "orchestrator-submit-one"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Submit a single task and return its task-id.  A convenience
@@ -3729,6 +3994,8 @@ DAGs, consensus, or multi-task batches.")
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-submit-and-collect)
    :id "orchestrator-submit-and-collect"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Submit a single task and block until it finishes (or
@@ -3743,6 +4010,8 @@ single call for short-running tasks.")
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-tail)
    :id "orchestrator-tail"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Return the last N bytes of a task's stdout or stderr stream.
@@ -3754,6 +4023,8 @@ claude partial output, or to inspect stderr after a failure."
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-list-interrupted)
    :id "orchestrator-list-interrupted"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "List tasks orphaned by a daemon restart (status=failed,
@@ -3764,6 +4035,8 @@ Phase 6C'' DAG resume diagnostic."
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-resume-interrupted)
    :id "orchestrator-resume-interrupted"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Re-queue every interrupted (daemon-restart orphan) task in
@@ -3781,6 +4054,8 @@ Phase 6C'' DAG resume.")
   (anvil-server-register-tool
    (anvil-orchestrator--encode-handler #'anvil-orchestrator--tool-stream)
    :id "orchestrator-stream"
+   :intent '(orchestrator)
+   :layer 'workflow
    :server-id anvil-orchestrator--server-id
    :description
    "Return the live stream-event list recorded for TASK_ID
@@ -3822,13 +4097,22 @@ Response plist includes :events / :last-seq / :task-status."
   (anvil-orchestrator--restore-from-state)
   (anvil-orchestrator--restore-consensus-from-state)
   (anvil-orchestrator--register-tools)
+  (require 'anvil-orchestrator-routing)
+  (anvil-orchestrator-routing--register-tools)
+  ;; Doc 23 Phase 1 — preset CRUD API exposed at enable time so
+  ;; `M-x anvil-orchestrator-consensus-preset-set` is interactive-
+  ;; callable without a manual `require'.  MCP tool registration
+  ;; lands with Phase 2.
+  (require 'anvil-orchestrator-presets)
   (anvil-orchestrator--ensure-pump-timer))
 
 (defun anvil-orchestrator-disable ()
   "Disable the module: unregister tools, cancel the pump timer."
   (interactive)
   (anvil-orchestrator--cancel-pump-timer)
-  (anvil-orchestrator--unregister-tools))
+  (anvil-orchestrator--unregister-tools)
+  (when (featurep 'anvil-orchestrator-routing)
+    (anvil-orchestrator-routing--unregister-tools)))
 
 (provide 'anvil-orchestrator)
 ;;; anvil-orchestrator.el ends here

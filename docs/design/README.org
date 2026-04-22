@@ -19,6 +19,24 @@ Anvil の現行アーキテクチャ (Architecture B) は、purpose 別に 4 層
 
 これらは個別に場当たりで凌いできたが、次段として *設計上* で解きたい。本ディレクトリはその設計 doc を集約する。
 
+* Scope Classification
+
+各 doc には =#+property: scope= ヘッダで分類を付与している。
+将来 anvil を外部公開する際、~GENERIC~ のみを先行で切り出し、~CONVENTION-COUPLED~ は
+primitive 層と convention 層に分離、~WINDOWS-ONLY~ は optional module として扱う方針。
+
+- *GENERIC* (18) — 一般 Emacs+AI 開発者に価値がある primitive
+- *CONVENTION-COUPLED* (6) — primitive は汎用だが運用者固有慣習が食い込んでいる
+- *WINDOWS-ONLY* (2) — Windows native Emacs 環境固有の課題解決
+
+| Scope                 | Docs                                                  |
+|-----------------------+-------------------------------------------------------|
+| GENERIC               | 01, 03, 06, 07, 08, 09, 11, 12, 13, 14, 17, 18, 19, 21, 22, 24, 25 |
+| CONVENTION-COUPLED    | 02 (journal/init.org 動機), 05 (init.org divergence), 10 (codex/claude 役割・journal cron), 15 (Co-Authored-By 強制・MEMO), 16 (org SCHEDULED scanner), 23 (codex+ollama 無料前提) |
+| WINDOWS-ONLY          | 04, 20 (PTY Broker Phase 1/2 — ConPTY stdin 片方向)  |
+
+*CONVENTION-COUPLED* は各 doc 末尾の =Primitive vs Convention= 節で分離可能な境界を示す。
+
 * Design Principles
 
 1. *Emacs は人間の道具が第一*。AI tool call は editor をブロックしてはならない。
@@ -54,11 +72,11 @@ Tier 1 から順に実装。Tier 1 完了で Claude の tool hop が構造的に
 
 | #  | Doc                                         | 依存           | 想定工数 | Tier | 状態  |
 |----+---------------------------------------------+----------------+----------+------+-------|
-| 11 | [[file:11-defs-index.org][Elisp Symbol Index]]                          | なし           | 中       | 1    | DRAFT |
-| 12 | [[file:12-sexp-edits.org][Sexp / AST Edits]]                            | 11             | 中       | 1    | DRAFT |
-| 13 | [[file:13-bisect.org][Test-Driven Bisect]]                          | 01             | 小       | 1    | DRAFT |
-| 14 | [[file:14-bench-profile.org][Bench + Profile]]                             | なし           | 小       | 2    | DRAFT |
-| 15 | [[file:15-git-msg.org][Commit / PR Synthesis]]                       | なし           | 小       | 2    | DRAFT |
+| 11 | [[file:11-defs-index.org][Elisp Symbol Index]]                          | なし           | 中       | 1    | Ph1+2 SHIPPED |
+| 12 | [[file:12-sexp-edits.org][Sexp / AST Edits (elisp, reader-only)]]       | 11 (Ph2b)      | 中       | 1    | Ph1+2a+2b SHIPPED |
+| 13 | [[file:13-bisect.org][Test-Driven Bisect]]                          | 01             | 小       | 1    | Ph1 SHIPPED |
+| 14 | [[file:14-bench-profile.org][Bench + Profile]]                             | なし           | 小       | 2    | Ph1 SHIPPED |
+| 15 | [[file:15-git-msg.org][Commit / PR Synthesis]]                       | なし           | 小       | 2    | Ph1 SHIPPED |
 | 16 | [[file:16-lint.org][Repo Hygiene Scanner]]                        | 11             | 小       | 2    | DRAFT |
 | 17 | [[file:17-session.org][Cross-Session Context Handoff]]               | 08             | 小       | 3    | DRAFT |
 | 18 | [[file:18-rag.org][Local Semantic Search (RAG)]]                 | 02, 11         | 中       | 3    | DRAFT |
@@ -69,6 +87,80 @@ Tier 凡例:
 - *Tier 1* — 10x multiplier.  Claude の日常的な hop 数を構造的に減らす。
 - *Tier 2* — 大きな生産性向上.  Tier 1 の上に乗る使い勝手と安全性。
 - *Tier 3* — 増幅器.  他 AI 連携、cross-session、semantic 検索、Windows TUI。
+
+** Week-3 Wave — non-elisp language family (Doc 21 / 24 / 25, DRAFT)
+
+Emacs を AI にとって最も価値ある editor にする戦略的ベット
+(Doc 12 の続き)。言語を 3 family に分けて扱う:
+
+1. *elisp* — reader-native (Doc 12)
+2. *brace-keyword languages* (Python / TS / JS / Rust / Go / …) —
+   tree-sitter (Doc 21)
+3. *Lisp-family* (Common Lisp / Scheme / Clojure) — 各方言の
+   native reader / REPL 経由 (Doc 24)
+4. *structured text* (HTML / CSS / YAML / TOML / JSON / Markdown /
+   SQL) — path / selector / heading ベースの別 API family (Doc 25
+   → 26-30 に分割)
+
+| #  | Doc                                         | 依存   | 想定工数 | Tier | 状態  |
+|----+---------------------------------------------+--------+----------+------+-------|
+| 21 | [[file:21-treesit-edits.org][Tree-sitter Edits (Py / TS / JS)]]            | 06     | 大       | 2    | DRAFT |
+| 24 | [[file:24-lisp-reader.org][Lisp-family Reader (CL / Scheme / Clojure)]]  | 12     | 大       | 2    | DRAFT |
+| 25 | [[file:25-structured-text.org][Structured Text Family (concept doc)]]        | 06     | 中       | 3    | DRAFT |
+
+/Revision 2026-04-20:/ Doc 21 を Python 先行 + TS/JS 後に再構成、
+Doc 24 / 25 を新規 draft。詳細は Doc 21 の revision note 参照。
+
+** Orchestrator Polish (Doc 22–23, DRAFT, 2026-04-19)
+
+Derived from the v1 orchestrator benchmark
+([[file:../../benchmarks/results/report-2026-04-19.org][=report-2026-04-19.org=]]).  Observations drive both: a 14× latency
+gap between providers (routing), and emergent recurring provider
+combinations (presets).
+
+| #  | Doc                                         | 依存   | 想定工数 | Tier | 状態  |
+|----+---------------------------------------------+--------+----------+------+-------|
+| 22 | [[file:22-provider-routing.org][Provider Latency Routing]]                    | 10     | 小       | 2    | Ph1 SHIPPED |
+| 23 | [[file:23-consensus-presets.org][Consensus Presets]]                           | 10, 22 | 小       | 2    | Ph1 SHIPPED |
+
+** Week-3 Token Efficiency Wave (Doc 26-29 + Doc 17 Ph3-4, DRAFT, 2026-04-20)
+
+Competitor audit (rtk / context-mode / code-review-graph /
+token-savior) からの取り込み提案。主語は *Claude Code セッション
+1 本あたりの token 効率*。
+
+| #        | Doc                                                                   | 依存   | 想定工数 | Tier | 状態  |
+|----------+-----------------------------------------------------------------------+--------+----------+------+-------|
+| 26       | [[file:26-manifest-profile.org][Manifest Profile (tools/list filter)]] | —      | 小       | 1    | Ph1 SHIPPED |
+| 27       | [[file:27-shell-filter.org][Shell Output Filter + Tee]]                | 08     | 中       | 1    | DRAFT |
+| 28       | [[file:28-progressive-disclosure.org][3-Layer Read Contract + Citation URI]] | 02, 11 | 中       | 1    | Ph1 SHIPPED |
+| 29       | [[file:29-memory-engine.org][Memory Engine (Bayesian + TTL + ROI)]]     | 08     | 大       | 2    | DRAFT |
+| 17 Ph3-4 | [[file:17-session.org][Claude Code Lifecycle Hooks]]                       | 08     | 中       | 2    | DRAFT |
+
+競合対応マトリクス:
+
+| 競合               | 取り込み先      |
+|--------------------+-----------------|
+| rtk                | Doc 27 (shell)  |
+| context-mode       | Doc 17 Ph3      |
+| code-review-graph  | Doc 18 (既存)   |
+| token-savior       | Doc 26 / 28 / 29 |
+
+Tier 1 (26 / 27 / 28) を先行 ship、Tier 2 (29 / 17 Ph3-4) を後続。
+詳細は各 doc の ~Motivation~ / ~Review Questions~ 参照。
+
+** Week-4 Module Critical-Mass Wave (Doc 34-, DRAFT, 2026-04-22)
+
+Doc 26 の volume reduction と直交する *semantic discovery* 側からの
+取り組み。tool 数 ~90 の中から「今欲しい X にどれが対応するか」を
+runtime query 可能にすることで CLAUDE.md の手書きフローチャートへの
+依存を減らす。
+
+| #  | Doc                                                                 | 依存   | 想定工数 | Tier | 状態  |
+|----+---------------------------------------------------------------------+--------+----------+------+-------|
+| 34 | [[file:34-tool-discovery.org][Intent-based Tool Discovery]]            | 26     | 小-中    | 1    | Ph A+B+C SHIPPED |
+
+Phase A / B / C の 3 段、Phase A は単独 ship 可能。
 
 * Status Legend
 

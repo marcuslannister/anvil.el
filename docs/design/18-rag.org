@@ -2,12 +2,29 @@
 #+date: 2026-04-19
 #+author: zawatton
 #+property: status DRAFT
+#+property: scope GENERIC
 
 * STATUS
   :PROPERTIES:
   :ID:       1ce1e487-24df-4388-8c2f-ace8928f4f0c
   :END:
-~DRAFT~ (2026-04-19)
+~DRAFT~ (2026-04-19) → ~DEFERRED~ (2026-04-22) — Implementation
+needs ollama install + nomic-embed-text model (~270 MB) + indexing
+pipeline + cosine-search hot path + filenotify watcher tie-in.
+Multi-day scope.  Existing keyword search (Grep, Doc 11 defs-search,
+Doc 02 org-index) already covers the queries the maintainer's
+own work surfaces; semantic-similarity gap is hypothetical, not
+observed.  Re-trigger criteria:
+
+1. The maintainer (or an external user) reports a concrete
+   "find code that does X-ish" miss that grep / defs / org-index
+   could not have answered.
+2. Doc 11 + Doc 02 saturate to the point where adding more
+   keyword-only indexes shows diminishing returns on a real
+   refactor task.
+3. ollama becomes a baseline dependency for another anvil module
+   (Doc 19 pair-review judge or similar) so the cold-start
+   overhead amortises across two specs.
 
 Tier 3 of Week-2 roadmap.  Keyword search (Grep, Doc 11 defs,
 Doc 02 org-index) covers structural / exact queries.  Doc 18 adds

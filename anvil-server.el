@@ -366,6 +366,25 @@ fills them with nil at dispatch time."
         ;; No user-visible arguments case (all args are `_'-prefixed or empty)
         '((type . "object"))))))
 
+(defun anvil-server--normalize-tool-handler (handler)
+  "Return registration metadata derived from HANDLER.
+Wrappers created by `anvil-server-encode-handler' (or compatible helpers
+that set the `anvil-server-raw-handler' / `anvil-server-encode-result'
+symbol properties) keep the original handler as the source of truth for
+schema extraction and argument binding while transport encoding happens
+after execution."
+  (let* ((raw-handler
+          (if-let ((wrapped (and (symbolp handler)
+                                 (get handler 'anvil-server-raw-handler))))
+              wrapped
+            handler))
+         (encode-result
+          (and (symbolp handler)
+               (get handler 'anvil-server-encode-result))))
+    (list :handler raw-handler
+          :arglist (help-function-arglist raw-handler t)
+          :encode-result encode-result)))
+
 (defun anvil-server--ref-counted-register (key item table)
   "Register ITEM with KEY in TABLE with reference counting.
 If KEY already exists, increment its reference count.
@@ -684,12 +703,14 @@ METHOD-METRICS is used to track errors."
 (defun anvil-server--handle-resources-read
     (id params method-metrics server-id)
   "Handle resources/read request with ID and PARAMS for SERVER-ID.
-METHOD-METRICS is used to track errors for this method."
+METHOD-METRICS is used to track errors for this method.
+SERVER-ID is resolved through `anvil-server-id-aliases'."
   (let* ((uri (alist-get 'uri params))
+         (resolved-id (anvil-server--resolve-id server-id))
          (resources-table
-          (anvil-server--get-server-resources server-id))
+          (anvil-server--get-server-resources resolved-id))
          (templates-table
-          (anvil-server--get-server-templates server-id))
+          (anvil-server--get-server-templates resolved-id))
          (resource (gethash uri resources-table))
          (template-match
           (unless resource
@@ -754,13 +775,15 @@ Returns a JSON-RPC response string for the request."
 (defun anvil-server--handle-initialize (id server-id)
   "Handle initialize request with ID for SERVER-ID.
 This implements the MCP initialize handshake, which negotiates protocol
-version and capabilities between the client and server."
-  (let ((capabilities '()))
-    (let ((tools-table (gethash server-id anvil-server--tools))
+version and capabilities between the client and server.  SERVER-ID
+is resolved through `anvil-server-id-aliases' for capability lookup."
+  (let ((capabilities '())
+        (resolved-id (anvil-server--resolve-id server-id)))
+    (let ((tools-table (gethash resolved-id anvil-server--tools))
           (resources-table
-           (gethash server-id anvil-server--resources))
+           (gethash resolved-id anvil-server--resources))
           (templates-table
-           (gethash server-id anvil-server--resource-templates)))
+           (gethash resolved-id anvil-server--resource-templates)))
       (when (and tools-table (> (hash-table-count tools-table) 0))
         (push `(tools . ,(make-hash-table)) capabilities))
       (when (or (and resources-table
@@ -784,41 +807,91 @@ This is called after successful initialization to complete the handshake.
 The client sends this notification to acknowledge the server's response
 to the initialize request.")
 
+(defvar anvil-server-tool-filter-function nil
+  "Optional filter applied to tools/list advertisements.
+When bound to a function, it is called with (TOOL-ID TOOL-PLIST
+SERVER-ID) for each registered tool and must return non-nil to keep
+the tool in the response.  The SERVER-ID argument is the original
+(possibly virtual) server-id the client asked for — useful when
+filtering per connection, not per daemon.
+
+Handlers remain live either way, so hidden tools stay callable via
+explicit tools/call.
+
+Set by `anvil-manifest' (Doc 26) to implement ANVIL_PROFILE.")
+
+(defvar anvil-server-tool-dispatch-hook nil
+  "Abnormal hook run after a tool handler returns successfully.
+Functions on this hook are called with (TOOL-ID SERVER-ID); the
+SERVER-ID is the virtual id the client used (before alias
+resolution).  Used by Doc 34 Phase C (`anvil-discovery') to track
+per-tool usage counters without coupling anvil-server to anvil-state.
+
+Errors raised by hook functions are caught and logged; they do not
+mask or modify the handler's result.  Keep hook functions cheap —
+they run on every successful dispatch.")
+
+(defvar anvil-server-id-aliases nil
+  "Alist mapping virtual server-ids to real server-ids.
+Entries are (VIRTUAL . REAL) string pairs.  Used to advertise the
+same set of tool handlers under multiple server-ids, typically so
+`anvil-manifest' (Doc 26) can apply a per-connection profile filter
+without duplicating the tool registrations.
+
+Example: ((\"emacs-eval-ultra\" . \"emacs-eval\")) makes tools/list
+for `emacs-eval-ultra' look up the `emacs-eval' tools table while
+the filter function still sees the original virtual server-id and
+can pick a different profile for it.")
+
+(defun anvil-server--resolve-id (server-id)
+  "Return the real server-id SERVER-ID resolves to.
+Follows `anvil-server-id-aliases'.  Safe to call on a real id (it
+becomes a no-op)."
+  (or (cdr (assoc server-id anvil-server-id-aliases)) server-id))
+
 (defun anvil-server--handle-tools-list (id server-id)
   "Handle tools/list request with ID for SERVER-ID.
-Returns a list of all registered tools with their metadata."
-  (let ((tool-list (vector)))
+Returns a list of registered tools with their metadata, minus any
+filtered out by `anvil-server-tool-filter-function'.  SERVER-ID may
+be a virtual id registered in `anvil-server-id-aliases'; in that
+case tool lookup uses the resolved real id but the filter function
+still sees the original virtual id for profile selection."
+  (let ((tool-list (vector))
+        (resolved-id (anvil-server--resolve-id server-id)))
     (when-let* ((tools-table
-                 (gethash server-id anvil-server--tools)))
+                 (gethash resolved-id anvil-server--tools)))
       (maphash
        (lambda (tool-id tool)
-         (let* ((tool-description (plist-get tool :description))
-                (tool-title (plist-get tool :title))
-                (tool-read-only (plist-get tool :read-only))
-                (tool-schema
-                 (or (plist-get tool :schema) '((type . "object"))))
-                (tool-entry
-                 `((name . ,tool-id)
-                   (description . ,tool-description)
-                   (inputSchema . ,tool-schema)))
-                (annotations nil))
-           ;; Collect annotations if present
-           (when tool-title
-             (push (cons 'title tool-title) annotations))
-           ;; Add readOnlyHint when :read-only is explicitly provided (both t
-           ;; and nil)
-           (when (plist-member tool :read-only)
-             (let ((annot-value
-                    (if tool-read-only
-                        t
-                      :json-false)))
-               (push (cons 'readOnlyHint annot-value) annotations)))
-           ;; Add annotations to tool entry if any exist
-           (when annotations
-             (setq tool-entry
-                   (append
-                    tool-entry `((annotations . ,annotations)))))
-           (setq tool-list (vconcat tool-list (vector tool-entry)))))
+         (when (or (null anvil-server-tool-filter-function)
+                   (funcall anvil-server-tool-filter-function
+                            tool-id tool server-id))
+           (let* ((tool-description (plist-get tool :description))
+                  (tool-title (plist-get tool :title))
+                  (tool-read-only (plist-get tool :read-only))
+                  (tool-schema
+                   (or (plist-get tool :schema) '((type . "object"))))
+                  (tool-entry
+                   `((name . ,tool-id)
+                     (description . ,tool-description)
+                     (inputSchema . ,tool-schema)))
+                  (annotations nil))
+             ;; Collect annotations if present
+             (when tool-title
+               (push (cons 'title tool-title) annotations))
+             ;; Add readOnlyHint when :read-only is explicitly provided (both t
+             ;; and nil)
+             (when (plist-member tool :read-only)
+               (let ((annot-value
+                      (if tool-read-only
+                          t
+                        :json-false)))
+                 (push (cons 'readOnlyHint annot-value) annotations)))
+             ;; Add annotations to tool entry if any exist
+             (when annotations
+               (setq tool-entry
+                     (append
+                      tool-entry `((annotations . ,annotations)))))
+             (setq tool-list (vconcat tool-list (vector tool-entry))))))
        tools-table))
     (anvil-server--jsonrpc-response id `((tools . ,tool-list)))))
 
@@ -862,9 +935,11 @@ Returns a vector of resource entries."
 
 (defun anvil-server--handle-resources-list (id server-id)
   "Handle resources/list request with ID for SERVER-ID.
-Returns a list of all registered resources with their metadata."
-  (let* ((resources-table
-          (gethash server-id anvil-server--resources))
+Returns a list of all registered resources with their metadata.
+SERVER-ID is resolved through `anvil-server-id-aliases'."
+  (let* ((resolved-id (anvil-server--resolve-id server-id))
+         (resources-table
+          (gethash resolved-id anvil-server--resources))
          (resource-list
           (if resources-table
               (anvil-server--collect-resources-from-hash
@@ -875,9 +950,11 @@ Returns a list of all registered resources with their metadata."
 
 (defun anvil-server--handle-resources-templates-list (id server-id)
   "Handle resources/templates/list request with ID for SERVER-ID.
-Returns a list of all registered resource templates."
-  (let* ((templates-table
-          (gethash server-id anvil-server--resource-templates))
+Returns a list of all registered resource templates.
+SERVER-ID is resolved through `anvil-server-id-aliases'."
+  (let* ((resolved-id (anvil-server--resolve-id server-id))
+         (templates-table
+          (gethash resolved-id anvil-server--resource-templates))
          (template-list
           (if templates-table
               (anvil-server--collect-resources-from-hash
@@ -889,9 +966,12 @@ Returns a list of all registered resource templates."
 (defun anvil-server--handle-tools-call
     (id params method-metrics server-id)
   "Handle tools/call request with ID and PARAMS for SERVER-ID.
-METHOD-METRICS is used to track errors for this method."
+METHOD-METRICS is used to track errors for this method.  SERVER-ID
+is resolved through `anvil-server-id-aliases' before tool lookup so
+virtual server-ids share the same handler pool."
   (let* ((tool-name (alist-get 'name params))
-         (tools-table (gethash server-id anvil-server--tools))
+         (resolved-id (anvil-server--resolve-id server-id))
+         (tools-table (gethash resolved-id anvil-server--tools))
          (tool
           (when tools-table
             (gethash tool-name tools-table)))
@@ -901,18 +981,21 @@ METHOD-METRICS is used to track errors for this method."
               (context (list :id id)))
           (condition-case err
               (let*
-                  ;; Check if handler is defined before trying to get arglist
                   ((arglist
-                    (if (fboundp handler)
-                        (help-function-arglist handler t)
-                      ;; If undefined, signal early with proper error
-                      (signal 'void-function (list handler))))
+                    (progn
+                      (unless (functionp handler)
+                        (signal 'void-function (list handler)))
+                      ;; Keep dispatch aligned with registration-time
+                      ;; schema extraction, including transport-only
+                      ;; wrappers created by `anvil-server-encode-handler'.
+                      (or (plist-get tool :arglist)
+                          (help-function-arglist handler t))))
                    (expected-params '())
                    (required-params '())
                    (provided-params '())
                    (arg-values '())
                    (seen-optional nil)
-                   (result
+                   (raw-result
                     (progn
                       ;; Collect expected and required parameter names.
                       ;; `_'-prefixed args follow the Elisp unused-arg
@@ -972,6 +1055,13 @@ METHOD-METRICS is used to track errors for this method."
                             (anvil-server--offload-apply
                              tool handler final-args)
                           (apply handler final-args)))))
+                   ;; `anvil-server-encode-handler' marks tools that want
+                   ;; transport-level JSON encoding while their raw
+                   ;; handler keeps returning rich Lisp data.
+                   (result
+                    (if (plist-get tool :encode-result)
+                        (anvil-server-encode-for-mcp raw-result)
+                      raw-result))
                    ;; Ensure result is string or nil, error on other types
                    (result-text
                     (cond
@@ -994,6 +1084,14 @@ METHOD-METRICS is used to track errors for this method."
                          `((type . "text") (text . ,result-text))))
                       (isError . :json-false))))
                 (anvil-server-metrics--track-tool-call tool-name)
+                (condition-case hook-err
+                    (run-hook-with-args
+                     'anvil-server-tool-dispatch-hook
+                     tool-name server-id)
+                  (error
+                   (message "anvil-server: dispatch-hook error on %s: %s"
+                            tool-name
+                            (error-message-string hook-err))))
                 (anvil-server--respond-with-result
                  context formatted-result))
             ;; Handle invalid parameter errors
@@ -1286,6 +1384,10 @@ Optional properties:
   :server-id       Server identifier (defaults to \"default\")
 
 The HANDLER function's signature determines its input schema.
+When HANDLER is wrapped by `anvil-server-encode-handler' (or a
+compatible wrapper), registration still derives schema and
+parameter validation from the underlying raw handler and only
+encodes the result at the MCP transport boundary.
 Currently only no-argument and single-argument handlers are supported.
 
 Example:
@@ -1335,17 +1437,25 @@ See also:
     ;; Check for existing registration
     (if-let* ((existing (gethash id tools-table)))
       (anvil-server--ref-counted-register id existing tools-table)
-      (let* ((schema
-              (anvil-server--generate-schema-from-function handler))
+      (let* ((handler-meta
+              (anvil-server--normalize-tool-handler handler))
+             (raw-handler (plist-get handler-meta :handler))
+             (arglist (plist-get handler-meta :arglist))
+             (encode-result (plist-get handler-meta :encode-result))
+             (schema
+              (anvil-server--generate-schema-from-function raw-handler))
              (tool
               (list
                :id id
                :description description
-               :handler handler
+               :handler raw-handler
+               :arglist arglist
                :schema schema)))
         ;; Add optional properties if provided
         (when title
           (setq tool (plist-put tool :title title)))
+        (when encode-result
+          (setq tool (plist-put tool :encode-result t)))
         ;; Always include :read-only if it was specified, even if nil
         (when (plist-member properties :read-only)
           (setq tool (plist-put tool :read-only read-only)))
@@ -1354,10 +1464,21 @@ See also:
         ;; subprocess instead of the main daemon.  The handler must be a
         ;; symbol (not a lambda) because the subprocess identifies it by
         ;; name after loading the features listed in :offload-require.
+        ;; Encoded registration wrappers are normalized back to the raw
+        ;; handler before offload metadata is stored.
         (dolist (k '(:offload :offload-require :offload-load-path
                               :offload-inherit-load-path
                               :offload-timeout
-                              :resumable))
+                              :resumable
+                              ;; Discovery metadata (Doc 34 Phase A):
+                              ;; :intent is a list of symbols naming
+                              ;; the use-cases the tool serves;
+                              ;; :layer classifies the tool as
+                              ;; core / io / workflow / dev;
+                              ;; :stability is stable / experimental /
+                              ;; deprecated.  Handlers ignore these
+                              ;; values; `anvil-discovery' reads them.
+                              :intent :layer :stability))
           (when (plist-member properties k)
             (setq tool (plist-put tool k (plist-get properties k)))))
         ;; Register the tool
@@ -1682,9 +1803,11 @@ will be caught by the resource handler infrastructure."
 ;;      flags any `(list :K ...)' that is still the terminal form.
 ;;
 ;;   2. Tag the file with the `;;; anvil-audit: tools-wrapped-at-registration'
-;;      header and wrap each registered handler with `anvil-server-encode-
-;;      handler' at registration time (the pattern anvil-orchestrator uses
-;;      for its ~25 tools).
+;;      header and wrap each registered handler with
+;;      `anvil-server-encode-handler' at registration time.  The wrapper is
+;;      transport-only: registration still inspects the underlying raw
+;;      handler and applies JSON encoding after execution (the pattern
+;;      anvil-orchestrator uses for its ~25 tools).
 ;;
 ;; Option 1 is the smaller, per-tool fix; option 2 is the whole-module
 ;; pattern.  Both produce the same wire format and pass the scanner.
@@ -1692,6 +1815,18 @@ will be caught by the resource handler infrastructure."
 (defun anvil-server--plist-p (x)
   "Return non-nil when X is a plist (keyword-keyed list)."
   (and (consp x) (keywordp (car x))))
+
+(defun anvil-server--list-to-json-array (xs)
+  "Recursively convert proper or improper list XS into a JSON array.
+A dotted tail becomes the final array element, so `(1 . 2)' becomes
+`[1, 2]' on the wire."
+  (let (out)
+    (while (consp xs)
+      (push (anvil-server--to-json-value (car xs)) out)
+      (setq xs (cdr xs)))
+    (when xs
+      (push (anvil-server--to-json-value xs) out))
+    (vconcat (nreverse out))))
 
 (defun anvil-server--to-json-value (x)
   "Recursively convert X into a value that `json-encode' renders sensibly.
@@ -1709,8 +1844,11 @@ through unchanged.  Keywords serialize as their bare name (no colon)."
     (cl-loop for (k v) on x by #'cddr
              collect (cons (intern (substring (symbol-name k) 1))
                            (anvil-server--to-json-value v))))
+   ((and (consp x) (not (proper-list-p x)))
+    (vector (anvil-server--to-json-value (car x))
+            (anvil-server--to-json-value (cdr x))))
    ((listp x)
-    (apply #'vector (mapcar #'anvil-server--to-json-value x)))
+    (anvil-server--list-to-json-array x))
    (t x)))
 
 (defun anvil-server-encode-for-mcp (value)
@@ -1721,14 +1859,36 @@ Strings and nil pass through unchanged; other shapes round-trip through
    ((or (null value) (stringp value)) value)
    (t (json-encode (anvil-server--to-json-value value)))))
 
+(defun anvil-server--encoded-handler-dispatch (encoder handler &rest args)
+  "Apply HANDLER to ARGS, then pass the result through ENCODER."
+  (funcall encoder (apply handler args)))
+
+(defun anvil-server--make-encoded-handler (handler encoder)
+  "Return a symbol-backed transport wrapper around HANDLER using ENCODER.
+The wrapper records the underlying raw handler on the
+`anvil-server-raw-handler' symbol property and marks
+`anvil-server-encode-result' so registration can preserve the raw
+signature/docstring for schema extraction and dispatch."
+  (let* ((name (if (symbolp handler)
+                   (symbol-name handler)
+                 "handler"))
+         (sym (make-symbol (format "anvil-encoded:%s" name))))
+    (put sym 'anvil-server-raw-handler handler)
+    (put sym 'anvil-server-encode-result t)
+    (put sym 'function-documentation (documentation handler t))
+    (fset sym
+          (apply-partially #'anvil-server--encoded-handler-dispatch
+                           encoder handler))
+    sym))
+
 (defun anvil-server-encode-handler (handler)
   "Return a wrapper around HANDLER that JSON-encodes its result.
 Lets the underlying tool body keep returning a rich plist for direct
 Elisp / ERT callers while the MCP transport receives a JSON string.
-HANDLER is called with whatever positional/rest arguments the
-wrapper receives."
-  (lambda (&rest args)
-    (anvil-server-encode-for-mcp (apply handler args))))
+Schema extraction and MCP argument binding still use HANDLER's raw
+signature/docstring via `anvil-server-register-tool'."
+  (anvil-server--make-encoded-handler
+   handler #'anvil-server-encode-for-mcp))
 
 (provide 'anvil-server)
 ;;; anvil-server.el ends here
