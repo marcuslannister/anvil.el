@@ -295,6 +295,267 @@ Binds:
         (should (plist-member row k))))))
 
 
+;;;; --- Phase 1b: FTS5 search -----------------------------------------------
+
+(ert-deftest anvil-memory-test/search-returns-matches ()
+  "FTS5 search returns rows whose bodies contain the query token."
+  (skip-unless (anvil-memory-test--supported-p 'search))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_widgets.md" root)
+     "---\ntype: feedback\n---\nwidgets always foo the bar\n")
+    (anvil-memory-test--write
+     (expand-file-name "feedback_plumbing.md" root)
+     "---\ntype: feedback\n---\npipes and drains only\n")
+    (anvil-memory-scan)
+    (let* ((hits (anvil-memory-search "widgets"))
+           (files (mapcar (lambda (h)
+                            (file-name-nondirectory (plist-get h :file)))
+                          hits)))
+      (should (member "feedback_widgets.md" files))
+      (should-not (member "feedback_plumbing.md" files)))))
+
+(ert-deftest anvil-memory-test/search-result-has-snippet ()
+  "Each search result carries :file / :type / :snippet keys."
+  (skip-unless (anvil-memory-test--supported-p 'search))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "project_alpha.md" root)
+     "---\ntype: project\n---\nalpha milestone snapshot details\n")
+    (anvil-memory-scan)
+    (let ((row (car (anvil-memory-search "alpha"))))
+      (dolist (k '(:file :type :snippet))
+        (should (plist-member row k)))
+      (should (stringp (plist-get row :snippet))))))
+
+(ert-deftest anvil-memory-test/search-filter-by-type ()
+  "`:type' restricts results to rows of that type."
+  (skip-unless (anvil-memory-test--supported-p 'search))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_foo.md" root)
+     "foo bar baz\n")
+    (anvil-memory-test--write
+     (expand-file-name "project_foo.md" root)
+     "foo bar baz\n")
+    (anvil-memory-scan)
+    (let ((hits (anvil-memory-search "foo" :type 'feedback)))
+      (should (= 1 (length hits)))
+      (should (eq 'feedback (plist-get (car hits) :type))))))
+
+(ert-deftest anvil-memory-test/search-respects-limit ()
+  "`:limit' caps the result count."
+  (skip-unless (anvil-memory-test--supported-p 'search))
+  (anvil-memory-test--with-env
+    (dotimes (i 5)
+      (anvil-memory-test--write
+       (expand-file-name (format "feedback_n%d.md" i) root)
+       "widget widget widget\n"))
+    (anvil-memory-scan)
+    (let ((hits (anvil-memory-search "widget" :limit 2)))
+      (should (= 2 (length hits))))))
+
+(ert-deftest anvil-memory-test/search-empty-query-returns-empty ()
+  "Empty / whitespace-only query returns empty list, never errors."
+  (skip-unless (anvil-memory-test--supported-p 'search))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_x.md" root) "x\n")
+    (anvil-memory-scan)
+    (should (null (anvil-memory-search "")))
+    (should (null (anvil-memory-search "   ")))))
+
+(ert-deftest anvil-memory-test/search-reflects-body-update ()
+  "Re-scanning a changed file updates the FTS index."
+  (skip-unless (anvil-memory-test--supported-p 'search))
+  (anvil-memory-test--with-env
+    (let ((path (expand-file-name "feedback_x.md" root)))
+      (anvil-memory-test--write path "original content alpha\n")
+      (anvil-memory-scan)
+      (should (anvil-memory-search "alpha"))
+      (should-not (anvil-memory-search "beta"))
+      (anvil-memory-test--write path "revised content beta\n")
+      (anvil-memory-scan)
+      (should-not (anvil-memory-search "alpha"))
+      (should (anvil-memory-search "beta")))))
+
+
+;;;; --- Phase 1b: save-check (top-N similar) --------------------------------
+
+(ert-deftest anvil-memory-test/save-check-returns-similar-candidates ()
+  "`save-check' returns top-N memories whose body overlaps the draft."
+  (skip-unless (anvil-memory-test--supported-p 'save-check))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_existing.md" root)
+     "Always sign commits with Co-Authored-By trailer for Claude sessions.\n")
+    (anvil-memory-test--write
+     (expand-file-name "project_unrelated.md" root)
+     "Inventory tracker for the warehouse project.\n")
+    (anvil-memory-scan)
+    (let* ((hits (anvil-memory-save-check
+                  "commit rules"
+                  "Always sign commits with Co-Authored-By when Claude helped."))
+           (files (mapcar (lambda (h)
+                            (file-name-nondirectory (plist-get h :file)))
+                          hits)))
+      (should (member "feedback_existing.md" files))
+      (should-not (member "project_unrelated.md" files)))))
+
+(ert-deftest anvil-memory-test/save-check-no-match-returns-empty ()
+  "A unique draft with no indexed overlap returns nil."
+  (skip-unless (anvil-memory-test--supported-p 'save-check))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_a.md" root)
+     "completely different topic about databases\n")
+    (anvil-memory-scan)
+    (should (null (anvil-memory-save-check
+                   "something else entirely"
+                   "xyz qrs tuv unrelated keywords")))))
+
+(ert-deftest anvil-memory-test/save-check-result-has-similarity-score ()
+  "Each candidate carries :similarity (0-1 float)."
+  (skip-unless (anvil-memory-test--supported-p 'save-check))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_x.md" root)
+     "shared words common keywords important phrase\n")
+    (anvil-memory-scan)
+    (let ((hit (car (anvil-memory-save-check
+                     "x" "shared words common keywords important"))))
+      (should hit)
+      (should (numberp (plist-get hit :similarity)))
+      (should (>= (plist-get hit :similarity) 0.0))
+      (should (<= (plist-get hit :similarity) 1.0)))))
+
+
+;;;; --- Phase 1b: duplicates ------------------------------------------------
+
+(ert-deftest anvil-memory-test/duplicates-finds-high-overlap-pair ()
+  "Two memories whose body overlap exceeds the threshold appear as a pair."
+  (skip-unless (anvil-memory-test--supported-p 'duplicates))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_a.md" root)
+     "alpha beta gamma delta epsilon zeta eta theta\n")
+    (anvil-memory-test--write
+     (expand-file-name "feedback_b.md" root)
+     "alpha beta gamma delta epsilon zeta eta theta iota\n")
+    (anvil-memory-test--write
+     (expand-file-name "feedback_c.md" root)
+     "xi omicron pi rho sigma tau upsilon phi chi psi\n")
+    (anvil-memory-scan)
+    (let* ((pairs (anvil-memory-duplicates 0.6))
+           (files-in-pairs
+            (cl-loop for p in pairs
+                     collect (cons (file-name-nondirectory
+                                    (car (plist-get p :pair)))
+                                   (file-name-nondirectory
+                                    (cadr (plist-get p :pair)))))))
+      (should (cl-find-if
+               (lambda (f)
+                 (or (equal f '("feedback_a.md" . "feedback_b.md"))
+                     (equal f '("feedback_b.md" . "feedback_a.md"))))
+               files-in-pairs))
+      (should-not (cl-find-if
+                   (lambda (f)
+                     (or (equal (car f) "feedback_c.md")
+                         (equal (cdr f) "feedback_c.md")))
+                   files-in-pairs)))))
+
+(ert-deftest anvil-memory-test/duplicates-respects-threshold ()
+  "Higher threshold shrinks the result set."
+  (skip-unless (anvil-memory-test--supported-p 'duplicates))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_a.md" root) "foo bar baz qux\n")
+    (anvil-memory-test--write
+     (expand-file-name "feedback_b.md" root) "foo bar quux corge\n")
+    (anvil-memory-scan)
+    (let ((pairs-loose (anvil-memory-duplicates 0.2))
+          (pairs-tight (anvil-memory-duplicates 0.9)))
+      (should (>= (length pairs-loose) (length pairs-tight)))
+      (should (null pairs-tight)))))
+
+(ert-deftest anvil-memory-test/duplicates-pair-has-similarity ()
+  "Each duplicate entry exposes :pair and :similarity."
+  (skip-unless (anvil-memory-test--supported-p 'duplicates))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_a.md" root) "alpha beta gamma\n")
+    (anvil-memory-test--write
+     (expand-file-name "feedback_b.md" root) "alpha beta gamma\n")
+    (anvil-memory-scan)
+    (let ((entry (car (anvil-memory-duplicates 0.5))))
+      (should entry)
+      (should (plist-member entry :pair))
+      (should (plist-member entry :similarity))
+      (should (consp (plist-get entry :pair)))
+      (should (= 2 (length (plist-get entry :pair)))))))
+
+
+;;;; --- Phase 1b: audit URL HEAD ------------------------------------------
+
+(ert-deftest anvil-memory-test/audit-urls-flags-reference-status ()
+  "When `:with-urls' is set, reference-type rows gain a :url-status field."
+  (skip-unless (anvil-memory-test--supported-p 'audit-urls))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "reference_ok.md" root)
+     "See https://example.com for details.\n")
+    (anvil-memory-scan)
+    (cl-letf* (((symbol-function 'anvil-http-head)
+                (lambda (&rest _) '(:status 200))))
+      (let ((row (car (anvil-memory-audit nil :with-urls t))))
+        (should (eq 'ok (plist-get row :url-status)))))))
+
+(ert-deftest anvil-memory-test/audit-urls-detects-404 ()
+  "A non-2xx HTTP status on the first URL marks :url-status as `broken'."
+  (skip-unless (anvil-memory-test--supported-p 'audit-urls))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "reference_dead.md" root)
+     "https://example.com/gone is now 404\n")
+    (anvil-memory-scan)
+    (cl-letf* (((symbol-function 'anvil-http-head)
+                (lambda (&rest _) '(:status 404))))
+      (let ((row (car (anvil-memory-audit nil :with-urls t))))
+        (should (eq 'broken (plist-get row :url-status)))))))
+
+(ert-deftest anvil-memory-test/audit-urls-skips-non-reference-types ()
+  "URL HEAD is only attempted for reference-type rows."
+  (skip-unless (anvil-memory-test--supported-p 'audit-urls))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_x.md" root)
+     "Avoid https://example.com/doc link-rotting.\n")
+    (anvil-memory-scan)
+    (let ((calls 0))
+      (cl-letf* (((symbol-function 'anvil-http-head)
+                  (lambda (&rest _)
+                    (setq calls (1+ calls))
+                    '(:status 200))))
+        (anvil-memory-audit nil :with-urls t)
+        (should (= 0 calls))))))
+
+(ert-deftest anvil-memory-test/audit-default-skips-url-check ()
+  "Omitting `:with-urls' never touches `anvil-http-head'."
+  (skip-unless (anvil-memory-test--supported-p 'audit-urls))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "reference_a.md" root)
+     "https://example.com lives\n")
+    (anvil-memory-scan)
+    (let ((calls 0))
+      (cl-letf* (((symbol-function 'anvil-http-head)
+                  (lambda (&rest _)
+                    (setq calls (1+ calls))
+                    '(:status 200))))
+        (anvil-memory-audit)
+        (should (= 0 calls))))))
+
+
 (provide 'anvil-memory-test)
 
 ;;; anvil-memory-test.el ends here
