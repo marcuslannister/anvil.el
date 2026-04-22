@@ -786,6 +786,107 @@ check — same envelope used by `sexp-cst-read' for consistency."
     (should (equal (gethash "kind" err) "sexp-cst/file-not-found"))))
 
 
+;;;; --- sexp-cst-edit-write (Phase 2b-b, on-disk apply) --------------------
+
+(defun anvil-sexp-cst-test--edit-write-available-p ()
+  "Return non-nil when the Phase 2b-b write-to-disk variant is live."
+  (and (anvil-sexp-cst-test--available-p 'cst-edit-write)
+       (fboundp 'anvil-sexp-cst-edit-write)))
+
+(defun anvil-sexp-cst-test--invoke-edit-write (&rest args)
+  "Call `anvil-sexp-cst-edit-write' with ARGS and parse its JSON result."
+  (let ((raw (apply #'anvil-sexp-cst-edit-write args)))
+    (should (stringp raw))
+    (json-parse-string raw :object-type 'hash-table
+                       :array-type 'array
+                       :null-object :null
+                       :false-object :false)))
+
+(defun anvil-sexp-cst-test--read-file-contents (path)
+  "Return the raw string contents of PATH as UTF-8."
+  (with-temp-buffer
+    (insert-file-contents path)
+    (buffer-string)))
+
+(ert-deftest anvil-sexp-cst-test-edit-write-applies-and-backs-up ()
+  "The write variant commits NEW-CONTENT to disk and creates a backup
+file carrying the original pre-edit text.  Both must round-trip
+through `insert-file-contents' byte-for-byte so a caller can
+reconstruct the prior state from the backup alone."
+  (skip-unless (anvil-sexp-cst-test--edit-write-available-p))
+  (skip-unless (anvil-sexp-cst-test--grammar-ready-p))
+  (anvil-sexp-cst-test--with-elisp-file path
+      "(defun foo () 1)\n"
+    (let* ((original (anvil-sexp-cst-test--read-file-contents path))
+           (obj (anvil-sexp-cst-test--invoke-edit-write
+                 path 2 "(defun foo () 42)"))
+           (backup-path (anvil-sexp-cst-test--get obj "backup-path"))
+           (disk-after (anvil-sexp-cst-test--read-file-contents path)))
+      (should (equal (anvil-sexp-cst-test--get obj "type") "edit-write"))
+      (should (stringp backup-path))
+      (should (file-exists-p backup-path))
+      (should (string-match-p "42" disk-after))
+      (should-not (string-match-p "(defun foo () 1)" disk-after))
+      (should (equal original
+                     (anvil-sexp-cst-test--read-file-contents backup-path)))
+      (ignore-errors (delete-file backup-path)))))
+
+(ert-deftest anvil-sexp-cst-test-edit-write-preserves-disk-on-invalid ()
+  "A validation failure (unbalanced NEW-TEXT) must leave the file and
+surrounding directory in pristine state — no backup file, no
+partial write, no stray temp files.  Guards against the classic
+`validate-too-late' mistake."
+  (skip-unless (anvil-sexp-cst-test--edit-write-available-p))
+  (skip-unless (anvil-sexp-cst-test--grammar-ready-p))
+  (anvil-sexp-cst-test--with-elisp-file path
+      "(defun foo () 1)\n"
+    (let* ((original (anvil-sexp-cst-test--read-file-contents path))
+           (dir (file-name-directory path))
+           (siblings-before (directory-files dir))
+           (obj (anvil-sexp-cst-test--invoke-edit-write
+                 path 2 "(defun foo () (incomplete"))
+           (err (anvil-sexp-cst-test--get obj "error"))
+           (disk-after (anvil-sexp-cst-test--read-file-contents path))
+           (siblings-after (directory-files dir)))
+      (should (hash-table-p err))
+      (should (equal (gethash "kind" err)
+                     "sexp-cst/parse-error-in-replacement"))
+      (should (equal original disk-after))
+      (should (equal siblings-before siblings-after)))))
+
+(ert-deftest anvil-sexp-cst-test-edit-write-handles-missing-file ()
+  "Missing file → typed error, no directory side effects (nothing to
+back up, nothing to write).  Matches the `sexp-cst-edit' contract."
+  (skip-unless (anvil-sexp-cst-test--edit-write-available-p))
+  (let* ((raw (anvil-sexp-cst-edit-write
+               "/no/such/file/zz-anvil-sct-edit-write-missing.el"
+               1 "(defvar x 1)"))
+         (obj (json-parse-string raw :object-type 'hash-table
+                                 :array-type 'array
+                                 :null-object :null
+                                 :false-object :false))
+         (err (gethash "error" obj)))
+    (should (hash-table-p err))
+    (should (equal (gethash "kind" err) "sexp-cst/file-not-found"))))
+
+(ert-deftest anvil-sexp-cst-test-edit-write-custom-backup-suffix ()
+  "Explicit BACKUP-SUFFIX overrides the default timestamped name.
+Useful for callers that want deterministic rollback paths (e.g. a
+wrapper skill that names backups after the originating LLM turn)."
+  (skip-unless (anvil-sexp-cst-test--edit-write-available-p))
+  (skip-unless (anvil-sexp-cst-test--grammar-ready-p))
+  (anvil-sexp-cst-test--with-elisp-file path
+      "(defvar x 1)\n"
+    (let* ((suffix ".anvil-sct-test-backup")
+           (obj (anvil-sexp-cst-test--invoke-edit-write
+                 path 2 "(defvar x 7)" suffix))
+           (backup-path (anvil-sexp-cst-test--get obj "backup-path")))
+      (should (stringp backup-path))
+      (should (string-suffix-p suffix backup-path))
+      (should (file-exists-p backup-path))
+      (ignore-errors (delete-file backup-path)))))
+
+
 ;;;; --- meta-test: shape lock file is loaded and TDD-lite gate active -----
 
 (ert-deftest anvil-sexp-cst-test-meta-locks-loaded ()
