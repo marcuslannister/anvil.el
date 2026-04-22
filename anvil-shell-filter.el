@@ -1,4 +1,5 @@
 ;;; anvil-shell-filter.el --- Per-command shell output compression + tee  -*- lexical-binding: t; -*-
+;;; anvil-audit: tools-wrapped-at-registration
 
 ;; Copyright (C) 2026 zawatton
 
@@ -589,7 +590,7 @@ MCP Parameters:
 ;;;; --- module lifecycle ---------------------------------------------------
 
 (defconst anvil-shell-filter--tool-specs
-  `((,#'anvil-shell-filter--tool-shell-run
+  `((,(anvil-server-encode-handler #'anvil-shell-filter--tool-shell-run)
      :id "shell-run"
      :description
      "Run a shell command, compress its stdout through a per-command filter
@@ -599,7 +600,7 @@ for later retrieval via `shell-tee-get'.  `filter=auto' picks a
 handler from the first token of CMD; `filter=\"\"` disables
 compression.")
 
-    (,#'anvil-shell-filter--tool-shell-filter
+    (,(anvil-server-encode-handler #'anvil-shell-filter--tool-shell-filter)
      :id "shell-filter"
      :description
      "Apply a named filter to a string without running a shell command.  Lets
@@ -607,7 +608,7 @@ callers re-compress output they already have (from a prior
 `shell-tee-get' or a foreign tool)."
      :read-only t)
 
-    (,#'anvil-shell-filter--tool-shell-tee-get
+    (,(anvil-server-encode-handler #'anvil-shell-filter--tool-shell-tee-get)
      :id "shell-tee-get"
      :description
      "Fetch raw stdout previously captured by `shell-run' under TEE_ID.
@@ -615,7 +616,7 @@ Retention is governed by `anvil-shell-tee-ttl-sec' (default 1h);
 expired ids return :found nil."
      :read-only t)
 
-    (,#'anvil-shell-filter--tool-shell-gain
+    (,(anvil-server-encode-handler #'anvil-shell-filter--tool-shell-gain)
      :id "shell-gain"
      :description
      "Summarise cumulative raw→compressed savings over the last DAYS days
