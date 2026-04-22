@@ -45,17 +45,20 @@
 
 (defconst anvil-sexp-cst-supported-types
   '(integer nil symbol string list alist plist hash-table vector cons
-            record truncation circular drill byte-cap)
+            record char-table truncation circular drill byte-cap
+            eieio purge)
   "Type tags + behaviors that `anvil-inspect-object' handles today.
-Phase 1a chunks extend this list; tests in
+Phase 1a/1b chunks extend this list; tests in
 tests/anvil-sexp-cst-test.el gate their `skip-unless' on membership
 here so a half-shipped chunk never breaks CI.  The pseudo-tags
-`truncation', `circular', `drill', and `byte-cap' describe emitted
-*behaviors* rather than Emacs runtime types — they live on the
-same list so each test can self-describe its capability gate.")
+`truncation', `circular', `drill', `byte-cap', `eieio', `purge'
+describe emitted *behaviors* rather than Emacs runtime types —
+they live on the same list so each test can self-describe its
+capability gate.")
 
 (defconst anvil-sexp-cst--real-type-tags
-  '(integer nil symbol string list alist plist hash-table vector cons record)
+  '(integer nil symbol string list alist plist hash-table vector cons
+            record char-table)
   "Runtime type tags returned by `anvil-sexp-cst--type-tag'.
 Subset of `anvil-sexp-cst-supported-types' that the dispatcher
 can match with a live handler.")
@@ -449,13 +452,94 @@ is omitted — a pair has no meaningful sequence length."
              (list :k "cdr" :v (anvil-sexp-cst--repr (cdr c))))))
 
 (defun anvil-sexp-cst--inspect-record (rec)
-  "Render record REC as a Phase 1a stub: type tag + slot count only.
-Slot 0 holds the record type, so `length' is `(length rec) - 1'
-to match the user-visible slot count.  Drill into individual
-slots lands in Phase 1b."
-  (anvil-sexp-cst--encode
-   'record
-   :length (max 0 (1- (length rec)))))
+  "Render record REC as shape-lock JSON.
+EIEIO objects dispatch to `--inspect-eieio-object' which surfaces
+class slot names and values.  Non-EIEIO records (bare records,
+cl-defstruct) retain the Phase 1a stub: type tag + slot count only.
+
+`cl-defstruct' introspection (type tag + named slots) lands in a
+later chunk; 1b-c keeps it at the stub rather than growing scope."
+  (cond
+   ((and (fboundp 'eieio-object-p) (eieio-object-p rec))
+    (anvil-sexp-cst--inspect-eieio-object rec))
+   (t
+    (anvil-sexp-cst--encode
+     'record
+     :length (max 0 (1- (length rec)))))))
+
+(defun anvil-sexp-cst--eieio-slot-names (class)
+  "Return the list of slot-name symbols defined on EIEIO CLASS.
+Handles the Emacs 26+ `eieio-class-slots' API (vector of
+`cl-slot-descriptor' structs) while staying tolerant of older
+representations (plain vectors / name symbols) so a future Emacs
+does not silently break introspection."
+  (when (fboundp 'eieio-class-slots)
+    (mapcar (lambda (sd)
+              (cond
+               ((fboundp 'cl--slot-descriptor-name)
+                (cl--slot-descriptor-name sd))
+               ((vectorp sd) (elt sd 1))
+               (t sd)))
+            (eieio-class-slots class))))
+
+(defun anvil-sexp-cst--inspect-eieio-object (obj)
+  "Render EIEIO OBJ as shape-lock JSON (type=eieio-object).
+Entry keys are slot-name strings; values go through
+`anvil-sexp-cst--repr'.  Unbound slots surface as `:unbound'
+so the caller can tell them apart from an explicit nil."
+  (let* ((class (eieio-object-class obj))
+         (slot-names (anvil-sexp-cst--eieio-slot-names class))
+         (total (length slot-names))
+         (off (anvil-sexp-cst--clamp-offset total))
+         (take (min (max 0 (- total off)) anvil-sexp-cst-top-limit))
+         (window (cl-subseq slot-names off (+ off take)))
+         (entries (cl-loop for sn in window
+                           collect (list :k (symbol-name sn)
+                                         :v (anvil-sexp-cst--repr
+                                             (condition-case _err
+                                                 (slot-value obj sn)
+                                               (error :unbound))))))
+         (ti (anvil-sexp-cst--window-truncation-info total off take obj)))
+    (anvil-sexp-cst--encode
+     'eieio-object
+     :length total
+     :entries (apply #'vector entries)
+     :truncated (car ti)
+     :cursor (cdr ti)
+     :cursor-source obj)))
+
+(defun anvil-sexp-cst--inspect-char-table (ct)
+  "Render char-table CT as shape-lock JSON.
+Enumerates via `map-char-table' and stops at
+`anvil-sexp-cst-top-limit' ranges.  Entry keys are single char
+codes (\"97\") or `FROM-TO' ranges (\"97-122\").  Drill on a
+char-table returns the same first-N window: `map-char-table'
+order is deterministic (ascending code points) but cannot be
+cheaply resumed, so offset pagination is out of scope for 1b-c."
+  (let* ((limit anvil-sexp-cst-top-limit)
+         (count 0)
+         entries)
+    (catch 'cap
+      (map-char-table
+       (lambda (k v)
+         (when (>= count limit) (throw 'cap nil))
+         (let ((key-str (cond
+                         ((integerp k) (format "%d" k))
+                         ((consp k) (format "%d-%d" (car k) (cdr k)))
+                         (t (format "%S" k)))))
+           (push (list :k key-str :v (anvil-sexp-cst--repr v))
+                 entries)
+           (cl-incf count)))
+       ct))
+    (let* ((truncated (>= count limit))
+           (cursor (and truncated (anvil-sexp-cst--make-cursor ct))))
+      (anvil-sexp-cst--encode
+       'char-table
+       :length count
+       :entries (apply #'vector (nreverse entries))
+       :truncated truncated
+       :cursor cursor
+       :cursor-source ct))))
 
 
 ;;;; --- drill cursor resolution (chunk 1b-a) ------------------------------
@@ -508,6 +592,7 @@ rather than undefined shape."
       ('vector     (anvil-sexp-cst--inspect-vector value))
       ('cons       (anvil-sexp-cst--inspect-cons value))
       ('record     (anvil-sexp-cst--inspect-record value))
+      ('char-table (anvil-sexp-cst--inspect-char-table value))
       (_
        ;; Unreachable — guard above rejects unlisted tags.
        (signal 'anvil-server-tool-error
@@ -619,6 +704,32 @@ MCP Parameters:
                (anvil-sexp-cst--inspect-dispatch value))))))))))
 
 
+;;;###autoload
+(defun anvil-inspect-object-purge (client-id)
+  "Delete every inspect-object cursor stored for CLIENT-ID.
+Drops every row in the `inspect-object/CLIENT-ID' namespace of
+anvil-state (Doc 08).  Returns the integer deletion count (0
+when the namespace was empty or anvil-state is not loaded).
+
+Use at session end so stale state rows do not accumulate across
+long-running daemons.  Signals `user-error' when CLIENT-ID is
+missing or empty.
+
+MCP Parameters:
+  CLIENT-ID  Required client-id whose cursor namespace to drop"
+  (anvil-server-with-error-handling
+   (cond
+    ((not (and client-id (stringp client-id)
+               (not (string-empty-p client-id))))
+     (user-error
+      "anvil-inspect-object-purge: CLIENT-ID must be a non-empty string"))
+    ((not (fboundp 'anvil-state-delete-ns)) 0)
+    (t
+     (let ((n (funcall (symbol-function 'anvil-state-delete-ns)
+                       (format "inspect-object/%s" client-id))))
+       (if (integerp n) n 0))))))
+
+
 ;;;; --- module lifecycle --------------------------------------------------
 
 (defun anvil-sexp-cst--abi-ready-p ()
@@ -668,12 +779,21 @@ sexp-cst-inspect-object-drill to page past top-limit."
 under a caller-supplied window (OFFSET / LIMIT).  Typed errors cover
 malformed cursors, expired state rows, cross-client attempts, and the
 case where anvil-state is not loaded.  Read-only."
-   :read-only t))
+   :read-only t)
+  (anvil-server-register-tool
+   #'anvil-inspect-object-purge
+   :id "sexp-cst-inspect-object-purge"
+   :server-id anvil-sexp-cst--server-id
+   :description
+   "Delete every inspect-object cursor stored for CLIENT-ID.  Returns the
+deletion count.  Intended for session-end cleanup so stale state rows do
+not accumulate across long-running daemons.  Write tool."))
 
 (defun anvil-sexp-cst--unregister-tools ()
   "Remove every sexp-cst-* MCP tool."
   (dolist (id '("sexp-cst-inspect-object"
-                "sexp-cst-inspect-object-drill"))
+                "sexp-cst-inspect-object-drill"
+                "sexp-cst-inspect-object-purge"))
     (anvil-server-unregister-tool id anvil-sexp-cst--server-id)))
 
 ;;;###autoload
