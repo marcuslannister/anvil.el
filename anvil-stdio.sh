@@ -60,6 +60,67 @@ else
 	}
 fi
 
+# --- Retry wrapper for emacsclient ------------------------------------
+# Absorbs the ~few-second window where `emacs --daemon' is being
+# restarted: emacsclient then fails with "can't find socket" /
+# "Connection refused" until the new daemon's server file is ready.
+# Retrying silently keeps the MCP pipe alive so upstream Claude Code
+# (or whoever is driving this bridge) doesn't see a hard failure for
+# a routine daemon bounce.
+#
+# Configure with env vars (defaults chosen to cover a typical restart):
+#   ANVIL_EMACSCLIENT_RETRY_MAX        attempts (default 60)
+#   ANVIL_EMACSCLIENT_RETRY_DELAY_MS   delay per attempt in ms (default 100)
+# 60 * 100ms = 6 seconds of tolerance.
+ANVIL_EMACSCLIENT_RETRY_MAX=${ANVIL_EMACSCLIENT_RETRY_MAX:-60}
+ANVIL_EMACSCLIENT_RETRY_DELAY_MS=${ANVIL_EMACSCLIENT_RETRY_DELAY_MS:-100}
+
+# anvil_emacsclient_retry STDERR_FILE -- EMACSCLIENT_ARGS...
+#
+# Run `emacsclient EMACSCLIENT_ARGS...', retrying on transient socket-
+# missing / connection-refused errors.  STDERR_FILE receives stderr of
+# the final attempt.  Non-socket failures (e.g. elisp errors) surface
+# immediately so genuine faults aren't masked.
+# Prints emacsclient's stdout on success; exits with emacsclient's rc.
+anvil_emacsclient_retry() {
+	local stderr_file="$1"
+	shift
+	if [ "${1-}" = "--" ]; then shift; fi
+
+	local attempt=0 out="" rc=0
+	while :; do
+		set +e
+		out=$(emacsclient "$@" 2>"$stderr_file")
+		rc=$?
+		set -e
+		if [ "$rc" -eq 0 ]; then
+			printf '%s' "$out"
+			return 0
+		fi
+		if [ -s "$stderr_file" ] \
+			&& grep -qE "can't find socket|Connection refused|server.*not.*running|No such file or directory" "$stderr_file"; then
+			attempt=$((attempt + 1))
+			if [ "$attempt" -ge "$ANVIL_EMACSCLIENT_RETRY_MAX" ]; then
+				mcp_debug_log "RETRY-EXHAUSTED" "attempts=$attempt max=$ANVIL_EMACSCLIENT_RETRY_MAX rc=$rc"
+				printf '%s' "$out"
+				return "$rc"
+			fi
+			if [ "$attempt" -eq 1 ] || [ $((attempt % 10)) -eq 0 ]; then
+				mcp_debug_log "RETRY" "attempt=$attempt rc=$rc stderr=$(tr '\n' ' ' <"$stderr_file" | cut -c1-120)"
+			fi
+			if [ "$ANVIL_EMACSCLIENT_RETRY_DELAY_MS" -gt 0 ]; then
+				local delay_sec
+				delay_sec=$(awk -v ms="$ANVIL_EMACSCLIENT_RETRY_DELAY_MS" 'BEGIN{printf "%.3f", ms/1000}')
+				sleep "$delay_sec"
+			fi
+			continue
+		fi
+		# Non-retriable failure — surface immediately.
+		printf '%s' "$out"
+		return "$rc"
+	done
+}
+
 # Parse command line arguments
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -121,16 +182,17 @@ fi
 
 # Initialize MCP if init function is provided
 if [ -n "$INIT_FUNCTION" ]; then
-	# shellcheck disable=SC2124
-	readonly INIT_CMD="emacsclient ${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} -e \"($INIT_FUNCTION)\""
-
-	mcp_debug_log "INIT-CALL" "$INIT_CMD"
+	mcp_debug_log "INIT-CALL" "emacsclient ${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} -e ($INIT_FUNCTION) (with retry)"
 
 	# Execute the command and capture output and return code
 	init_stderr_file="/tmp/mcp-init-stderr.$$-$(date +%s%N)"
 	mcp_debug_log "INIT-STDERR-FILE" "$init_stderr_file"
-	INIT_OUTPUT=$(eval "$INIT_CMD" 2>"$init_stderr_file")
+	set +e
+	INIT_OUTPUT=$(anvil_emacsclient_retry "$init_stderr_file" -- \
+		${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} \
+		-e "($INIT_FUNCTION)")
 	INIT_RC=$?
+	set -e
 
 	# Log results
 	mcp_debug_log "INIT-RC" "$INIT_RC"
@@ -159,9 +221,17 @@ while read -r line; do
 	# Handle nil responses from notifications by converting to empty string
 	elisp_expr="(base64-encode-string (encode-coding-string (or (anvil-server-process-jsonrpc (base64-decode-string \"$base64_input\") \"$SERVER_ID\") \"\") 'utf-8 t) t)"
 
-	# Get response from emacsclient - capture stderr for debugging
+	# Get response from emacsclient (with retry across daemon restarts).
+	# Capture stderr for debugging and rc for logging only; existing code
+	# downstream treats an empty `base64_response' as a soft failure.
 	stderr_file="/tmp/mcp-stderr.$$-$(date +%s%N)"
-	base64_response=$(emacsclient "${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"}" -e "$elisp_expr" 2>"$stderr_file")
+	set +e
+	base64_response=$(anvil_emacsclient_retry "$stderr_file" -- \
+		${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} \
+		-e "$elisp_expr")
+	_anvil_client_rc=$?
+	set -e
+	mcp_debug_log "EMACSCLIENT-RC" "$_anvil_client_rc"
 
 	# Check for stderr output
 	if [ -s "$stderr_file" ]; then
@@ -236,19 +306,24 @@ done
 # Stop MCP if stop function is provided
 if [ -n "$STOP_FUNCTION" ]; then
 	mcp_debug_log "INFO" "Stopping MCP with function: $STOP_FUNCTION"
-
-	# shellcheck disable=SC2124
-	readonly STOP_CMD="emacsclient ${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} -e \"($STOP_FUNCTION)\""
-
-	mcp_debug_log "STOP-CALL" "$STOP_CMD"
+	mcp_debug_log "STOP-CALL" "emacsclient ${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} -e ($STOP_FUNCTION) (with retry)"
 
 	# Execute the command and capture output and return code
-	STOP_OUTPUT=$(eval "$STOP_CMD" 2>&1)
+	stop_stderr_file="/tmp/mcp-stop-stderr.$$-$(date +%s%N)"
+	set +e
+	STOP_OUTPUT=$(anvil_emacsclient_retry "$stop_stderr_file" -- \
+		${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} \
+		-e "($STOP_FUNCTION)")
 	STOP_RC=$?
+	set -e
 
 	# Log results
 	mcp_debug_log "STOP-RC" "$STOP_RC"
 	mcp_debug_log "STOP-OUTPUT" "$STOP_OUTPUT"
+	if [ -s "$stop_stderr_file" ]; then
+		mcp_debug_log "STOP-STDERR" "$(cat "$stop_stderr_file")"
+	fi
+	rm -f "$stop_stderr_file"
 else
 	mcp_debug_log "INFO" "Skipping stop function call (none provided)"
 fi
