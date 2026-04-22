@@ -130,6 +130,16 @@ These are not loaded by default.  Available modules:
                 docs/design/28-progressive-disclosure.org.  Depends on
                 `anvil-org-index' for the org-index-index handler
                 (Doc 28 Phase 1)
+- `shell-filter' — Per-command shell output compression + tee +
+                gain statistics.  Adds MCP tools shell-run,
+                shell-filter, shell-tee-get, shell-gain that
+                transparently filter verbose stdout (git status /
+                git log / git diff / rg / find / ls / pytest /
+                ert-batch / emacs-batch / make) before returning
+                to the caller.  Raw bytes are stashed under the
+                `shell-tee' namespace with a TTL so callers can
+                recover the full output on demand.  Requires
+                `anvil-state' (Emacs 29+ SQLite).  Doc 27 Phase 1.
 - `sexp-cst'  — Tree-sitter CST + runtime `inspect-object' tool:
                 token-bounded JSON view of any live Lisp value.
                 Phase 1a ships 9 core types + record stub + truncation
