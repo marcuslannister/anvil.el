@@ -1441,6 +1441,222 @@ forwarded keyword args so tests can assert call counts / contents."
       (should (file-exists-p out)))))
 
 
+;;;; --- Phase 3b: live TCP server ----------------------------------------
+
+(defun anvil-memory-test--http-get (port path)
+  "Open a TCP client to 127.0.0.1:PORT, GET PATH, return a parsed plist.
+Plist keys: :status (int), :headers (alist, lower-cased names), :body (str).
+Blocks up to 3s then times out returning :status -1."
+  (let* ((buf "")
+         (done nil)
+         (proc (make-network-process
+                :name "anvil-memory-http-test-client"
+                :host "127.0.0.1"
+                :service port
+                :family 'ipv4
+                :coding 'binary
+                :noquery t
+                :filter (lambda (_p s) (setq buf (concat buf s)))
+                :sentinel (lambda (p _e)
+                            (when (memq (process-status p)
+                                        '(closed failed exit signal))
+                              (setq done t))))))
+    (unwind-protect
+        (progn
+          (process-send-string
+           proc (format "GET %s HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n" path))
+          (with-timeout (3 nil)
+            (while (not done)
+              (accept-process-output proc 0.1))))
+      (when (process-live-p proc) (delete-process proc)))
+    (if (string-match "\\`HTTP/[0-9.]+ \\([0-9]+\\) " buf)
+        (let* ((status (string-to-number (match-string 1 buf)))
+               (split (string-match "\r\n\r\n" buf))
+               (head (substring buf 0 (or split (length buf))))
+               (body (if split (substring buf (+ split 4)) ""))
+               (headers
+                (let (acc)
+                  (dolist (line (cdr (split-string head "\r\n" t)))
+                    (when (string-match "\\([^:]+\\):\\s-*\\(.*\\)" line)
+                      (push (cons (downcase (match-string 1 line))
+                                  (match-string 2 line))
+                            acc)))
+                  (nreverse acc))))
+          (list :status status :headers headers :body body))
+      (list :status -1 :headers nil :body buf))))
+
+(defun anvil-memory-test--http-raw (port request-bytes)
+  "Open TCP client to 127.0.0.1:PORT, write REQUEST-BYTES, return full reply."
+  (let* ((buf "")
+         (done nil)
+         (proc (make-network-process
+                :name "anvil-memory-http-test-raw"
+                :host "127.0.0.1"
+                :service port
+                :family 'ipv4
+                :coding 'binary
+                :noquery t
+                :filter (lambda (_p s) (setq buf (concat buf s)))
+                :sentinel (lambda (p _e)
+                            (when (memq (process-status p)
+                                        '(closed failed exit signal))
+                              (setq done t))))))
+    (unwind-protect
+        (progn
+          (process-send-string proc request-bytes)
+          (with-timeout (3 nil)
+            (while (not done)
+              (accept-process-output proc 0.1))))
+      (when (process-live-p proc) (delete-process proc)))
+    buf))
+
+(defmacro anvil-memory-test--with-server (root-var &rest body)
+  "Run BODY with a memory server bound to an ephemeral port.
+ROOT-VAR is the temp memory root.  Binds `port' (int) and `info'
+(the start plist)."
+  (declare (indent 1))
+  `(let* ((info (anvil-memory-serve-start :host "127.0.0.1" :port t
+                                          :root ,root-var))
+          (port (plist-get info :port)))
+     (unwind-protect (progn ,@body)
+       (anvil-memory-serve-stop))))
+
+(ert-deftest anvil-memory-test/serve-start-returns-port-and-process ()
+  "Start returns :port / :host / :process; the process is live."
+  (skip-unless (anvil-memory-test--supported-p 'serve))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-typed-mix root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-server root
+      (should (integerp port))
+      (should (> port 0))
+      (should (equal "127.0.0.1" (plist-get info :host)))
+      (should (process-live-p (plist-get info :process))))))
+
+(ert-deftest anvil-memory-test/serve-double-start-errors ()
+  "Starting while already running raises `user-error'."
+  (skip-unless (anvil-memory-test--supported-p 'serve))
+  (anvil-memory-test--with-env
+    (anvil-memory-scan)
+    (anvil-memory-test--with-server root
+      (should-error (anvil-memory-serve-start :host "127.0.0.1" :port t
+                                              :root root)))))
+
+(ert-deftest anvil-memory-test/serve-stop-idempotent ()
+  "Stop when no server is running returns nil without signalling."
+  (skip-unless (anvil-memory-test--supported-p 'serve))
+  (anvil-memory-test--with-env
+    (should (null (anvil-memory-serve-stop)))
+    (should (null (anvil-memory-serve-stop)))))
+
+(ert-deftest anvil-memory-test/serve-get-root-returns-html ()
+  "GET / answers 200 with Content-Type: text/html."
+  (skip-unless (anvil-memory-test--supported-p 'serve))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-typed-mix root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-server root
+      (let* ((res (anvil-memory-test--http-get port "/"))
+             (ct (assoc "content-type" (plist-get res :headers))))
+        (should (= 200 (plist-get res :status)))
+        (should ct)
+        (should (string-match-p "text/html" (cdr ct)))
+        (should (string-match-p "<!DOCTYPE html>" (plist-get res :body)))))))
+
+(ert-deftest anvil-memory-test/serve-get-root-contains-memories ()
+  "The served HTML lists every indexed memory's basename."
+  (skip-unless (anvil-memory-test--supported-p 'serve))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-typed-mix root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-server root
+      (let ((body (plist-get (anvil-memory-test--http-get port "/") :body)))
+        (should (string-match-p "user_role\\.md" body))
+        (should (string-match-p "feedback_commits\\.md" body))
+        (should (string-match-p "project_anvil\\.md" body))))))
+
+(ert-deftest anvil-memory-test/serve-get-api-list-returns-json ()
+  "GET /api/list returns 200 + application/json + parseable array."
+  (skip-unless (anvil-memory-test--supported-p 'serve))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-typed-mix root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-server root
+      (let* ((res (anvil-memory-test--http-get port "/api/list"))
+             (ct (assoc "content-type" (plist-get res :headers))))
+        (should (= 200 (plist-get res :status)))
+        (should (string-match-p "application/json" (cdr ct)))
+        (let* ((json-object-type 'alist)
+               (json-array-type 'list)
+               (parsed (json-read-from-string (plist-get res :body))))
+          (should (listp parsed)))))))
+
+(ert-deftest anvil-memory-test/serve-get-api-heatmap-returns-json ()
+  "GET /api/decay-heatmap returns 200 + per-type aggregate JSON."
+  (skip-unless (anvil-memory-test--supported-p 'serve))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-typed-mix root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-server root
+      (let* ((res (anvil-memory-test--http-get port "/api/decay-heatmap"))
+             (json-object-type 'alist)
+             (json-array-type 'list)
+             (parsed (and (= 200 (plist-get res :status))
+                          (json-read-from-string (plist-get res :body)))))
+        (should parsed)
+        (should (listp parsed))
+        (dolist (entry parsed)
+          (should (assq 'type entry))
+          (should (assq 'count entry))
+          (should (assq 'mean_decay entry)))))))
+
+(ert-deftest anvil-memory-test/serve-unknown-path-404 ()
+  "Unknown paths answer 404."
+  (skip-unless (anvil-memory-test--supported-p 'serve))
+  (anvil-memory-test--with-env
+    (anvil-memory-scan)
+    (anvil-memory-test--with-server root
+      (let ((res (anvil-memory-test--http-get port "/does-not-exist")))
+        (should (= 404 (plist-get res :status)))))))
+
+(ert-deftest anvil-memory-test/serve-non-get-405 ()
+  "Non-GET methods answer 405 Method Not Allowed."
+  (skip-unless (anvil-memory-test--supported-p 'serve))
+  (anvil-memory-test--with-env
+    (anvil-memory-scan)
+    (anvil-memory-test--with-server root
+      (let ((raw (anvil-memory-test--http-raw
+                  port "POST / HTTP/1.0\r\nHost: x\r\n\r\n")))
+        (should (string-match-p "HTTP/1\\.[01] 405 " raw))))))
+
+(ert-deftest anvil-memory-test/serve-sequential-requests-ok ()
+  "Three back-to-back GETs each succeed; the server survives all."
+  (skip-unless (anvil-memory-test--supported-p 'serve))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-typed-mix root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-server root
+      (dotimes (_ 3)
+        (let ((res (anvil-memory-test--http-get port "/")))
+          (should (= 200 (plist-get res :status))))))))
+
+(ert-deftest anvil-memory-test/serve-mcp-tool-lifecycle ()
+  "MCP `memory-serve-start' / `memory-serve-stop' round-trip."
+  (skip-unless (anvil-memory-test--supported-p 'serve))
+  (anvil-memory-test--with-env
+    (anvil-memory-scan)
+    (let* ((started (anvil-memory--tool-serve-start "127.0.0.1" "0" root))
+           (port (plist-get started :port)))
+      (unwind-protect
+          (progn
+            (should (integerp port))
+            (should (plist-get started :running))
+            (let ((res (anvil-memory-test--http-get port "/")))
+              (should (= 200 (plist-get res :status)))))
+        (let ((stopped (anvil-memory--tool-serve-stop)))
+          (should (plist-member stopped :stopped)))))))
+
+
 (provide 'anvil-memory-test)
 
 ;;; anvil-memory-test.el ends here
