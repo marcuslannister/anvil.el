@@ -1,0 +1,271 @@
+#+title: anvil-data-path — JSON / YAML / TOML path-based edits
+#+date: 2026-04-22
+#+author: zawatton
+#+property: status DRAFT
+#+property: scope GENERIC
+
+* STATUS
+  :PROPERTIES:
+  :ID:       019dafb1-0000-7000-0000-data-path-doc33
+  :END:
+~DRAFT~ (2026-04-22) → ~SHIPPED~ (2026-04-22, develop branch) —
+Phase 1 (JSON only) complete: data-get-path / data-set-path /
+data-delete-path / data-list-keys MCP tools registered by
+`anvil-data-enable', anvil-data-test 28/28 pass, make test-all
+971/976 pass 0 failed.  Phase 2 (YAML / TOML via subprocess) and
+Phase 3 (JSONPath / quoted segments) remain DRAFT.
+
+First concrete sibling of the Doc 25 (structured-text) family.
+Numbered Doc 33 because the slots Doc 25 reserved at writing time
+(Doc 26-30) have all been claimed.  Implements the YAML / TOML /
+JSON sketch from Doc 25 §"YAML / TOML / JSON (Doc 28 candidate)" —
+hierarchical map access by dotted / indexed path, preview-by-default,
+~:apply~ to write.
+
+* Motivation
+
+Anvil already ships ~json-object-add~ (Doc 06 family) which inserts
+string-typed key/value pairs at the *top level* of a JSON object.
+That covers the i18n locale-file pattern but not the day-to-day
+config-editing pattern that dominates the maintainer's workflow:
+
+| File                              | Format | Frequent edit                            |
+|-----------------------------------+--------+------------------------------------------|
+| ~~/.claude.json~                   | JSON   | add MCP server entry (nested)             |
+| ~~/.claude/settings.json~          | JSON   | tweak ~hooks.PostToolUse~                  |
+| ~package.json~                    | JSON   | bump ~scripts.test~ command               |
+| ~~/.emacs.d/.el-cache/manifest.json~| JSON  | inspect / surgical fix                    |
+| ~~/.config/.../config.toml~        | TOML   | toggle a nested boolean                   |
+| ~~/.github/workflows/*.yml~        | YAML   | adjust matrix entry                       |
+
+Today Claude / a human edits these by hand or via the generic
+~Edit~ tool, and structural mistakes (trailing comma, indent off
+by one, broken anchor) are real.  A path-based MCP surface
+removes that whole failure mode: the parser rejects malformed
+input before the file is written, and round-tripping through a
+typed parser eliminates "I edited the wrong subtree" bugs.
+
+The competition (~jq~, ~yq~, ~tomlq~, ~dasel~) does this from the
+shell.  Anvil's value-add is making it MCP-callable so Claude can
+use it directly without spawning a CLI per call, and integrating
+with the existing ~file-batch-across~ apply pipeline.
+
+* Goals
+
+1. ~data-get-path~ FILE PATH → value (read)
+2. ~data-set-path~ FILE PATH VALUE [APPLY] → preview / written file
+3. ~data-delete-path~ FILE PATH [APPLY] → preview / written file
+4. ~data-list-keys~ FILE [PATH] → list of keys at the named map
+5. Format detected from extension (~.json~ / ~.yaml~ / ~.yml~ /
+   ~.toml~), opt-out via explicit ~:format~ keyword.
+6. *Preview by default*; writing requires ~:apply t~.  Same gate
+   convention as Doc 06 / Doc 12 / Doc 21.
+7. JSON: zero external dependency (built-in ~json-*~).  YAML / TOML:
+   degrade gracefully if the backend (~yq~ / ~tomlq~ / pure-elisp
+   parser) is unavailable — return a typed error, never silently
+   misparse.
+
+* Non-goals
+
+- *Schema validation.*  Out of scope; callers run their own.
+- *Round-trip formatting preservation* beyond what each parser
+  supports.  YAML / TOML preserve comments only when the backend
+  (~yq~ etc.) supports it; JSON loses formatting on rewrite (we
+  prettify with detected indent + trailing newline).  When a
+  format-preserving rewrite is critical, stay in ~json-object-add~
+  (which patches in place) for top-level JSON additions.
+- *JSONPath expressions* (~$.foo[*].bar~).  Phase 1 accepts the
+  simple dotted form ~foo.bar[0].baz~ only.  JSONPath bigger surface
+  punted to Phase 3 once a real consumer asks.
+- *YAML anchors / merge keys.*  Backends that don't expand them
+  (e.g. pure-elisp) refuse with a typed error; ~yq~ does the right
+  thing.
+
+* Path syntax
+
+Single grammar across formats:
+
+#+begin_src
+  segment       := IDENT | "[" INDEX "]"
+  IDENT         := [A-Za-z_][A-Za-z0-9_-]*
+  INDEX         := 0 | [1-9][0-9]*
+  path          := segment ( ("." segment) | ("[" INDEX "]") )*
+#+end_src
+
+Examples:
+- ~hooks.PostToolUse~ — nested map access
+- ~mcpServers.emacs-eval.command~ — three levels deep
+- ~workflows[0].steps[2].name~ — array index
+- ~packages[\"@scope/name\"].version~ — quoted segment for keys
+  that contain ~.~ or ~[~ (Phase 1 may reject; Phase 2 supports)
+
+Empty path / ~""~ refers to the root document.
+
+* Architecture
+
+** Phase 1 — JSON only (~anvil-data.el~ extension)
+
+JSON path operations land in the existing ~anvil-data.el~ module
+(MCP server-id ~emacs-eval~).  Backed by ~json-parse-string~ +
+~json-serialize~ (Emacs 27+, native).  No subprocess, no extra
+dependency.
+
+The current ~anvil-data.el~ is a placeholder; Phase 1 fills it
+with the four ops above plus the path parser + tree walker.
+
+#+begin_src elisp
+(defun anvil-data-path-get (file path)
+  "Return the value at PATH in JSON FILE; nil when absent.")
+
+(defun anvil-data-path-set (file path value &key apply)
+  "Replace / create PATH in FILE with VALUE.
+Returns plist (:file :path :before :after :preview :applied).
+With :apply nil (default) only the preview is built; with :apply t
+the file is rewritten via `file-batch-across' (one audit point).")
+
+(defun anvil-data-path-delete (file path &key apply)
+  "Remove PATH from FILE; preview / apply contract per -path-set.")
+
+(defun anvil-data-path-keys (file &optional path)
+  "Return the keys of the map at PATH (or root) in FILE.")
+#+end_src
+
+Tool ids ship with the explicit ~data-~ prefix so the format-detect
+step is hidden but never auto-routed to a different format.
+
+** Phase 2 — YAML + TOML via subprocess
+
+Backends:
+- YAML: ~yq~ (mikefarah, MIT) — single Go binary, ships from the
+  same repo as ~jq~.  Path syntax is a superset of ours, so we map
+  our dotted form to ~yq~ filter strings.
+- TOML: ~tomlq~ (Python ~yq~ package alias) or ~dasel~ if the user
+  prefers a single binary for all formats.  Auto-detect available
+  backend; fall back to typed error.
+
+Subprocess spawn cost is paid per-call; pre-warmed REPL pool is
+overkill for batch-friendly tools.  Reuses the same ~anvil-host~
+~--run~ helpers Doc 24's REPL pool would have shared.
+
+Phase 2 ships behind the same ~data-*~ tool ids — callers pass
+~~/.config/foo.yml~ and the format dispatch happens internally.
+~:format~ keyword stays as the override.
+
+** Phase 3 — JSONPath / quoted segments
+
+- JSONPath expressions (~$.foo[*]~) for users coming from ~jq~.
+- Quoted path segments (~packages[\"@scope/name\"]~) for keys with
+  reserved characters.
+- Both are pure parser additions; the walker stays.
+
+* Public API
+
+Phase 1 (Elisp):
+
+#+begin_src elisp
+(anvil-data-path-get      FILE PATH)
+(anvil-data-path-set      FILE PATH VALUE &key apply format)
+(anvil-data-path-delete   FILE PATH       &key apply format)
+(anvil-data-path-keys     FILE &optional PATH &key format)
+#+end_src
+
+* Public MCP tools
+
+| id                | phase | args                                   | notes        |
+|-------------------+-------+----------------------------------------+--------------|
+| ~data-get-path~   |     1 | file, path                             | read-only    |
+| ~data-set-path~   |     1 | file, path, value-json, apply?         | preview-def  |
+| ~data-delete-path~|     1 | file, path, apply?                     | preview-def  |
+| ~data-list-keys~  |     1 | file, path?                            | read-only    |
+
+VALUE-JSON is a string the caller has already serialised to JSON
+(~"42"~, ~"\"x\""~, ~"[1,2,3]"~, ~"{\"k\":\"v\"}"~).  This avoids
+the Lisp-to-JSON-type ambiguity at the MCP boundary (Lisp ~nil~ vs
+JSON ~null~ vs missing key).
+
+* Phases
+
+** Phase 1 — JSON read / write / delete / list (~SHIPPED~ 2026-04-22)
+
+Surface implemented in ~anvil-data.el~ alongside the existing
+data utilities.  ERT 28 covering:
+
+- Path parser: empty / single ident / dotted / array indices /
+  malformed (4 tests).
+- get-path: shallow, nested, array index, missing returns nil,
+  empty path returns whole tree (5 tests).
+- set-path: overwrite leaf, create deep intermediates, preview
+  no-write, array append, array out-of-range error, type mismatch
+  on existing wrong-type intermediate (6 tests).
+- delete-path: leaf, nested, noop on missing, array element
+  (4 tests).
+- list-keys: root, nested, array indices, missing path errors
+  (4 tests).
+- Format detection: extension routing + Phase-1 YAML/TOML refusal
+  (2 tests).
+- Value decoding: scalars + collections (2 tests).
+
+Read-side traversal (`get-path' / `list-keys') is lenient — a
+missing or wrong-shape intermediate returns the missing sentinel
+which surfaces as nil at the API boundary.  Set / delete are
+strict because a wrong-type assignment would silently corrupt
+the tree.
+
+Apply path goes through `anvil-data--write-content' (UTF-8 + LF
+via `write-region') with the rendered tree pretty-printed via
+`json-pretty-print-buffer'.  `file-batch-across' is intentionally
+not used here — JSON loses formatting on a full-tree rewrite, so
+a per-byte-range plan would not buy anything.
+
+** Phase 2 — YAML + TOML subprocess backends
+
+- ~anvil-data-path--backend-yaml-yq~ + ~--backend-toml-tomlq~ +
+  ~--backend-toml-dasel~.
+- Backend probe at ~anvil-data-enable~ time: missing binary →
+  format-set silently disabled, MCP error references which binary
+  is missing so the user can install it.
+- ERT +6 with subprocess fixtures gated by ~ANVIL_HAS_YQ=1~ etc.
+  so CI without the tools still passes.
+
+** Phase 3 — JSONPath + quoted segments
+
+Pure-parser change.  ERT +4.
+
+* Testing strategy
+
+- Phase 1: pure in-process, no subprocess.  Round-trip every set
+  through a re-parse to verify the file is still valid JSON.
+- Phase 2: ~ANVIL_HAS_YQ~ / ~ANVIL_HAS_TOMLQ~ env gates; ERT skips
+  with a clear message when missing.
+- Soak test (opt-in via ~ANVIL_SOAK=1~): rewrite a 5 MB JSON file
+  100 times to catch quadratic regressions in the walker.
+
+* Platform notes
+
+- Phase 1 is ~json.el~-only, runs everywhere Emacs 27+ does.
+- Phase 2 needs ~yq~ / ~tomlq~ on PATH.  Windows: scoop / winget
+  install both; documented in install notes.
+- macOS: ~brew install yq~ ships ~yq~ + the Python ~yq~ package
+  separately (mikefarah vs Python).  Backend probe distinguishes
+  by ~--version~ output to avoid mistaking one for the other.
+
+* Out of scope / future
+
+- *XML / XPath* — would join this family but the reader story is
+  uglier (entity expansion, namespaces).  Separate doc when demand.
+- *.ini files* — INI is a flat single-section format ~json-object-add~
+  could be extended to handle.  Skip for now; demand is rare.
+- *Format-specific niceties:* JSON5 (trailing comma tolerance),
+  HJSON, JSONC.  All would degrade by routing through a normaliser.
+
+* References
+
+- Doc 25 (~25-structured-text.org~): family index this doc
+  implements the first sibling of.
+- Doc 06 (~06-code-transform-tools.org~): preview / apply plan
+  convention.
+- ~anvil-file--tool-json-object-add~ (Doc 06 family): top-level
+  JSON additions, retained for the in-place insert pattern this
+  doc deliberately does not replicate.
+- ~jq~ / ~yq~ / ~tomlq~ / ~dasel~ — the CLI prior art whose
+  semantics this doc adopts.
