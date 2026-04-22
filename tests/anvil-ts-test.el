@@ -284,5 +284,290 @@ body parses without an error."
 (ert-deftest anvil-ts-test-list-imports-errors-on-nil-file ()
   (should-error (anvil-ts-list-imports nil) :type 'user-error))
 
+;;;; --- Phase 2: edit helpers ---------------------------------------------
+
+(defun anvil-ts-test--temp-copy (src ext)
+  "Copy SRC to a fresh tempfile with extension EXT and return its path."
+  (let ((dst (make-temp-file "anvil-ts-phase2-" nil (concat "." ext))))
+    (with-temp-file dst
+      (insert-file-contents src))
+    dst))
+
+(defun anvil-ts-test--contents (path)
+  "Return PATH's contents as a string."
+  (with-temp-buffer
+    (insert-file-contents path)
+    (buffer-substring-no-properties (point-min) (point-max))))
+
+(ert-deftest anvil-ts-test-add-import-new-statement ()
+  "Adding an import from an unused module emits a fresh statement."
+  (anvil-ts-test--requires 'typescript
+    (let ((f (anvil-ts-test--temp-copy anvil-ts-test--ts-fixture "ts")))
+      (unwind-protect
+          (let ((plan (anvil-ts-add-import
+                       f (list :from "fresh-mod"
+                               :named (list "hello"))
+                       :apply t)))
+            (should (plist-get plan :applied-at))
+            (should (string-match-p
+                     "import { hello } from \"fresh-mod\";"
+                     (anvil-ts-test--contents f))))
+        (delete-file f)))))
+
+(ert-deftest anvil-ts-test-add-import-merges-into-existing ()
+  "Adding a :named member to an existing statement merges in place."
+  (anvil-ts-test--requires 'typescript
+    (let ((f (anvil-ts-test--temp-copy anvil-ts-test--ts-fixture "ts")))
+      (unwind-protect
+          (progn
+            (anvil-ts-add-import
+             f (list :from "node:fs/promises"
+                     :named (list "writeFile"))
+             :apply t)
+            (should (string-match-p
+                     "import { readFile, writeFile } from \"node:fs/promises\";"
+                     (anvil-ts-test--contents f))))
+        (delete-file f)))))
+
+(ert-deftest anvil-ts-test-add-import-idempotent ()
+  "Re-adding an already-present specifier is a no-op plan."
+  (anvil-ts-test--requires 'typescript
+    (let ((f (anvil-ts-test--temp-copy anvil-ts-test--ts-fixture "ts")))
+      (unwind-protect
+          (let* ((plan (anvil-ts-add-import
+                        f (list :from "node:fs/promises"
+                                :named (list "readFile")))))
+            (should (null (plist-get plan :ops)))
+            (should (string-match-p "no-op"
+                                    (plist-get plan :summary))))
+        (delete-file f)))))
+
+(ert-deftest anvil-ts-test-add-import-type-only-splits ()
+  "A :type-only add with a non-type existing statement splits into a
+second `import type ...' line rather than overwriting the value
+import."
+  (anvil-ts-test--requires 'typescript
+    (let ((f (anvil-ts-test--temp-copy anvil-ts-test--ts-fixture "ts")))
+      (unwind-protect
+          (progn
+            (anvil-ts-add-import
+             f (list :from "express" :type-only t
+                     :named (list "RequestHandler"))
+             :apply t)
+            (let ((body (anvil-ts-test--contents f)))
+              (should (string-match-p
+                       "import express.*from \"express\";" body))
+              (should (string-match-p
+                       "import type { RequestHandler } from \"express\";"
+                       body))))
+        (delete-file f)))))
+
+(ert-deftest anvil-ts-test-add-import-refuses-default-overwrite ()
+  "When an existing import already carries a different default,
+add-import errors rather than silently replace it."
+  (anvil-ts-test--requires 'typescript
+    (let ((f (anvil-ts-test--temp-copy anvil-ts-test--ts-fixture "ts")))
+      (unwind-protect
+          (should-error
+           (anvil-ts-add-import
+            f (list :from "express" :default "notExpress"))
+           :type 'user-error)
+        (delete-file f)))))
+
+(ert-deftest anvil-ts-test-remove-import-named-member ()
+  "Removing a single :named member keeps the remaining specifiers."
+  (anvil-ts-test--requires 'typescript
+    (let ((f (anvil-ts-test--temp-copy anvil-ts-test--ts-fixture "ts"))
+          (body nil))
+      (unwind-protect
+          (progn
+            (anvil-ts-add-import
+             f (list :from "node:fs/promises"
+                     :named (list "writeFile"))
+             :apply t)
+            (anvil-ts-remove-import
+             f (list :from "node:fs/promises"
+                     :named (list "writeFile"))
+             :apply t)
+            (setq body (anvil-ts-test--contents f))
+            (should (string-match-p "readFile" body))
+            (should-not (string-match-p "writeFile" body)))
+        (delete-file f)))))
+
+(ert-deftest anvil-ts-test-remove-import-drops-whole-statement ()
+  "Removing the last specifier deletes the statement and its newline."
+  (anvil-ts-test--requires 'typescript
+    (let ((f (anvil-ts-test--temp-copy anvil-ts-test--ts-fixture "ts"))
+          (body nil))
+      (unwind-protect
+          (progn
+            (anvil-ts-remove-import
+             f (list :from "express" :default "express"
+                     :named (list (list :name "Request" :alias nil
+                                        :type-only nil)
+                                  (list :name "Response" :alias nil
+                                        :type-only nil)))
+             :apply t)
+            (setq body (anvil-ts-test--contents f))
+            (should-not (string-match-p "from \"express\"" body)))
+        (delete-file f)))))
+
+(ert-deftest anvil-ts-test-remove-import-noop-when-absent ()
+  "Removing a module that is not imported returns a no-op plan."
+  (anvil-ts-test--requires 'typescript
+    (let ((f (anvil-ts-test--temp-copy anvil-ts-test--ts-fixture "ts")))
+      (unwind-protect
+          (let ((plan (anvil-ts-remove-import
+                       f (list :from "not-imported"
+                               :named (list "x")))))
+            (should (null (plist-get plan :ops))))
+        (delete-file f)))))
+
+(ert-deftest anvil-ts-test-rename-import-adds-alias ()
+  "Renaming a named specifier from its raw name gives it an alias."
+  (anvil-ts-test--requires 'typescript
+    (let ((f (anvil-ts-test--temp-copy anvil-ts-test--ts-fixture "ts")))
+      (unwind-protect
+          (progn
+            (anvil-ts-rename-import f "readFile" "rf" :apply t)
+            (should (string-match-p
+                     "import { readFile as rf }"
+                     (anvil-ts-test--contents f))))
+        (delete-file f)))))
+
+(ert-deftest anvil-ts-test-rename-import-existing-alias ()
+  "Renaming via an existing alias rewrites only the alias, not the
+raw name.  `path' is imported as `* as path' namespace; renaming
+`path' to `nodePath' rewrites the namespace binding."
+  (anvil-ts-test--requires 'typescript
+    (let ((f (anvil-ts-test--temp-copy anvil-ts-test--ts-fixture "ts")))
+      (unwind-protect
+          (progn
+            (anvil-ts-rename-import f "path" "nodePath" :apply t)
+            (should (string-match-p
+                     "import \\* as nodePath from \"node:path\""
+                     (anvil-ts-test--contents f))))
+        (delete-file f)))))
+
+(ert-deftest anvil-ts-test-rename-import-errors-on-unknown ()
+  "Renaming an OLD that no import binds is a user-error."
+  (anvil-ts-test--requires 'typescript
+    (let ((f (anvil-ts-test--temp-copy anvil-ts-test--ts-fixture "ts")))
+      (unwind-protect
+          (should-error (anvil-ts-rename-import f "nobody" "someone")
+                        :type 'user-error)
+        (delete-file f)))))
+
+(ert-deftest anvil-ts-test-replace-function-preserves-export-prefix ()
+  "replace-function on `export function foo' preserves `export' and
+reindents body lines to column 2 regardless of how many chars
+the prefix occupies."
+  (anvil-ts-test--requires 'typescript
+    (let ((f (anvil-ts-test--temp-copy anvil-ts-test--ts-fixture "ts")))
+      (unwind-protect
+          (progn
+            (anvil-ts-replace-function
+             f "plainFunc"
+             "function plainFunc(x: number): number {\n  return x + 42;\n}"
+             :apply t)
+            (let ((body (anvil-ts-test--contents f)))
+              (should (string-match-p
+                       "export function plainFunc(x: number): number"
+                       body))
+              (should (string-match-p "  return x \\+ 42;" body))))
+        (delete-file f)))))
+
+(ert-deftest anvil-ts-test-replace-function-method ()
+  "replace-function on a class method handles the method's indent."
+  (anvil-ts-test--requires 'typescript
+    (let ((f (anvil-ts-test--temp-copy anvil-ts-test--ts-fixture "ts")))
+      (unwind-protect
+          (progn
+            (anvil-ts-replace-function
+             f "write"
+             "write(rows: number[]): void {\n  console.log(rows.length);\n}"
+             :class "ReportWriter" :apply t)
+            (let ((body (anvil-ts-test--contents f)))
+              (should (string-match-p
+                       "  write(rows: number\\[\\]): void {" body))
+              (should (string-match-p
+                       "    console.log(rows.length);" body))))
+        (delete-file f)))))
+
+(ert-deftest anvil-ts-test-replace-function-idempotent ()
+  "Replacing with the same source twice is a no-op plan."
+  (anvil-ts-test--requires 'typescript
+    (let ((f (anvil-ts-test--temp-copy anvil-ts-test--ts-fixture "ts")))
+      (unwind-protect
+          (let* ((src "function plainFunc(a: number, b: number): number {\n  return a + b;\n}")
+                 (_ (anvil-ts-replace-function f "plainFunc" src :apply t))
+                 (plan (anvil-ts-replace-function f "plainFunc" src)))
+            (should (null (plist-get plan :ops))))
+        (delete-file f)))))
+
+(ert-deftest anvil-ts-test-replace-function-ambiguous-errors ()
+  "A method named identically in two classes errors without :class."
+  (anvil-ts-test--requires 'typescript
+    ;; Build a fresh file with two classes each having a `run' method.
+    (let ((f (make-temp-file "anvil-ts-ambig-" nil ".ts")))
+      (unwind-protect
+          (progn
+            (with-temp-file f
+              (insert "class A { run() { return 1; } }\n"
+                      "class B { run() { return 2; } }\n"))
+            (should-error
+             (anvil-ts-replace-function
+              f "run" "run(): number { return 3; }")
+             :type 'user-error))
+        (delete-file f)))))
+
+(ert-deftest anvil-ts-test-wrap-expr-hole-substitution ()
+  "wrap-expr replaces `|anvil-hole|' with the source at [START,END)."
+  (anvil-ts-test--requires 'typescript
+    (let ((f (anvil-ts-test--temp-copy anvil-ts-test--ts-fixture "ts")))
+      (unwind-protect
+          ;; The fixture has `x * 2' inside arrowHelper body.  Locate
+          ;; that literal in source and wrap it.
+          (let (beg end)
+            (with-temp-buffer
+              (insert-file-contents f)
+              (goto-char (point-min))
+              (re-search-forward "(x: number): number => \\(x \\* 2\\);")
+              (setq beg (match-beginning 1) end (match-end 1)))
+            (anvil-ts-wrap-expr f beg end "cached(|anvil-hole|)" :apply t)
+            (should (string-match-p "cached(x \\* 2)"
+                                    (anvil-ts-test--contents f))))
+        (delete-file f)))))
+
+(ert-deftest anvil-ts-test-wrap-expr-rejects-missing-placeholder ()
+  (anvil-ts-test--requires 'typescript
+    (let ((f (anvil-ts-test--temp-copy anvil-ts-test--ts-fixture "ts")))
+      (unwind-protect
+          (should-error (anvil-ts-wrap-expr f 100 105 "foo()")
+                        :type 'user-error)
+        (delete-file f)))))
+
+(ert-deftest anvil-ts-test-wrap-expr-rejects-misaligned-range ()
+  (anvil-ts-test--requires 'typescript
+    (let ((f (anvil-ts-test--temp-copy anvil-ts-test--ts-fixture "ts")))
+      (unwind-protect
+          ;; Pick a range that bisects an identifier, not a node boundary.
+          (should-error
+           (anvil-ts-wrap-expr f 100 103 "cached(|anvil-hole|)")
+           :type 'user-error)
+        (delete-file f)))))
+
+(ert-deftest anvil-ts-test-preview-default-does-not-touch-disk ()
+  "Without :apply, add-import returns a plan but does not write."
+  (anvil-ts-test--requires 'typescript
+    (let* ((f (anvil-ts-test--temp-copy anvil-ts-test--ts-fixture "ts"))
+           (before (anvil-ts-test--contents f)))
+      (unwind-protect
+          (progn
+            (anvil-ts-add-import
+             f (list :from "brand-new" :named (list "foo")))
+            (should (string= before (anvil-ts-test--contents f))))
+        (delete-file f)))))
+
 (provide 'anvil-ts-test)
 ;;; anvil-ts-test.el ends here

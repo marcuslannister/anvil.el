@@ -20,8 +20,13 @@ placeholder check, +12 tests).  Phase 1b ~SHIPPED~ 2026-04-22
 shared internal `anvil-ts--*-lang' helpers; ts/tsx grammar split
 by extension; JS side drops interfaces / type-aliases; +38
 tests across ts-sample / tsx-sample / js-sample / jsx-sample
-fixtures).  Phase 3 (cross-file rename), Phase 4 (extract/inline)
-still ~DRAFT~.
+fixtures).  Phase 2 ~SHIPPED~ 2026-04-22 (TS / JS structural
+edits: add-import / remove-import / rename-import / replace-
+function / wrap-expr; 10 new MCP tools — 5 ts-* + 5 js-*; merge-
+into-existing idempotency, type-only split, export/async prefix
+preservation, node-aligned wrap, alias rename with ambiguity
+error; +28 tests).  Phase 3 (cross-file rename), Phase 4
+(extract/inline) still ~DRAFT~.
 
 Sibling of Doc 12 (anvil-sexp, elisp).  Provides tree-sitter-backed
 structural editing for brace-and-keyword languages, with a shared
@@ -412,19 +417,38 @@ parameter so anvil-js.el routes ~'javascript~ through the same
 collectors; ts/tsx split is done at the public surface by file
 extension.
 
-** Phase 2 — structural edits
+** Phase 2 — structural edits (~SHIPPED~ 2026-04-22)
 
 - ~add-import~ with merge-into-existing logic (same-module named
-  imports collapse to one statement; type-only is preserved).
-- ~replace-function~ body using tree-sitter node bounds.
-- ~wrap-expr~ with ~|anvil-hole|~ placeholder substitution.
-- ~remove-import~ and ~rename-import~ (alias only; reference
-  renaming is Phase 3).
-- ERT +15: round-trip, idempotency (double-apply is a no-op),
-  string / comment exclusion.
-- *Ship criterion*: ~ts-add-import~ called twice with the same
-  spec is a no-op; ~ts-replace-function~ on a fixture round-trips;
-  ~tsc --noEmit~ still passes on the fixture after edit.
+  imports collapse to one statement; type-only split when an
+  existing non-type statement already exists on the same module).
+- ~replace-function~ body using tree-sitter node bounds; any
+  prefix on the def line (`export' / `async' / `static' / access
+  modifier) is preserved by replacing only the
+  function_declaration / method_definition node itself and
+  reindenting body lines to the def-line column.
+- ~wrap-expr~ with ~|anvil-hole|~ placeholder substitution and
+  exact tree-sitter node-range alignment.
+- ~remove-import~ (idempotent — missing = no-op; drops whole
+  statement when empty).
+- ~rename-import~ (alias / default / namespace; errors on
+  ambiguity or absence; reference renaming is Phase 3).
+- ERT +28: round-trip, idempotency (double-apply = no-op),
+  preview-vs-apply, type-only split, default-overwrite refusal,
+  export prefix preservation, method indent, misaligned range
+  rejection, missing placeholder rejection.
+- *Ship criterion verified*: ~ts-add-import~ called twice with
+  the same spec is a no-op; ~ts-replace-function~ on the fixture
+  round-trips without losing the `export' prefix; `make test-all'
+  green at 1187/1192 pass.
+
+Shipped surface — 10 new MCP tools: 5 ts-* (ts-add-import /
+ts-remove-import / ts-rename-import / ts-replace-function /
+ts-wrap-expr) plus 5 js-* (same set).  Internal helpers
+`anvil-ts--plan-*-lang' take LANG as a parameter so anvil-js
+passes ~'javascript~ through the same planners.  JS drops the
+~:type-only~ flag silently — JavaScript has no type-only
+imports.
 
 ** Phase 3 — cross-file rename
 

@@ -86,6 +86,67 @@ KIND optionally filters to `function' / `arrow' / `class'."
   (anvil-js--lang-for-file file)
   (anvil-ts--surrounding-form-lang file anvil-js--lang point kind nil))
 
+;;;; --- public edit API (Phase 2) ------------------------------------------
+
+(cl-defun anvil-js-add-import (file spec &key apply)
+  "Add the import specified by SPEC to FILE.
+Mirrors `anvil-ts-add-import' minus :type-only (JavaScript has no
+type-only imports — the flag is silently ignored).  Returns the
+edit plan unless APPLY is truthy."
+  (anvil-js--lang-for-file file)
+  (let ((plan (anvil-ts--plan-add-import
+               anvil-js--lang file
+               (let ((copy (copy-sequence spec)))
+                 (plist-put copy :type-only nil)))))
+    (if (anvil-treesit-truthy apply)
+        (anvil-treesit-apply-plan plan)
+      plan)))
+
+(cl-defun anvil-js-remove-import (file spec &key apply)
+  "Remove the import specified by SPEC from FILE.
+Mirrors `anvil-ts-remove-import'.  Returns the plan unless APPLY
+is truthy."
+  (anvil-js--lang-for-file file)
+  (let ((plan (anvil-ts--plan-remove-import
+               anvil-js--lang file spec)))
+    (if (anvil-treesit-truthy apply)
+        (anvil-treesit-apply-plan plan)
+      plan)))
+
+(cl-defun anvil-js-rename-import (file old new &key apply)
+  "Rename the binding OLD to NEW across imports in FILE.
+Mirrors `anvil-ts-rename-import'.  Returns the plan unless APPLY
+is truthy."
+  (anvil-js--lang-for-file file)
+  (let ((plan (anvil-ts--plan-rename-import
+               anvil-js--lang file old new)))
+    (if (anvil-treesit-truthy apply)
+        (anvil-treesit-apply-plan plan)
+      plan)))
+
+(cl-defun anvil-js-replace-function (file name new-source &key class apply)
+  "Replace the def named NAME in FILE with NEW-SOURCE.
+Mirrors `anvil-ts-replace-function'.  Returns the plan unless
+APPLY is truthy."
+  (anvil-js--lang-for-file file)
+  (let ((plan (anvil-ts--plan-replace-function
+               anvil-js--lang file name new-source
+               (and class (if (symbolp class) (symbol-name class) class)))))
+    (if (anvil-treesit-truthy apply)
+        (anvil-treesit-apply-plan plan)
+      plan)))
+
+(cl-defun anvil-js-wrap-expr (file start end wrapper &key apply)
+  "Wrap the expression [START, END) of FILE with WRAPPER.
+Mirrors `anvil-ts-wrap-expr'.  Returns the plan unless APPLY is
+truthy."
+  (anvil-js--lang-for-file file)
+  (let ((plan (anvil-ts--plan-wrap-expr
+               anvil-js--lang file start end wrapper)))
+    (if (anvil-treesit-truthy apply)
+        (anvil-treesit-apply-plan plan)
+      plan)))
+
 ;;;; --- MCP handlers -------------------------------------------------------
 
 (defun anvil-js--tool-list-imports (file)
@@ -160,6 +221,67 @@ MCP Parameters:
      (or (anvil-js-surrounding-form file p :kind k)
          (list :found nil :point p)))))
 
+(defun anvil-js--tool-add-import (file spec apply)
+  "MCP wrapper — add an import.
+
+MCP Parameters:
+  file  - absolute path to the .js/.jsx/.mjs/.cjs file to edit
+  spec  - plist (:from MODULE :default NAME :named LIST)
+  apply - truthy to write; default returns a preview plan"
+  (anvil-server-with-error-handling
+   (anvil-js-add-import file (anvil-ts--coerce-spec spec) :apply apply)))
+
+(defun anvil-js--tool-remove-import (file spec apply)
+  "MCP wrapper — remove an import.
+
+MCP Parameters:
+  file  - absolute path to the .js/.jsx/.mjs/.cjs file to edit
+  spec  - plist (:from MODULE :default NAME :named LIST)
+  apply - truthy to write; default returns a preview plan"
+  (anvil-server-with-error-handling
+   (anvil-js-remove-import file (anvil-ts--coerce-spec spec) :apply apply)))
+
+(defun anvil-js--tool-rename-import (file old new apply)
+  "MCP wrapper — rename an imported binding alias.
+
+MCP Parameters:
+  file  - absolute path to the .js/.jsx/.mjs/.cjs file to edit
+  old   - current binding name
+  new   - new binding name
+  apply - truthy to write; default returns a preview plan"
+  (anvil-server-with-error-handling
+   (anvil-js-rename-import file old new :apply apply)))
+
+(defun anvil-js--tool-replace-function (file name new-source class apply)
+  "MCP wrapper — replace a JS / JSX function or method body.
+
+MCP Parameters:
+  file       - absolute path to the .js/.jsx/.mjs/.cjs file to edit
+  name       - identifier of the function / method to replace
+  new-source - full replacement source
+  class      - optional enclosing class name; empty / nil means any
+  apply      - truthy to write; default returns a preview plan"
+  (anvil-server-with-error-handling
+   (let ((cls (cond ((null class) nil)
+                    ((and (stringp class) (string-empty-p class)) nil)
+                    (t class))))
+     (anvil-js-replace-function file name new-source
+                                :class cls :apply apply))))
+
+(defun anvil-js--tool-wrap-expr (file start end wrapper apply)
+  "MCP wrapper — wrap a JS / JSX expression.
+
+MCP Parameters:
+  file    - absolute path to the .js/.jsx/.mjs/.cjs file to edit
+  start   - 1-based buffer point at the start of the expression
+  end     - 1-based buffer point at the end of the expression
+  wrapper - source template containing `|anvil-hole|' exactly once
+  apply   - truthy to write; default returns a preview plan"
+  (anvil-server-with-error-handling
+   (let ((s (if (stringp start) (string-to-number start) start))
+         (e (if (stringp end) (string-to-number end) end)))
+     (anvil-js-wrap-expr file s e wrapper :apply apply))))
+
 ;;;; --- module lifecycle ---------------------------------------------------
 
 (defconst anvil-js--tool-ids
@@ -169,11 +291,16 @@ MCP Parameters:
     "js-list-classes"
     "js-list-methods"
     "js-find-definition"
-    "js-surrounding-form")
+    "js-surrounding-form"
+    "js-add-import"
+    "js-remove-import"
+    "js-rename-import"
+    "js-replace-function"
+    "js-wrap-expr")
   "Stable list of MCP tool ids registered by `anvil-js-enable'.")
 
 (defun anvil-js--register-tools ()
-  "Register the Phase 1b js-* MCP tools on `anvil-js--server-id'."
+  "Register the Phase 1b + 2 js-* MCP tools on `anvil-js--server-id'."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-js--tool-list-imports)
    :id "js-list-imports"
@@ -250,15 +377,75 @@ JS / JSX file.  Source-order wins when the name is shared; use
    :description "Return the innermost function or class whose source
 range contains the 1-based buffer POINT.  KIND restricts the match
 \(`function' / `arrow' / `class'); empty / nil matches any."
-   :read-only t))
+   :read-only t)
+
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-js--tool-add-import)
+   :id "js-add-import"
+   :intent '(js-edit structure)
+   :layer 'core
+   :server-id anvil-js--server-id
+   :description "Add an import to a JS / JSX file.  SPEC is a plist:
+(:from MODULE :default NAME :named LIST).  :named entries may be
+plain NAME strings, (NAME . ALIAS) cons cells, or (:name :alias)
+plists.  Idempotent — merges into an existing `import ... from
+MODULE'.  Preview-default; pass :apply t to write.")
+
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-js--tool-remove-import)
+   :id "js-remove-import"
+   :intent '(js-edit structure)
+   :layer 'core
+   :server-id anvil-js--server-id
+   :description "Remove an import from a JS / JSX file.  SPEC shape
+matches `js-add-import'.  :named entries are removed from the
+existing statement; :default drops the default specifier.  When
+nothing remains the statement is deleted.  Idempotent.  Preview-
+default.")
+
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-js--tool-rename-import)
+   :id "js-rename-import"
+   :intent '(js-edit structure)
+   :layer 'core
+   :server-id anvil-js--server-id
+   :description "Rename the binding OLD to NEW across JS / JSX
+imports.  Walks every `import_statement' and rewrites the unique
+specifier (default / named / named-alias / namespace) whose
+visible binding is OLD.  Errors on ambiguity or absence.
+Reference use sites are not touched.  Preview-default.")
+
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-js--tool-replace-function)
+   :id "js-replace-function"
+   :intent '(js-edit structure)
+   :layer 'core
+   :server-id anvil-js--server-id
+   :description "Replace a JS / JSX function or method body with
+NEW-SOURCE.  NEW-SOURCE is the full def at column 0; dedented +
+reindented to the existing def's column.  CLASS disambiguates
+methods of the same name.  Double-apply with identical NEW-SOURCE
+is a no-op.  Preview-default.")
+
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-js--tool-wrap-expr)
+   :id "js-wrap-expr"
+   :intent '(js-edit structure)
+   :layer 'core
+   :server-id anvil-js--server-id
+   :description "Wrap the expression at [START, END) with WRAPPER.
+WRAPPER is a source template containing `|anvil-hole|' exactly
+once.  The range must align to an exact tree-sitter node boundary,
+or the tool errors rather than produce invalid source.  Preview-
+default."))
 
 (defun anvil-js-enable ()
-  "Enable the Phase 1b js-* MCP tools."
+  "Enable the Phase 1b + 2 js-* MCP tools."
   (interactive)
   (anvil-js--register-tools))
 
 (defun anvil-js-disable ()
-  "Unregister the Phase 1b js-* MCP tools."
+  "Unregister the Phase 1b + 2 js-* MCP tools."
   (interactive)
   (dolist (id anvil-js--tool-ids)
     (anvil-server-unregister-tool id anvil-js--server-id)))
