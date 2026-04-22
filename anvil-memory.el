@@ -100,7 +100,7 @@ indexed in a single DB.  Explicit list overrides auto-detection."
   '(scan audit access list
          search save-check duplicates audit-urls
          decay promote regenerate reindex-fts llm-verdict
-         mdl-distill)
+         mdl-distill export-html)
   "Capability tags this module currently provides.
 Tests in tests/anvil-memory-test.el gate their `skip-unless' on
 membership here so a half-shipped feature never breaks CI.")
@@ -1069,6 +1069,190 @@ human) decides whether to accept the draft."
                            (or err-msg "no error message")))))))
 
 
+;;;; --- Phase 3a: HTML export (static viewer) -----------------------------
+
+(defconst anvil-memory--html-escape-map
+  '(("&" . "&amp;")
+    ("<" . "&lt;")
+    (">" . "&gt;")
+    ("\"" . "&quot;")
+    ("'" . "&#39;"))
+  "Literal → entity substitutions for `anvil-memory--html-escape'.
+Applied in order; `&' must come first so later ampersands coming
+from prior replacements (there aren't any here, but the ordering
+rule is still the defensible default).")
+
+(defun anvil-memory--html-escape (s)
+  "Return S with the 5 core HTML entities escaped.
+Returns \"\" on nil input so callers can feed it `plist-get'
+results without a guard."
+  (let ((out (or s "")))
+    (dolist (pair anvil-memory--html-escape-map)
+      (setq out (replace-regexp-in-string
+                 (regexp-quote (car pair)) (cdr pair) out t t)))
+    out))
+
+(defconst anvil-memory--html-css
+  "body{font-family:system-ui,-apple-system,sans-serif;\
+max-width:1100px;margin:2rem auto;padding:0 1rem;color:#222}
+h1{margin-bottom:.2rem}
+h2{margin-top:2rem;text-transform:capitalize;\
+border-bottom:1px solid #ddd;padding-bottom:.2rem}
+.summary{color:#666;font-size:.9rem;margin-bottom:1rem}
+table{width:100%;border-collapse:collapse;margin-top:.5rem}
+th,td{text-align:left;padding:.3rem .5rem;border-bottom:1px solid #eee;\
+vertical-align:top}
+th{font-weight:600;background:#fafafa;font-size:.9rem}
+.bar{display:inline-block;height:.6em;border-radius:3px;\
+background:#ccc;vertical-align:middle}
+.bar.hot{background:#3c5}
+.bar.warm{background:#dd3}
+.bar.cold{background:#d73}
+.name{font-weight:600}
+.desc{color:#444}
+.muted{color:#888;font-size:.85rem}
+.file{font-family:ui-monospace,monospace;font-size:.8rem;color:#555}
+tr.empty td{color:#888;font-style:italic;text-align:center}
+"
+  "Self-contained CSS embedded in `anvil-memory-export-html' output.
+Kept minimal + offline-openable — no external fonts / CDNs.")
+
+(defconst anvil-memory--html-type-order
+  '(user feedback project reference memo)
+  "Stable render order for memory type sections.
+User / feedback first (long-lived rules), then project (scoped),
+reference (TTL'd links), memo (misc catch-all).")
+
+(defun anvil-memory--group-by-type (rows)
+  "Return alist ((TYPE . ROWS) ...) grouped from decay-sorted ROWS.
+Key order matches `anvil-memory--html-type-order'; input row
+order within each type is preserved (so the caller's decay-desc
+sort survives the split)."
+  (let (buckets)
+    (dolist (row rows)
+      (let* ((type (plist-get row :type))
+             (cell (assq type buckets)))
+        (if cell
+            (setcdr cell (append (cdr cell) (list row)))
+          (push (cons type (list row)) buckets))))
+    (let (ordered)
+      (dolist (type anvil-memory--html-type-order)
+        (let ((cell (assq type buckets)))
+          (when cell
+            (push cell ordered)
+            (setq buckets (delq cell buckets)))))
+      (append (nreverse ordered) buckets))))
+
+(defun anvil-memory--decay-bar-class (decay)
+  "Map DECAY (0.0-1.0) onto a bar CSS class."
+  (cond
+   ((>= decay 0.66) "bar hot")
+   ((>= decay 0.33) "bar warm")
+   (t               "bar cold")))
+
+(defun anvil-memory--render-row (row)
+  "Return one <tr> string for ROW (a memory-list plist)."
+  (let* ((path (plist-get row :file))
+         (base (file-name-nondirectory path))
+         (body (or (anvil-memory--get-body path) ""))
+         (fm (anvil-memory--parse-frontmatter body))
+         (name (or (and fm (plist-get fm :name))
+                   (anvil-memory--fallback-display-name path)))
+         (desc (or (and fm (plist-get fm :description)) ""))
+         (decay (or (plist-get row :decay-score) 0.0))
+         (count (or (plist-get row :access-count) 0))
+         (last (plist-get row :last-accessed))
+         (last-str (if last
+                       (format-time-string "%Y-%m-%d" last)
+                     "—")))
+    (format "    <tr data-decay=\"%.3f\">\
+<td><div class=\"name\">%s</div>\
+<div class=\"desc\">%s</div>\
+<div class=\"file\">%s</div></td>\
+<td><span class=\"%s\" style=\"width:%.0fpx\"></span> \
+<span class=\"muted\">%.2f</span></td>\
+<td class=\"muted\">%d</td><td class=\"muted\">%s</td></tr>\n"
+            decay
+            (anvil-memory--html-escape name)
+            (anvil-memory--html-escape desc)
+            (anvil-memory--html-escape base)
+            (anvil-memory--decay-bar-class decay)
+            (* 80 decay)
+            decay
+            count
+            last-str)))
+
+(defun anvil-memory--render-section (type rows)
+  "Return a <section> string for TYPE with already-sorted ROWS."
+  (let ((heading (anvil-memory--html-escape (symbol-name type))))
+    (concat
+     (format "<section data-type=\"%s\">\n" heading)
+     (format "  <h2>%s <span class=\"muted\">(%d)</span></h2>\n"
+             heading (length rows))
+     "  <table>\n"
+     "    <thead><tr><th>memory</th><th>decay</th>\
+<th>access</th><th>last</th></tr></thead>\n"
+     "    <tbody>\n"
+     (mapconcat #'anvil-memory--render-row rows "")
+     "    </tbody>\n"
+     "  </table>\n"
+     "</section>\n")))
+
+(defun anvil-memory--render-page (abs-root groups title)
+  "Return the full HTML document for ABS-ROOT + GROUPS (:by-type alist)."
+  (let* ((total (apply #'+ (mapcar (lambda (g) (length (cdr g))) groups)))
+         (hdr (or title (format "anvil memory — %s"
+                                (abbreviate-file-name abs-root)))))
+    (concat
+     "<!DOCTYPE html>\n<html lang=\"en\"><head>\n"
+     "  <meta charset=\"utf-8\">\n"
+     "  <meta name=\"generator\" content=\"anvil-memory / Doc 29 Phase 3a\">\n"
+     "  <title>" (anvil-memory--html-escape hdr) "</title>\n"
+     "  <style>\n" anvil-memory--html-css "  </style>\n"
+     "</head><body>\n"
+     "<h1>anvil memory</h1>\n"
+     (format "<div class=\"summary\">%s · %d memor%s</div>\n"
+             (anvil-memory--html-escape (abbreviate-file-name abs-root))
+             total
+             (if (= total 1) "y" "ies"))
+     (if (zerop total)
+         "<p class=\"muted\">No indexed memories under this root.</p>\n"
+       (mapconcat (lambda (group)
+                    (anvil-memory--render-section (car group) (cdr group)))
+                  groups ""))
+     "</body></html>\n")))
+
+;;;###autoload
+(cl-defun anvil-memory-export-html (root &key out-path title)
+  "Return a self-contained HTML snapshot of memories under ROOT.
+Only rows whose `:file' lives under ROOT are included.  Within
+each type section, rows are decay-score descending so the most
+load-bearing entries surface at the top of the page.
+
+:out-path NON-NIL writes the HTML to that file (UTF-8) in addition
+to returning the string.  :title overrides the default <title>.
+
+Render surface: name / description (YAML frontmatter), filename,
+decay-score (numeric + colour bar), access-count, last-accessed
+date.  Memory bodies are NOT embedded so a stray .html file never
+leaks session text."
+  (unless (and root (stringp root))
+    (user-error "anvil-memory-export-html: ROOT must be a string"))
+  (let* ((abs (file-name-as-directory (expand-file-name root)))
+         (rows (anvil-memory-list nil :with-decay t :sort 'decay))
+         (scoped (cl-remove-if-not
+                  (lambda (r) (string-prefix-p abs (plist-get r :file)))
+                  rows))
+         (groups (anvil-memory--group-by-type scoped))
+         (html (anvil-memory--render-page abs groups title)))
+    (when out-path
+      (make-directory (file-name-directory out-path) t)
+      (let ((coding-system-for-write 'utf-8))
+        (with-temp-file out-path
+          (insert html))))
+    html))
+
+
 ;;;; --- MCP tool handlers --------------------------------------------------
 
 (defun anvil-memory--coerce-type (v)
@@ -1337,6 +1521,29 @@ memory-pruner skill / a human reviewer) decide adoption."
                      (t model))))
      (anvil-memory-mdl-distill paths :provider prov :model mdl))))
 
+(defun anvil-memory--tool-export-html (root &optional out_path title)
+  "Render a self-contained HTML snapshot of memories under ROOT.
+
+MCP Parameters:
+  root     - Directory whose indexed memory files should be listed.
+             Only rows whose `:file' lives under ROOT are included.
+  out_path - Optional absolute path.  When set, the HTML is also
+             written there; the parent dir is created if missing.
+  title    - Optional <title> override.  Empty / omitted keeps the
+             default `anvil memory — <root>' heading.
+
+Returns (:html STR :written PATH-OR-NIL).  Offline-openable —
+no external CSS / JS references."
+  (anvil-server-with-error-handling
+   (let* ((out (cond ((null out_path) nil)
+                     ((and (stringp out_path) (string-empty-p out_path)) nil)
+                     (t out_path)))
+          (ttl (cond ((null title) nil)
+                     ((and (stringp title) (string-empty-p title)) nil)
+                     (t title)))
+          (html (anvil-memory-export-html root :out-path out :title ttl)))
+     (list :html html :written out))))
+
 
 ;;;; --- module lifecycle ---------------------------------------------------
 
@@ -1448,6 +1655,21 @@ disk, so the memory-pruner skill / a human decides whether to
 accept it.  Pass files as a colon-separated absolute-path list;
 every entry must already be in the metadata index (run
 `memory-scan' first).  Returns :draft / :sources / :error."
+     :read-only t)
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-export-html)
+     :id "memory-export-html"
+     :description
+     "Render a self-contained HTML snapshot of memories under ROOT.
+Phase 3a: static viewer — no TCP server, no external resources, so
+the output file opens offline via file://.  Rows are grouped by
+type (user / feedback / project / reference / memo) and sorted by
+decay-score descending within each section.  Only metadata
+(frontmatter name / description, filename, decay, access-count,
+last-accessed) is emitted; memory bodies stay on disk so a stray
+.html file never leaks session text.  Pass `out_path' to also
+persist the page alongside the returned HTML string.  Returns
+:html + :written."
      :read-only t))
   "Spec list consumed by `anvil-server-register-tools'.")
 
