@@ -46,14 +46,14 @@
 (defconst anvil-sexp-cst-supported-types
   '(integer nil symbol string list alist plist hash-table vector cons
             record char-table truncation circular drill byte-cap
-            eieio purge cst-read)
+            eieio purge cst-read cst-edit)
   "Type tags + behaviors that `anvil-inspect-object' handles today.
 Phase 1a/1b/2 chunks extend this list; tests in
 tests/anvil-sexp-cst-test.el gate their `skip-unless' on membership
 here so a half-shipped chunk never breaks CI.  The pseudo-tags
 `truncation', `circular', `drill', `byte-cap', `eieio', `purge',
-and `cst-read' describe emitted *behaviors* rather than Emacs
-runtime types — they live on the same list so each test can
+`cst-read', `cst-edit' describe emitted *behaviors* rather than
+Emacs runtime types — they live on the same list so each test can
 self-describe its capability gate.")
 
 (defconst anvil-sexp-cst--real-type-tags
@@ -845,6 +845,139 @@ MCP Parameters:
            (json-serialize plist :false-object :false :null-object :null))))))))
 
 
+;;;; --- sexp-cst-edit (Phase 2b-a, dry-run) -------------------------------
+
+(defun anvil-sexp-cst--reparse-and-locate (content start-0based)
+  "Re-parse CONTENT with tree-sitter-elisp and describe the named
+node at START-0BASED.  Returns either `(ok . PLIST)' with the
+node info or `(error . MESSAGE)' when the re-parsed tree contains
+any ERROR node.  Called from the Phase 2b-a edit dry-run path to
+verify a proposed replacement keeps the whole file structurally
+valid."
+  (with-temp-buffer
+    (insert content)
+    (let* ((parser (treesit-parser-create 'elisp))
+           (root (treesit-parser-root-node parser)))
+      (cond
+       ((treesit-node-check root 'has-error)
+        (cons 'error
+              "Re-parsed file contains tree-sitter ERROR nodes; replacement rejected."))
+       (t
+        (let* ((new-pos (1+ start-0based))
+               (node (anvil-sexp-cst--pick-node parser root new-pos)))
+          (cons 'ok
+                (list :type (treesit-node-type node)
+                      :start (treesit-node-start node)
+                      :end (treesit-node-end node)
+                      :text (treesit-node-text node t)))))))))
+
+(defun anvil-sexp-cst--edit-dry-run (file pos new-text)
+  "Internal: open FILE, splice NEW-TEXT over the node at POS, verify.
+Returns a JSON string — either the shape-locked edit-result
+envelope or a typed error (see `anvil-sexp-cst-edit')."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (let* ((parser (treesit-parser-create 'elisp))
+           (root (treesit-parser-root-node parser))
+           (node (anvil-sexp-cst--pick-node parser root pos))
+           (before-text (buffer-string))
+           (before-bytes (string-bytes before-text)))
+      (cond
+       ((or (null node) (eq node root))
+        (anvil-sexp-cst--encode-error
+         'error "sexp-cst/no-node-at-position"
+         (format "No named node at position %d" pos)))
+       (t
+        (let* ((old-start (treesit-node-start node))
+               (old-end (treesit-node-end node))
+               (old-text (treesit-node-text node t))
+               (new-content
+                (concat (substring before-text 0 (1- old-start))
+                        new-text
+                        (substring before-text (1- old-end))))
+               (reparse (anvil-sexp-cst--reparse-and-locate
+                         new-content (1- old-start))))
+          (if (eq (car reparse) 'error)
+              (anvil-sexp-cst--encode-error
+               'error "sexp-cst/parse-error-in-replacement"
+               (cdr reparse))
+            (let* ((after-plist (cdr reparse))
+                   (before-plist (list :type (treesit-node-type node)
+                                       :start old-start
+                                       :end old-end
+                                       :text old-text))
+                   (after-bytes (string-bytes new-content))
+                   (result (list :type "edit-result"
+                                 :before before-plist
+                                 :after after-plist
+                                 :file-before-bytes before-bytes
+                                 :file-after-bytes after-bytes
+                                 :new-content new-content)))
+              (json-serialize result
+                              :false-object :false
+                              :null-object :null)))))))))
+
+;;;###autoload
+(defun anvil-sexp-cst-edit (file position new-text)
+  "Replace the named node at POSITION in FILE with NEW-TEXT (dry-run).
+
+Does NOT modify FILE on disk — the caller reads `new-content' from
+the returned JSON and applies it via `file-replace-string' or an
+equivalent tool.  The point of 2b-a's dry-run is to keep edit
+tooling MCP-safe: a tool call never rewrites a file the caller
+did not intend to commit.
+
+Validates the proposed result by re-parsing the full patched
+content through tree-sitter-elisp.  Any ERROR node in the reparse
+(unbalanced parens, stray quotes, …) rejects the edit with
+`sexp-cst/parse-error-in-replacement' so LLMs that emit half-
+written forms cannot silently corrupt the source.
+
+Output shape:
+  {type:\"edit-result\",
+   before:{type, start, end, text},
+   after: {type, start, end, text},
+   file-before-bytes, file-after-bytes, new-content}
+
+Typed errors:
+  sexp-cst/missing-file             — FILE nil / empty
+  sexp-cst/file-not-found           — path absent
+  sexp-cst/grammar-unavailable      — treesit-elisp not loadable
+  sexp-cst/position-required        — POSITION missing / non-positive
+  sexp-cst/missing-new-text         — NEW-TEXT missing
+  sexp-cst/no-node-at-position      — nothing named encloses POSITION
+  sexp-cst/parse-error-in-replacement — re-parse failed
+
+MCP Parameters:
+  FILE      Required elisp source path
+  POSITION  Required 1-based point offset
+  NEW-TEXT  Required replacement text"
+  (anvil-server-with-error-handling
+   (let ((pos (anvil-sexp-cst--coerce-int position nil)))
+     (cond
+      ((not (and file (stringp file) (not (string-empty-p file))))
+       (anvil-sexp-cst--encode-error
+        'error "sexp-cst/missing-file" "FILE argument is required."))
+      ((not (file-exists-p file))
+       (anvil-sexp-cst--encode-error
+        'error "sexp-cst/file-not-found"
+        (format "No such file: %s" file)))
+      ((not (anvil-sexp-cst--grammar-usable-p))
+       (anvil-sexp-cst--encode-error
+        'error "sexp-cst/grammar-unavailable"
+        "tree-sitter-elisp grammar is not loadable in this Emacs session."))
+      ((or (null pos) (not (integerp pos)) (< pos 1))
+       (anvil-sexp-cst--encode-error
+        'error "sexp-cst/position-required"
+        "POSITION must be a positive 1-based point offset."))
+      ((not (and new-text (stringp new-text)))
+       (anvil-sexp-cst--encode-error
+        'error "sexp-cst/missing-new-text"
+        "NEW-TEXT argument is required."))
+      (t
+       (anvil-sexp-cst--edit-dry-run file pos new-text))))))
+
+
 ;;;; --- module lifecycle --------------------------------------------------
 
 (defun anvil-sexp-cst--abi-ready-p ()
@@ -915,6 +1048,20 @@ point offset; omit for the whole file.  MAX-DEPTH caps recursion (deeper
 children are replaced with text + truncated=t).  Typed errors:
 sexp-cst/missing-file, sexp-cst/file-not-found, sexp-cst/grammar-unavailable.
 Read-only."
+   :read-only t)
+  (anvil-server-register-tool
+   #'anvil-sexp-cst-edit
+   :id "sexp-cst-edit"
+   :server-id anvil-sexp-cst--server-id
+   :description
+   "Replace the named node at POSITION in FILE with NEW-TEXT (dry-run).
+Does NOT modify FILE — returns the proposed new content in `new-content'
+for the caller to apply via `file-replace-string'.  Validates that the
+re-parsed full file contains no ERROR nodes.  Output shape:
+{before, after, file-before-bytes, file-after-bytes, new-content}.
+Typed errors cover missing input, missing files, grammar unavailability,
+no-node-at-position, and parse-error-in-replacement.  Read-only (does
+not touch disk)."
    :read-only t))
 
 (defun anvil-sexp-cst--unregister-tools ()
@@ -922,7 +1069,8 @@ Read-only."
   (dolist (id '("sexp-cst-inspect-object"
                 "sexp-cst-inspect-object-drill"
                 "sexp-cst-inspect-object-purge"
-                "sexp-cst-read"))
+                "sexp-cst-read"
+                "sexp-cst-edit"))
     (anvil-server-unregister-tool id anvil-sexp-cst--server-id)))
 
 ;;;###autoload
