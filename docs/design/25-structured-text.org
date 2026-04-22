@@ -8,7 +8,20 @@
   :PROPERTIES:
   :ID:       019daf00-0000-7000-0000-structured-text
   :END:
-~DRAFT~ (2026-04-20)
+~DRAFT~ (2026-04-20) → ~DEFERRED~ (2026-04-22) — Index / concept
+doc.  Self-described above as "not itself an implementation
+roadmap"; all real implementation lives in per-format sibling docs.
+Doc 25 fulfils its role by documenting the common pattern and the
+sequencing rule; it does not itself ship code.
+
+Sibling-doc numbering note: at the time of writing this doc reserved
+"Doc 26 / 27 / 28 / 29 / 30" for HTML / CSS / YAML+TOML+JSON /
+Markdown / SQL.  Those slots have since been taken by other specs
+(Doc 26 manifest-profile, Doc 27 shell-filter, Doc 28
+progressive-disclosure, Doc 29 memory-engine, Doc 30 acp-bridge),
+so any sibling that ships uses the next free number (Doc 33+).
+The structured-text /family/ contract in this doc still applies —
+only the doc numbers move.
 
 Index / concept doc for the non-code structured text editor family.
 These formats have rich structure, but the anvil-sexp / anvil-treesit
@@ -17,10 +30,8 @@ They need their own MCP surfaces — path-based, selector-based, or
 heading-based depending on the format.
 
 /This doc is not itself an implementation roadmap./  It sketches the
-common pattern and carves up the family into per-format sibling docs
-(Doc 26 HTML, Doc 27 CSS, Doc 28 YAML / TOML / JSON, Doc 29
-Markdown, Doc 30 SQL).  Each sibling is written and ships only when
-real user demand surfaces.
+common pattern and carves up the family into per-format sibling docs.
+Each sibling is written and ships only when real user demand surfaces.
 
 * Why a separate family
 

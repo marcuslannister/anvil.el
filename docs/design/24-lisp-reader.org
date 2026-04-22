@@ -8,7 +8,24 @@
   :PROPERTIES:
   :ID:       019daf00-0000-7000-0000-lisp-reader-000
   :END:
-~DRAFT~ (2026-04-20)
+~DRAFT~ (2026-04-20) → ~DEFERRED~ (2026-04-22) — Phase 1 only
+covers the shared core + CL locators yet still needs SBCL +
+~anvil-offload~-style subprocess pool + JSON bridge + per-dialect
+fixture suite (~15 ERT).  Multi-day scope, system-installed
+interpreter dependencies (SBCL / Guile / babashka), and no concrete
+demand from the maintainer's own workflow (electrical-engineering
++ org-mode + Elisp + Python — no CL / Scheme / Clojure surface).
+Revisit when one of the following triggers fires:
+
+1. r/emacs / HN feedback after anvil's Tier-1 OSS push surfaces
+   non-elisp Lisp users wanting structural locate / edit.
+2. The maintainer's own workflow grows a CL component (e.g.
+   electrical-engineering simulation in CL via cl-cmu).
+3. Doc 12 (anvil-sexp) sees enough adoption that the gap to
+   "all reader-native Lisps" becomes a recurring feature request.
+
+Until then this doc stays as the recorded design so the day-1
+implementation cost is the README dust-off, not a re-architecture.
 
 Extends the Doc 12 anvil-sexp pattern to Common Lisp, Scheme, and
 Clojure.  These are all reader-native languages; the host
