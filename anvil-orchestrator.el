@@ -2414,7 +2414,10 @@ Errors when no judge has been submitted for the consensus."
 (defun anvil-orchestrator--to-json-value (x)
   "Recursively convert X into a value that `json-encode' renders sensibly.
 Plists become alists with symbol keys (leading colon stripped).
-Plain lists of scalars become vectors so they emit as JSON arrays."
+Plain lists of scalars become vectors so they emit as JSON arrays.
+Dotted pairs (e.g. alist entries like `(\"key\" . VAL)') become
+2-element vectors so they survive `json-encode' without the
+improper-list `mapcar' crashing on `1.0'-style cdrs."
   (cond
    ((or (null x) (eq x t) (numberp x)) x)
    ((stringp x) x)
@@ -2426,6 +2429,11 @@ Plain lists of scalars become vectors so they emit as JSON arrays."
     (cl-loop for (k v) on x by #'cddr
              collect (cons (intern (substring (symbol-name k) 1))
                            (anvil-orchestrator--to-json-value v))))
+   ((and (consp x) (not (proper-list-p x)))
+    ;; Dotted pair — emit as [car, cdr] array.  Recurse into both
+    ;; halves so alist values like 1.0 or nested plists still encode.
+    (vector (anvil-orchestrator--to-json-value (car x))
+            (anvil-orchestrator--to-json-value (cdr x))))
    ((listp x)
     (apply #'vector (mapcar #'anvil-orchestrator--to-json-value x)))
    (t x)))
