@@ -64,7 +64,8 @@ Phase B) filter by the `:intent' / `:layer' / `:stability' metadata
 attached at registration time."
   :type '(choice (const full) (const core) (const nav)
                  (const ultra) (const lean)
-                 (const agent) (const edit))
+                 (const agent) (const edit)
+                 (const headless))
   :group 'anvil-manifest)
 
 (defcustom anvil-manifest-server-profiles
@@ -72,7 +73,8 @@ attached at registration time."
     ("emacs-eval-nav"   . nav)
     ("emacs-eval-core"  . core)
     ("emacs-eval-agent" . agent)
-    ("emacs-eval-edit"  . edit))
+    ("emacs-eval-edit"  . edit)
+    ("emacs-eval-headless" . headless))
   "Alist of (SERVER-ID . PROFILE) overriding `anvil-manifest-profile'.
 Lets one MCP daemon advertise different tool subsets to different
 clients when each client connects under a distinct (virtual) server-id.
@@ -93,7 +95,8 @@ the unfiltered default for that connection."
     ("emacs-eval-nav"   . "emacs-eval")
     ("emacs-eval-core"  . "emacs-eval")
     ("emacs-eval-agent" . "emacs-eval")
-    ("emacs-eval-edit"  . "emacs-eval"))
+    ("emacs-eval-edit"  . "emacs-eval")
+    ("emacs-eval-headless" . "emacs-eval"))
   "Default `anvil-server-id-aliases' entries installed by
 `anvil-manifest-enable'.  Each alias routes a virtual server-id at
 the anvil-server tool table for `emacs-eval', so the filter can apply
@@ -179,6 +182,44 @@ Excludes orchestrator / browser / pty / cron / worker-admin tools.")
 After Doc 29 (memory-engine) ships, memory-* tools will be stripped
 here to keep the `learning workload' path slim.")
 
+(defconst anvil-manifest-profile-headless
+  '(;; Phase 5-E NeLisp MCP server baseline (7 tools) — Stage D MVP
+    "file-read" "file-outline"
+    "git-log" "git-status"
+    "http-fetch"
+    "data-get-path" "data-set-path"
+    ;; Read / write file ops — headless でも不可欠、UI 依存なし
+    "file-batch" "file-batch-across"
+    "file-replace-string" "file-replace-regexp"
+    "file-insert-at-line" "file-delete-lines" "file-append"
+    "file-ensure-import" "file-read-snippet"
+    "json-object-add" "code-add-field-by-map"
+    "code-extract-pattern"
+    ;; Git — subprocess 駆動、TUI 不要
+    "git-diff-names" "git-diff-stats" "git-head-sha"
+    "git-repo-root" "git-worktree-list" "git-branch-current"
+    "git-commit-message" "git-pr-body"
+    ;; HTTP — anvil-http Phase 6.2 port 対象、全部 expose
+    "http-head" "http-cache-get" "http-cache-clear" "http-cache-index"
+    ;; Data / state — Phase 5-F.1 state port で追加予定
+    "data-list-keys" "data-delete-path"
+    ;; Manifest 自己診断
+    "manifest-cost")
+  "Stage D (Doc 18) MVP = non-Emacs user distribution。
+TUI / transient / dashboard 依存 tool を完全除外、headless 環境で
+安全に動く subset のみ。=bin/anvil mcp serve= の default profile と
+して Stage D Phase 6.1 launcher から参照される。
+
+nav/core との差:
+- orchestrator / browser / pty / worker-admin / bisect / 大量の
+  dev tool は含めない (headless 環境で誤爆防止)
+- defs-* / elisp-describe-* / py-list-* 等 interactive 探索系も除外
+  (non-Emacs user は別手段で IDE 内検索)
+- memory-* は Stage D では user 書き込みを想定せず除外 (Phase 6.x
+  で memory-search のみ opt-in 追加を検討)
+
+Phase 5-F.1 state port 完了後、state-* tool 6 本を追加予定。")
+
 ;;; Intent-based profiles (Doc 34 Phase B)
 ;;
 ;; These use the `:intent' / `:layer' / `:stability' metadata attached
@@ -227,6 +268,7 @@ Possible return shapes:
     ('lean anvil-manifest-profile-lean)
     ('agent anvil-manifest-profile-agent)
     ('edit anvil-manifest-profile-edit)
+    ('headless anvil-manifest-profile-headless)
     (_ (user-error "anvil-manifest: unknown profile %S" profile))))
 
 (defun anvil-manifest--profile-for-server-id (server-id)
