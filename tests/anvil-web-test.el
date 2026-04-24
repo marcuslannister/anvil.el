@@ -34,12 +34,17 @@
         :final-url (or final-url "https://example.com/")))
 
 (defmacro anvil-web-test--with-stub (responses &rest body)
-  "Run BODY with `anvil-http--request' returning successive RESPONSES."
+  "Run BODY with `anvil-http--request' returning successive RESPONSES.
+Binds `anvil-http-respect-robots-txt' to nil so anvil-web tests
+don't need to queue extra robots.txt responses — the anvil-web
+helpers are internal API consumers, not crawlers, and the robots
+pre-check is tested separately in anvil-http-test."
   (declare (indent 1))
   `(let ((anvil-web-test--calls nil)
          (anvil-web-test--responses (copy-sequence ,responses))
          (anvil-state-db-path (make-temp-file "anvil-web-st-" nil ".db"))
          (anvil-state--db nil)
+         (anvil-http-respect-robots-txt nil)
          (anvil-http--metrics
           (list :requests 0 :cache-fresh 0 :cache-revalidated 0
                 :network-200 0 :errors 0 :log nil)))

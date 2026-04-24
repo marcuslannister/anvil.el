@@ -28,12 +28,15 @@ newest first.")
 
 (defmacro anvil-http-test--with-stub (responses &rest body)
   "Run BODY with `anvil-http--request' returning successive RESPONSES.
-Provides a fresh `anvil-state' DB and zeroed metrics."
+Provides a fresh `anvil-state' DB and zeroed metrics.  Binds
+`anvil-http-respect-robots-txt' to nil so unrelated tests do not
+pull on a robots.txt response the stub has not queued."
   (declare (indent 1))
   `(let ((anvil-http-test--calls nil)
          (anvil-http-test--responses (copy-sequence ,responses))
          (anvil-state-db-path (make-temp-file "anvil-http-st-" nil ".db"))
          (anvil-state--db nil)
+         (anvil-http-respect-robots-txt nil)
          (anvil-http--metrics
           (list :requests 0 :cache-fresh 0 :cache-revalidated 0
                 :network-200 0 :errors 0 :log nil)))
@@ -441,6 +444,80 @@ tempfile; response carries head slice + overflow metadata."
            (h (plist-get r :headers)))
       (should (equal "nginx/1.19" (plist-get h :server)))
       (should (equal "60" (plist-get h :x-ratelimit-limit))))))
+
+;;;; --- Phase 1e: robots.txt ------------------------------------------------
+
+(ert-deftest anvil-http-test-phase1e-parse-basic ()
+  "Parser groups User-agent + Allow + Disallow lines, ignoring comments."
+  (let* ((txt "# comment\nUser-agent: *\nDisallow: /private\nAllow: /private/public\n\nUser-agent: BadBot\nDisallow: /\n")
+         (groups (anvil-http--robots-parse txt)))
+    (should (= 2 (length groups)))
+    (let ((star (car groups))
+          (badbot (cadr groups)))
+      (should (equal '("*") (car star)))
+      (should (equal '((disallow . "/private")
+                       (allow . "/private/public"))
+                     (cdr star)))
+      (should (equal '("BadBot") (car badbot)))
+      (should (equal '((disallow . "/")) (cdr badbot))))))
+
+(ert-deftest anvil-http-test-phase1e-pick-group-longest-ua ()
+  "pick-group picks the most-specific UA match; falls back to `*'."
+  (let* ((groups (anvil-http--robots-parse
+                  "User-agent: *\nDisallow: /a\n\nUser-agent: Anvil\nDisallow: /b\n")))
+    ;; "Anvil/1.0" matches "Anvil" group
+    (should (equal '((disallow . "/b"))
+                   (anvil-http--robots-pick-group groups "Anvil/1.0")))
+    ;; Unknown UA falls back to `*' group
+    (should (equal '((disallow . "/a"))
+                   (anvil-http--robots-pick-group groups "OtherBot/2.0")))))
+
+(ert-deftest anvil-http-test-phase1e-match-longest-wins ()
+  "Longest pattern wins; on a tie Allow beats Disallow (RFC 9309)."
+  (let ((rules '((disallow . "/private")
+                 (allow . "/private/public"))))
+    ;; Longer pattern (allow /private/public) wins on /private/public/index
+    (let ((m (anvil-http--robots-match rules "/private/public/index")))
+      (should (car m))                 ; allowed
+      (should (= 15 (cdr m)))))        ; "/private/public" = 15 chars
+  (let ((rules '((disallow . "/path")
+                 (allow . "/path"))))
+    ;; Tie → allow wins
+    (let ((m (anvil-http--robots-match rules "/path")))
+      (should (car m)))))
+
+(ert-deftest anvil-http-test-phase1e-pattern-wildcard-and-anchor ()
+  "`*' expands to `.*' and trailing `$' anchors to URL end."
+  (let ((rx-star (anvil-http--robots-pattern-to-regex "/a/*.pdf"))
+        (rx-anchor (anvil-http--robots-pattern-to-regex "/a$")))
+    (should (string-match-p rx-star "/a/x/y.pdf"))
+    (should (string-match-p rx-star "/a/big.pdf"))
+    (should-not (string-match-p rx-star "/b/file.pdf"))
+    (should (string-match-p rx-anchor "/a"))
+    (should-not (string-match-p rx-anchor "/a/more"))))
+
+(ert-deftest anvil-http-test-phase1e-get-signals-on-disallow ()
+  "anvil-http-get raises user-error when robots.txt Disallows the URL."
+  (anvil-http-test--with-stub
+      (list (anvil-http-test--response
+             200 (list :content-type "text/plain")
+             "User-agent: *\nDisallow: /secret\n")
+            (anvil-http-test--response
+             200 (list :content-type "text/plain") "unreached"))
+    (let ((anvil-http-respect-robots-txt t))
+      (should-error (anvil-http-get "https://example.com/secret/doc")
+                    :type 'user-error))))
+
+(ert-deftest anvil-http-test-phase1e-fail-open-on-error ()
+  "robots.txt non-200 → fail-open; request proceeds."
+  (anvil-http-test--with-stub
+      (list (anvil-http-test--response 404 nil "Not found")
+            (anvil-http-test--response
+             200 (list :content-type "text/plain") "payload"))
+    (let ((anvil-http-respect-robots-txt t))
+      (let ((r (anvil-http-get "https://example.com/anything")))
+        (should (= 200 (plist-get r :status)))
+        (should (equal "payload" (plist-get r :body)))))))
 
 ;;;; --- live smoke test ----------------------------------------------------
 

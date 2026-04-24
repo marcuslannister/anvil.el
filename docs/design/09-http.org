@@ -1,7 +1,7 @@
 #+title: HTTP Client — url-retrieve Wrapper with ETag/TTL Cache
 #+date: 2026-04-18
 #+author: zawatton
-#+property: status PHASE-1A-1B-1C-SHIPPED
+#+property: status PHASE-1A-1B-1C-1E-SHIPPED
 #+property: scope GENERIC
 
 * STATUS
@@ -35,8 +35,20 @@ Location / Retry-After の 7 keys のみ) と =all= (フル返却)
 1 live skipped、byte-compile clean。feat branch
 =feat/doc-09-http-phase1c=。
 
-Phase 1d-1e (batch fetch, robots.txt) は次スロット。Review
-Questions Q1-Q10 resolved のままキープ。
+~Phase 1e SHIPPED~ (2026-04-24) — robots.txt enforcement。
+=anvil-http-respect-robots-txt= (既定 t) で =anvil-http-get= の
+pre-network hook として robots.txt を確認。fetch は origin 単位
+で 24h TTL cache (=ns=http-robots=)、RFC 9309 parser (User-agent
+longest-match + Allow/Disallow + longest-pattern wins + Allow
+ties) を実装。Disallow で =user-error=、fetch 失敗 / 非 200 は
+fail-open。=http-robots-check= MCP tool で standalone 判定
+可能 (side-effect 無し)。ERT +6 (parser basic / pick-group /
+longest-match / pattern wildcard & anchor / integration disallow /
+fail-open)。tests 33 pass / 1 live skipped、byte-compile +
+release-audit clean。feat branch =feat/doc-09-http-phase1e=。
+
+Phase 1d (batch fetch) は次スロット。Review Questions Q1-Q10
+resolved のままキープ。
 
 * Goal
 
@@ -660,7 +672,7 @@ Phase 1b〜1d は *独立に並ぶ* (依存なし)。1a 完了後、体力とユ
 4. ERT +4 (直列比較 / concurrency=1 / concurrency=4 / 部分失敗)
 5. bench (10 URL 単発 loop vs batch)
 
-** Phase 1e — robots.txt (所要 1-2 日)
+** Phase 1e — robots.txt (所要 1-2 日、SHIPPED 2026-04-24)
 
 1. robots.txt fetcher (ns=http-robots、TTL 24h)
 2. RFC 9309 parser (Allow / Disallow / User-Agent matching / longest-match
