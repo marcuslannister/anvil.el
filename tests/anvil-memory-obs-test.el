@@ -879,6 +879,150 @@
       (should t))))
 
 
+;;;; --- Phase 4: auto-inject tests ----------------------------------------
+
+(cl-defun anvil-memory-obs-test--seed-summary
+    (session-id project-dir &key topic summary ts is-ai)
+  "Seed a session + summary fixture for auto-inject tests."
+  (let ((db (anvil-memory-obs--db)))
+    (sqlite-execute
+     db
+     "INSERT OR IGNORE INTO obs_sessions (id, started_at, project_dir)
+        VALUES (?, ?, ?)"
+     (list session-id (or ts (anvil-memory-obs--now)) (or project-dir "")))
+    (sqlite-execute
+     db
+     "INSERT INTO obs_summaries
+        (session_id, obs_start_id, obs_end_id, topic, summary, ts, is_ai)
+        VALUES (?, ?, ?, ?, ?, ?, ?)"
+     (list session-id 1 1
+           (or topic "tt") (or summary "ss")
+           (or ts (anvil-memory-obs--now))
+           (if is-ai 1 0)))))
+
+(ert-deftest anvil-memory-obs-auto-inject-off-returns-empty ()
+  "Default flag off → preamble is empty."
+  (skip-unless (anvil-memory-obs-test--supported-p 'auto-inject))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-auto-inject nil))
+      (anvil-memory-obs-test--seed-summary
+       "ai-off" "/tmp/proj" :topic "T" :summary "S")
+      (should (equal
+               (anvil-memory-obs-build-session-preamble "x" "/tmp/proj")
+               "")))))
+
+(ert-deftest anvil-memory-obs-auto-inject-no-candidates-returns-empty ()
+  "On but DB empty → empty preamble."
+  (skip-unless (anvil-memory-obs-test--supported-p 'auto-inject))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-auto-inject t))
+      (anvil-memory-obs--db)
+      (should (equal
+               (anvil-memory-obs-build-session-preamble "x" "/tmp/proj")
+               "")))))
+
+(ert-deftest anvil-memory-obs-auto-inject-renders-summary-block ()
+  "Matching candidate yields a preamble containing topic + summary."
+  (skip-unless (anvil-memory-obs-test--supported-p 'auto-inject))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-auto-inject t)
+          (anvil-memory-obs-auto-inject-project-match 'exact))
+      (anvil-memory-obs-test--seed-summary
+       "ai-1" "/tmp/proj" :topic "refactor" :summary "Tidied up parser." :is-ai t)
+      (let ((pre (anvil-memory-obs-build-session-preamble "x" "/tmp/proj")))
+        (should (string-match-p "refactor" pre))
+        (should (string-match-p "Tidied up parser" pre))
+        (should-not (string-match-p "rule-based" pre))))))
+
+(ert-deftest anvil-memory-obs-auto-inject-marks-rule-based ()
+  "Rule-based summaries get a `[rule-based]' marker."
+  (skip-unless (anvil-memory-obs-test--supported-p 'auto-inject))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-auto-inject t)
+          (anvil-memory-obs-auto-inject-project-match 'any))
+      (anvil-memory-obs-test--seed-summary
+       "ai-2" "" :topic "X" :summary "Y" :is-ai nil)
+      (let ((pre (anvil-memory-obs-build-session-preamble "x" "/tmp")))
+        (should (string-match-p "rule-based" pre))))))
+
+(ert-deftest anvil-memory-obs-auto-inject-project-match-exact-rejects-others ()
+  "Match=exact filters out unrelated project_dir rows."
+  (skip-unless (anvil-memory-obs-test--supported-p 'auto-inject))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-auto-inject t)
+          (anvil-memory-obs-auto-inject-project-match 'exact))
+      (anvil-memory-obs-test--seed-summary
+       "ai-3a" "/tmp/A" :topic "topic-a" :summary "S")
+      (anvil-memory-obs-test--seed-summary
+       "ai-3b" "/tmp/B" :topic "topic-b" :summary "S")
+      (let ((pre (anvil-memory-obs-build-session-preamble "x" "/tmp/A")))
+        (should (string-match-p "topic-a" pre))
+        (should-not (string-match-p "topic-b" pre))))))
+
+(ert-deftest anvil-memory-obs-auto-inject-project-match-prefix-allows-parent ()
+  "Match=prefix accepts current as a prefix of the stored project-dir."
+  (skip-unless (anvil-memory-obs-test--supported-p 'auto-inject))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-auto-inject t)
+          (anvil-memory-obs-auto-inject-project-match 'prefix))
+      (anvil-memory-obs-test--seed-summary
+       "ai-4" "/tmp/parent/child" :topic "topic-pref" :summary "S")
+      (let ((pre (anvil-memory-obs-build-session-preamble "x" "/tmp/parent")))
+        (should (string-match-p "topic-pref" pre))))))
+
+(ert-deftest anvil-memory-obs-auto-inject-window-filters-old ()
+  "Summaries older than window-days do not appear."
+  (skip-unless (anvil-memory-obs-test--supported-p 'auto-inject))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-auto-inject t)
+          (anvil-memory-obs-auto-inject-window-days 7)
+          (anvil-memory-obs-auto-inject-project-match 'any))
+      (let ((old (- (anvil-memory-obs--now) (* 30 24 60 60))))
+        (anvil-memory-obs-test--seed-summary
+         "ai-5" "" :topic "topic-old" :summary "S" :ts old))
+      (let ((pre (anvil-memory-obs-build-session-preamble "x" "/")))
+        (should (equal pre ""))))))
+
+(ert-deftest anvil-memory-obs-auto-inject-respects-max-summaries ()
+  "Result is capped at `auto-inject-max-summaries'."
+  (skip-unless (anvil-memory-obs-test--supported-p 'auto-inject))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-auto-inject t)
+          (anvil-memory-obs-auto-inject-project-match 'any)
+          (anvil-memory-obs-auto-inject-max-summaries 2))
+      (dotimes (i 5)
+        (anvil-memory-obs-test--seed-summary
+         (format "ai-6-%d" i) "" :topic (format "T%d" i) :summary "S"))
+      (let* ((pre (anvil-memory-obs-build-session-preamble "x" "/"))
+             ;; Count list-item bullets to confirm the cap.
+             (bullets (with-temp-buffer
+                        (insert pre)
+                        (goto-char (point-min))
+                        (let ((n 0))
+                          (while (re-search-forward "^- \\*\\*" nil t)
+                            (cl-incf n))
+                          n))))
+        (should (= bullets 2))))))
+
+(ert-deftest anvil-memory-obs-auto-inject-truncates-over-cap ()
+  "Output longer than `auto-inject-max-chars' ends with `[truncated]'."
+  (skip-unless (anvil-memory-obs-test--supported-p 'auto-inject))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-auto-inject t)
+          (anvil-memory-obs-auto-inject-project-match 'any)
+          (anvil-memory-obs-auto-inject-max-summaries 50)
+          (anvil-memory-obs-auto-inject-max-chars 200))
+      (dotimes (i 20)
+        (anvil-memory-obs-test--seed-summary
+         (format "ai-7-%d" i)
+         "" :topic (format "T%d" i)
+         :summary (concat "summary "
+                          (make-string 50 ?x))))
+      (let ((pre (anvil-memory-obs-build-session-preamble "x" "/")))
+        (should (<= (length pre) 220))     ; cap + truncation marker
+        (should (string-match-p "truncated" pre))))))
+
+
 ;;;; --- purge tests --------------------------------------------------------
 
 (ert-deftest anvil-memory-obs-purge-removes-old-low-importance ()

@@ -213,7 +213,8 @@ Observations:
 (defconst anvil-memory-obs-supported
   '(schema record importance redact integration purge
            compress-rule-based compress-ai compress-auto budget
-           search timeline get summary-search mcp-tools)
+           search timeline get summary-search mcp-tools
+           auto-inject)
   "Capability tags this module currently provides.
 Tests `skip-unless' their tag is in this list so a half-shipped
 feature never breaks CI.  Phase milestones append tags here.")
@@ -890,6 +891,142 @@ Empty / whitespace-only QUERY returns nil."
                       :is-ai      (and (nth 5 r) (= (nth 5 r) 1))
                       :rank       (nth 6 r)))
               rows))))
+
+
+;;;; --- Phase 4: SessionStart auto-inject ---------------------------------
+
+(defcustom anvil-memory-obs-auto-inject nil
+  "When non-nil, SessionStart prepends related summaries to the preamble.
+Off by default: opting into observation capture does not implicitly
+inject any context until the user is happy with the budget knobs."
+  :type 'boolean
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-auto-inject-window-days 7
+  "Look back this many days when picking auto-inject candidates."
+  :type 'integer
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-auto-inject-max-summaries 5
+  "Cap on the number of summaries injected per SessionStart."
+  :type 'integer
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-auto-inject-max-chars 4000
+  "Hard cap on the rendered preamble length (~1000 tokens at 4 char/token)."
+  :type 'integer
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-auto-inject-project-match 'prefix
+  "Strategy for matching `obs_sessions.project_dir' to current project-dir.
+
+  `exact'  — only when the strings are identical.
+  `prefix' — either string is a prefix of the other (default).
+  `any'    — accept every prior session (most aggressive).
+  `none'   — disable project filtering entirely (alias of `any')."
+  :type '(choice (const :tag "Exact match"           exact)
+                 (const :tag "Prefix match (either)" prefix)
+                 (const :tag "Any project"           any)
+                 (const :tag "No filter"             none))
+  :group 'anvil-memory-obs)
+
+(defun anvil-memory-obs--project-match-p (current other)
+  "Return non-nil when CURRENT and OTHER project dirs are considered related."
+  (pcase anvil-memory-obs-auto-inject-project-match
+    ((or 'any 'none) t)
+    ('exact (and (stringp current) (stringp other) (equal current other)))
+    ('prefix
+     (when (and (stringp current) (stringp other)
+                (not (string-empty-p current))
+                (not (string-empty-p other)))
+       (or (string-prefix-p current other)
+           (string-prefix-p other current))))
+    (_ nil)))
+
+(defun anvil-memory-obs--auto-inject-candidates (current-project)
+  "Return ranked summary candidate plists from the inject window.
+Filters by `anvil-memory-obs-auto-inject-project-match' against
+CURRENT-PROJECT.  Does not enforce the max-summaries cap; the
+caller trims after de-duplicating."
+  (let* ((db (anvil-memory-obs--db))
+         (since (- (anvil-memory-obs--now)
+                   (* anvil-memory-obs-auto-inject-window-days
+                      24 60 60)))
+         ;; Pull a wider window than max-summaries so the project
+         ;; filter has room to discard misses.
+         (raw-cap (* (max anvil-memory-obs-auto-inject-max-summaries 1)
+                     4))
+         (rows (sqlite-select
+                db
+                "SELECT s.id, s.session_id, s.topic, s.summary,
+                        s.ts, s.is_ai,
+                        COALESCE(sess.project_dir, '')
+                   FROM obs_summaries s
+                   LEFT JOIN obs_sessions sess
+                     ON sess.id = s.session_id
+                  WHERE s.ts >= ?
+               ORDER BY (s.ts + s.is_ai * 86400) DESC
+                  LIMIT ?"
+                (list since raw-cap)))
+         (rendered (mapcar
+                    (lambda (r)
+                      (list :id (nth 0 r)
+                            :session-id (nth 1 r)
+                            :topic (nth 2 r)
+                            :summary (nth 3 r)
+                            :ts (nth 4 r)
+                            :is-ai (and (nth 5 r) (= (nth 5 r) 1))
+                            :project-dir (nth 6 r)))
+                    rows)))
+    (cl-remove-if-not
+     (lambda (r)
+       (anvil-memory-obs--project-match-p
+        current-project (plist-get r :project-dir)))
+     rendered)))
+
+(defun anvil-memory-obs--render-preamble (rows)
+  "Format ROWS as a Markdown preamble block.
+Caps at `anvil-memory-obs-auto-inject-max-chars'.  Empty ROWS
+yields an empty string so callers can concat unconditionally."
+  (if (null rows)
+      ""
+    (let* ((cap anvil-memory-obs-auto-inject-max-chars)
+           (header
+            "## Related context from prior anvil-memory-obs sessions\n\n")
+           (lines
+            (mapconcat
+             (lambda (r)
+               (format "- **%s%s** %s"
+                       (or (plist-get r :topic) "(no topic)")
+                       (if (plist-get r :is-ai) "" " [rule-based]")
+                       (or (plist-get r :summary) "")))
+             rows
+             "\n"))
+           (full (concat header lines "\n")))
+      (if (<= (length full) cap)
+          full
+        (let* ((cut (or (and (>= cap 0)
+                             (cl-search "\n" full
+                                        :start2 0 :end2 cap
+                                        :from-end t))
+                        cap)))
+          (concat (substring full 0 cut)
+                  "\n[truncated]\n"))))))
+
+(defun anvil-memory-obs-build-session-preamble (_session-id
+                                                &optional project-dir)
+  "Return a Markdown preamble (possibly empty) for SessionStart injection.
+Empty when `anvil-memory-obs-auto-inject' is nil or no candidates
+qualify.  PROJECT-DIR defaults to `default-directory'."
+  (if (not anvil-memory-obs-auto-inject)
+      ""
+    (let* ((current (or project-dir default-directory))
+           (candidates (anvil-memory-obs--auto-inject-candidates current))
+           (capped (cl-subseq
+                    candidates 0
+                    (min (length candidates)
+                         anvil-memory-obs-auto-inject-max-summaries))))
+      (anvil-memory-obs--render-preamble capped))))
 
 
 ;;;; --- Phase 3: MCP tool wrappers ----------------------------------------
