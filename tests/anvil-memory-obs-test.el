@@ -1146,6 +1146,146 @@ match, the candidate is filtered out."
         (should (plist-get result :rows))))))
 
 
+;;;; --- Phase 6: promote action tests -------------------------------------
+
+(defmacro anvil-memory-obs-test--with-promote-env (&rest body)
+  "Run BODY with a fresh obs DB and a temp memory dir."
+  (declare (indent 0))
+  `(let* ((tmp-db (make-temp-file "anvil-memory-obs-test-" nil ".db"))
+          (anvil-memory-obs-db-path tmp-db)
+          (mem-dir (file-name-as-directory
+                    (make-temp-file "anvil-memory-obs-mem-" t)))
+          (anvil-memory-obs-promote-target-dir mem-dir))
+     (unwind-protect
+         (progn
+           (when (fboundp 'anvil-memory-obs--close)
+             (anvil-memory-obs--close))
+           ,@body)
+       (when (fboundp 'anvil-memory-obs--close)
+         (anvil-memory-obs--close))
+       (when (file-exists-p tmp-db) (delete-file tmp-db))
+       (when (file-directory-p mem-dir)
+         (delete-directory mem-dir t)))))
+
+(ert-deftest anvil-memory-obs-promote-creates-md-file ()
+  "promote writes a new feedback_*.md with frontmatter + body."
+  (skip-unless (anvil-memory-obs-test--supported-p 'promote))
+  (anvil-memory-obs-test--with-promote-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3))
+      (anvil-memory-obs-test--seed-high-importance-session "pp1" 4)
+      (let* ((sid (anvil-memory-obs-summarize-session "pp1"))
+             (result (anvil-memory-obs-promote sid)))
+        (should (eq (plist-get result :status) 'created))
+        (should (file-exists-p (plist-get result :file)))
+        (let ((body (with-temp-buffer
+                      (insert-file-contents (plist-get result :file))
+                      (buffer-string))))
+          (should (string-match-p "^name: " body))
+          (should (string-match-p "^type: feedback" body))
+          (should (string-match-p "error" body)))))))
+
+(ert-deftest anvil-memory-obs-promote-updates-memory-index ()
+  "promote appends a new line to MEMORY.md (creates it when absent)."
+  (skip-unless (anvil-memory-obs-test--supported-p 'promote))
+  (anvil-memory-obs-test--with-promote-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3))
+      (anvil-memory-obs-test--seed-high-importance-session "pp2" 4)
+      (let* ((sid (anvil-memory-obs-summarize-session "pp2"))
+             (result (anvil-memory-obs-promote
+                      sid :name "memorable name"
+                      :description "one-line desc"))
+             (index (anvil-memory-obs--memory-index-path
+                     anvil-memory-obs-promote-target-dir)))
+        (should (plist-get result :index-updated))
+        (should (file-exists-p index))
+        (let ((index-body (with-temp-buffer
+                            (insert-file-contents index)
+                            (buffer-string))))
+          (should (string-match-p "memorable name" index-body))
+          (should (string-match-p "one-line desc" index-body)))))))
+
+(ert-deftest anvil-memory-obs-promote-respects-target-type ()
+  "Explicit :target-type lands in both filename prefix and frontmatter."
+  (skip-unless (anvil-memory-obs-test--supported-p 'promote))
+  (anvil-memory-obs-test--with-promote-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3))
+      (anvil-memory-obs-test--seed-high-importance-session "pp3" 4)
+      (let* ((sid (anvil-memory-obs-summarize-session "pp3"))
+             (result (anvil-memory-obs-promote sid :target-type 'project))
+             (filename (file-name-nondirectory
+                        (plist-get result :file))))
+        (should (string-prefix-p "project_" filename))
+        (let ((body (with-temp-buffer
+                      (insert-file-contents (plist-get result :file))
+                      (buffer-string))))
+          (should (string-match-p "^type: project" body)))))))
+
+(ert-deftest anvil-memory-obs-promote-errors-on-unknown-id ()
+  "Promoting a non-existent summary id signals a user-error."
+  (skip-unless (anvil-memory-obs-test--supported-p 'promote))
+  (anvil-memory-obs-test--with-promote-env
+    (anvil-memory-obs--db)
+    (should-error (anvil-memory-obs-promote 9999) :type 'user-error)))
+
+(ert-deftest anvil-memory-obs-promote-rejects-collision ()
+  "Promoting twice with the same name + type errors on the second call."
+  (skip-unless (anvil-memory-obs-test--supported-p 'promote))
+  (anvil-memory-obs-test--with-promote-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3))
+      (anvil-memory-obs-test--seed-high-importance-session "pp4" 4)
+      (let* ((sid (anvil-memory-obs-summarize-session "pp4")))
+        (anvil-memory-obs-promote sid :name "fixed-slug")
+        (should-error
+         (anvil-memory-obs-promote sid :name "fixed-slug")
+         :type 'user-error)))))
+
+(ert-deftest anvil-memory-obs-promote-memory-index-idempotent ()
+  "Second --update with same filename returns nil (no duplicate line)."
+  (skip-unless (anvil-memory-obs-test--supported-p 'promote))
+  (anvil-memory-obs-test--with-promote-env
+    (let ((dir anvil-memory-obs-promote-target-dir))
+      (should
+       (eq t (anvil-memory-obs--update-memory-index
+              dir "feedback_x.md" "X" "desc")))
+      (should
+       (null (anvil-memory-obs--update-memory-index
+              dir "feedback_x.md" "X" "desc")))
+      (let* ((index (anvil-memory-obs--memory-index-path dir))
+             (lines (with-temp-buffer
+                      (insert-file-contents index)
+                      (split-string (buffer-string) "\n" t))))
+        (should (= (length (cl-remove-if-not
+                            (lambda (l) (string-match-p "feedback_x.md" l))
+                            lines))
+                   1))))))
+
+(ert-deftest anvil-memory-obs-tool-promote-coerces-args ()
+  "MCP wrapper accepts digit-string id + string target-type."
+  (skip-unless (anvil-memory-obs-test--supported-p 'promote))
+  (anvil-memory-obs-test--with-promote-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3))
+      (anvil-memory-obs-test--seed-high-importance-session "pp5" 4)
+      (let* ((sid (anvil-memory-obs-summarize-session "pp5"))
+             (result (anvil-memory-obs--tool-promote
+                      (number-to-string sid) "feedback")))
+        (should (eq (plist-get result :status) 'created))
+        (should (file-exists-p (plist-get result :file)))))))
+
+(ert-deftest anvil-memory-obs-slug-is-stable ()
+  "slug helper produces predictable kebab-case output."
+  (skip-unless (anvil-memory-obs-test--supported-p 'promote))
+  (should (equal (anvil-memory-obs--slug "Refactor parser") "refactor-parser"))
+  (should (equal (anvil-memory-obs--slug "  multi   word  ") "multi-word"))
+  (should (equal (anvil-memory-obs--slug "____") "untitled"))
+  (should (equal (anvil-memory-obs--slug nil) "untitled"))
+  (should (<= (length (anvil-memory-obs--slug (make-string 200 ?a))) 30)))
+
+
 ;;;; --- purge tests --------------------------------------------------------
 
 (ert-deftest anvil-memory-obs-purge-removes-old-low-importance ()
