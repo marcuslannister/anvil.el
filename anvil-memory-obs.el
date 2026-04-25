@@ -214,7 +214,7 @@ Observations:
   '(schema record importance redact integration purge
            compress-rule-based compress-ai compress-auto budget
            search timeline get summary-search mcp-tools
-           auto-inject)
+           auto-inject auto-inject-integration)
   "Capability tags this module currently provides.
 Tests `skip-unless' their tag is in this list so a half-shipped
 feature never breaks CI.  Phase milestones append tags here.")

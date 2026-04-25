@@ -454,14 +454,24 @@ the shell wrapper does not crash the Claude hook pipeline."
               (compact-preamble
                (when (fboundp 'anvil-compact-on-session-start)
                  (funcall (intern "anvil-compact-on-session-start")
-                          session-id))))
+                          session-id)))
+              (obs-preamble
+               (when (fboundp 'anvil-memory-obs-build-session-preamble)
+                 (funcall (intern "anvil-memory-obs-build-session-preamble")
+                          session-id default-directory))))
          (when (fboundp 'anvil-memory-obs-record-session-start)
            (funcall (intern "anvil-memory-obs-record-session-start")
                     session-id default-directory))
-         (if (and (stringp compact-preamble)
-                  (not (string-empty-p compact-preamble)))
-             compact-preamble
-           session-preamble)))
+         (let* ((primary (if (and (stringp compact-preamble)
+                                  (not (string-empty-p compact-preamble)))
+                             compact-preamble
+                           session-preamble))
+                (obs (if (stringp obs-preamble) obs-preamble "")))
+           (cond
+            ((and (string-empty-p primary) (string-empty-p obs)) "")
+            ((string-empty-p obs)     primary)
+            ((string-empty-p primary) obs)
+            (t (concat obs "\n" primary))))))
       ('post-tool-use
        (let* ((session-id (or (nth 0 args) "unknown"))
               (tool (nth 1 args))

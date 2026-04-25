@@ -1171,6 +1171,42 @@
                    1))))))
 
 
+;;;; --- Phase 4 auto-inject integration tests -----------------------------
+
+(ert-deftest anvil-memory-obs-session-start-injects-preamble ()
+  "session-start dispatch returns preamble built from prior summaries."
+  (skip-unless (anvil-memory-obs-test--supported-p 'auto-inject-integration))
+  (skip-unless (fboundp 'anvil-session-hook-dispatch))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-auto-inject t)
+          (anvil-memory-obs-auto-inject-project-match 'any)
+          (default-directory "/tmp/inject-proj"))
+      (anvil-memory-obs-test--seed-summary
+       "ai-int-1" "/tmp/inject-proj"
+       :topic "Phase 4 hook" :summary "Earlier session highlights." :is-ai t)
+      (let ((preamble (anvil-session-hook-dispatch
+                       'session-start "ai-int-new")))
+        (should (stringp preamble))
+        (should (string-match-p "Phase 4 hook" preamble))))))
+
+(ert-deftest anvil-memory-obs-session-start-empty-when-flag-off ()
+  "Flag off: session-start preamble does not contain obs content."
+  (skip-unless (anvil-memory-obs-test--supported-p 'auto-inject-integration))
+  (skip-unless (fboundp 'anvil-session-hook-dispatch))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-auto-inject nil)
+          (default-directory "/tmp/inject-proj"))
+      (anvil-memory-obs-test--seed-summary
+       "ai-int-2" "/tmp/inject-proj"
+       :topic "should-not-appear" :summary "x")
+      (let ((preamble (anvil-session-hook-dispatch
+                       'session-start "ai-int-2-new")))
+        (should (stringp preamble))
+        (should-not (string-match-p "should-not-appear" preamble))))))
+
+
 ;;;; --- anvil-session integration tests ------------------------------------
 
 (require 'anvil-session nil t)
