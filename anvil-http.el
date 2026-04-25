@@ -1014,46 +1014,50 @@ the returned plist always carries `:extract-mode' (symbol) and
 `:extract-engine' (symbol) for observability; `:body' is replaced
 only on a successful match and `:extract-miss t' is set on a
 no-match or content-type mismatch so callers never see an empty
-string they can't distinguish from \"server returned empty body\"."
-  (if (and (null selector) (null json-path))
-      response
-    (let* ((headers (plist-get response :headers))
-           (ct (plist-get headers :content-type))
-           (target (anvil-http--extract-target-from-content-type ct))
-           (body (plist-get response :body)))
-      (cond
-       ((and selector (memq target '(html xml)) (stringp body))
-        (let* ((engine (if (anvil-http--libxml-p) 'libxml 'regex-subset))
-               (extracted
-                (if (eq engine 'libxml)
-                    (anvil-http--select-html-libxml body selector)
-                  (anvil-http--select-html-fallback body selector))))
-          (if (and extracted (not (string-empty-p extracted)))
+string they can't distinguish from \"server returned empty body\".
+
+Delegates to `nelisp-http--apply-extract' when available."
+  (if (fboundp 'nelisp-http--apply-extract)
+      (nelisp-http--apply-extract response selector json-path)
+    (if (and (null selector) (null json-path))
+        response
+      (let* ((headers (plist-get response :headers))
+             (ct (plist-get headers :content-type))
+             (target (anvil-http--extract-target-from-content-type ct))
+             (body (plist-get response :body)))
+        (cond
+         ((and selector (memq target '(html xml)) (stringp body))
+          (let* ((engine (if (anvil-http--libxml-p) 'libxml 'regex-subset))
+                 (extracted
+                  (if (eq engine 'libxml)
+                      (anvil-http--select-html-libxml body selector)
+                    (anvil-http--select-html-fallback body selector))))
+            (if (and extracted (not (string-empty-p extracted)))
+                (anvil-http--plist-put! response
+                                        :body extracted
+                                        :extract-mode 'selector
+                                        :extract-engine engine)
               (anvil-http--plist-put! response
-                                      :body extracted
+                                      :extract-miss t
                                       :extract-mode 'selector
-                                      :extract-engine engine)
-            (anvil-http--plist-put! response
-                                    :extract-miss t
-                                    :extract-mode 'selector
-                                    :extract-engine engine))))
-       ((and json-path (eq target 'json) (stringp body))
-        (let ((extracted (anvil-http--select-json-dotted body json-path)))
-          (if extracted
+                                      :extract-engine engine))))
+         ((and json-path (eq target 'json) (stringp body))
+          (let ((extracted (anvil-http--select-json-dotted body json-path)))
+            (if extracted
+                (anvil-http--plist-put! response
+                                        :body extracted
+                                        :extract-mode 'json-path
+                                        :extract-engine 'json)
               (anvil-http--plist-put! response
-                                      :body extracted
+                                      :extract-miss t
                                       :extract-mode 'json-path
-                                      :extract-engine 'json)
-            (anvil-http--plist-put! response
-                                    :extract-miss t
-                                    :extract-mode 'json-path
-                                    :extract-engine 'json))))
-       (t
-        (anvil-http--plist-put! response
-                                :extract-miss t
-                                :extract-mode (cond (selector 'selector)
-                                                    (json-path 'json-path))
-                                :extract-engine 'content-type-mismatch))))))
+                                      :extract-engine 'json))))
+         (t
+          (anvil-http--plist-put! response
+                                  :extract-miss t
+                                  :extract-mode (cond (selector 'selector)
+                                                      (json-path 'json-path))
+                                  :extract-engine 'content-type-mismatch)))))))
 
 ;;;; --- body-mode / header-filter helpers (Phase 1c) -----------------------
 
