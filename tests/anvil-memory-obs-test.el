@@ -594,6 +594,71 @@
                  1)))))
 
 
+;;;; --- Phase 2: auto-compression-on-session-end tests --------------------
+
+(ert-deftest anvil-memory-obs-auto-compress-off-by-default ()
+  "Default flag off: session-end alone never creates a summary row."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-auto))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-on-session-end nil)
+          (anvil-memory-obs-compress-min-observations 3))
+      (anvil-memory-obs-test--seed-session "auto-off" 5)
+      (anvil-memory-obs-record-session-end "auto-off")
+      (should (zerop (length
+                      (sqlite-select (anvil-memory-obs--db)
+                                     "SELECT id FROM obs_summaries")))))))
+
+(ert-deftest anvil-memory-obs-auto-compress-creates-summary ()
+  "Flag on: session-end populates obs_summaries with a rule-based row."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-auto))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-on-session-end t)
+          (anvil-memory-obs-use-ai-compression nil)
+          (anvil-memory-obs-compress-min-observations 3))
+      (anvil-memory-obs-test--seed-session "auto-on" 5)
+      (anvil-memory-obs-record-session-end "auto-on")
+      (let ((rows (sqlite-select
+                   (anvil-memory-obs--db)
+                   "SELECT session_id FROM obs_summaries")))
+        (should (= (length rows) 1))
+        (should (equal (caar rows) "auto-on"))))))
+
+(ert-deftest anvil-memory-obs-auto-compress-respects-min-observations ()
+  "Even with the flag on, sessions below min-observations skip summary."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-auto))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-on-session-end t)
+          (anvil-memory-obs-compress-min-observations 5))
+      (anvil-memory-obs-test--seed-session "auto-tiny" 3)
+      (anvil-memory-obs-record-session-end "auto-tiny")
+      (should (zerop (length
+                      (sqlite-select (anvil-memory-obs--db)
+                                     "SELECT id FROM obs_summaries")))))))
+
+(ert-deftest anvil-memory-obs-auto-compress-swallows-errors ()
+  "A flaky AI path does not break the session-end pipeline."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-auto))
+  (anvil-memory-obs-test--with-env
+    (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+               (lambda (&rest _args)
+                 (error "boom"))))
+      (let ((anvil-memory-obs-enabled t)
+            (anvil-memory-obs-compress-on-session-end t)
+            (anvil-memory-obs-use-ai-compression t)
+            (anvil-memory-obs-compress-min-observations 3))
+        (anvil-memory-obs-test--seed-session "auto-flaky" 5)
+        ;; should-not error => the call must complete
+        (anvil-memory-obs-record-session-end "auto-flaky")
+        ;; rule-based fallback wrote a summary anyway
+        (should (= (length
+                    (sqlite-select (anvil-memory-obs--db)
+                                   "SELECT id FROM obs_summaries"))
+                   1))))))
+
+
 ;;;; --- anvil-session integration tests ------------------------------------
 
 (require 'anvil-session nil t)

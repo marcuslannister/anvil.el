@@ -181,6 +181,14 @@ loaded.  Failures fall back to the configured
   :type 'integer
   :group 'anvil-memory-obs)
 
+(defcustom anvil-memory-obs-compress-on-session-end nil
+  "When non-nil, `anvil-memory-obs-record-session-end' auto-summarises.
+Gated on `anvil-memory-obs-enabled' (which already gates the record
+function itself); off by default so opting into observation capture
+does not implicitly opt into LLM spend."
+  :type 'boolean
+  :group 'anvil-memory-obs)
+
 (defcustom anvil-memory-obs-compress-prompt-template
   "You are summarising a software development session for later recall.
 Read the observation log below and respond with **strict JSON only**:
@@ -194,7 +202,7 @@ Observations:
 
 (defconst anvil-memory-obs-supported
   '(schema record importance redact integration purge
-           compress-rule-based compress-ai)
+           compress-rule-based compress-ai compress-auto)
   "Capability tags this module currently provides.
 Tests `skip-unless' their tag is in this list so a half-shipped
 feature never breaks CI.  Phase milestones append tags here.")
@@ -462,7 +470,11 @@ SUMMARY is the (truncated) tool result/argument summary."
      :payload (list :transcript-path transcript-path))))
 
 (defun anvil-memory-obs-record-session-end (session-id)
-  "Record a session-end observation and stamp ended_at on the session row."
+  "Record a session-end observation and stamp ended_at on the session row.
+When `anvil-memory-obs-compress-on-session-end' is non-nil, also
+trigger `anvil-memory-obs-summarize-session' after the row is
+written; summarisation errors are swallowed so a flaky orchestrator
+never breaks the session-end pipeline."
   (when (and anvil-memory-obs-enabled (stringp session-id))
     (let ((db (anvil-memory-obs--db))
           (now (anvil-memory-obs--now)))
@@ -471,11 +483,15 @@ SUMMARY is the (truncated) tool result/argument summary."
        db
        "UPDATE obs_sessions SET ended_at = ? WHERE id = ?"
        (list now session-id))
-      (anvil-memory-obs--insert-observation
-       :session-id session-id
-       :hook "session-end"
-       :body (format "session %s ended" session-id)
-       :ts now))))
+      (let ((rowid (anvil-memory-obs--insert-observation
+                    :session-id session-id
+                    :hook "session-end"
+                    :body (format "session %s ended" session-id)
+                    :ts now)))
+        (when anvil-memory-obs-compress-on-session-end
+          (ignore-errors
+            (anvil-memory-obs-summarize-session session-id)))
+        rowid))))
 
 
 ;;;; --- purge --------------------------------------------------------------
