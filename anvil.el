@@ -243,7 +243,21 @@ These are not loaded by default.  Available modules:
                 destructive).  Doc 29 Phase 1a, requires Emacs
                 29+.  Phase 1b (FTS5 + contradiction detection +
                 URL HEAD) and Phase 2 (decay + promote) stay
-                DRAFT."
+                DRAFT.
+- `memory-obs' — Session lifecycle observation capture.  Records
+                Claude Code hook events (session-start, user-prompt,
+                post-tool-use, stop, session-end) into a separate
+                SQLite + FTS5 store at
+                `anvil-memory-obs-db-path'.  Body is redacted for
+                common secret patterns and an importance heuristic
+                runs at insert time.  Opt-in via
+                `anvil-memory-obs-enabled' (default nil); when off,
+                the integrated `fboundp' guards in `session' make it
+                a complete no-op.  Doc 37 Phase 1, requires Emacs
+                29+ and `session'.  Phase 2 (AI compression),
+                Phase 3 (3-layer search MCP tools), Phase 4
+                (auto-inject), Phase 5 (UI), Phase 6 (promote) and
+                Phase 7 (vector) stay DRAFT."
   :type '(repeat symbol)
   :group 'anvil)
 
