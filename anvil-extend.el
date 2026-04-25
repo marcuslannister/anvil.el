@@ -1,4 +1,4 @@
-;;; anvil-extend.el --- Claude self-extension SDK scaffold + hot-reload + sandbox v0 (Phase A+B+C) -*- lexical-binding: t; -*-
+;;; anvil-extend.el --- Claude self-extension SDK scaffold + hot-reload + sandbox v0 + rationale (Phase A+B+C+D) -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 zawatton
 
@@ -10,8 +10,8 @@
 
 ;;; Commentary:
 
-;; anvil-extend implements Phases A, B, and C (sandbox v0) of the
-;; Claude self-extension SDK sketched in
+;; anvil-extend implements Phases A, B, C (sandbox v0), and D
+;; (rationale memory) of the Claude self-extension SDK sketched in
 ;; `docs/design/38-claude-self-extension-sdk.org' (LOCKED v2;
 ;; renumbered from former Doc 35 per option B path).
 ;;
@@ -40,6 +40,17 @@
 ;; OS — and Doc 38 §3.C.v1 / §6.1 will eventually layer real
 ;; seccomp / RLIMIT / chroot enforcement on top.  Phase v0's scope is
 ;; strictly: process isolation + AST scan + per-session policy plist.
+;;
+;; Phase D records per-extension rationale (purpose / use-case / author /
+;; tags) into a Markdown file under `anvil-extend-rationale-storage-dir'
+;; so future Claude sessions can `anvil-memory-search' for prior
+;; reasoning instead of re-deriving it.  The Markdown follows the
+;; layout in Doc 38 §3.D (`extend-<NAME> rationale (v<VERSION>)') and
+;; is filtered through a built-in regex secret scanner that redacts
+;; common API-key / token / PEM / .env-style assignments before the
+;; record is written to disk.  `anvil-extend-scaffold' calls the
+;; recorder automatically when invoked with `:purpose' so the inner
+;; loop captures the rationale without an extra Claude round-trip.
 ;;
 ;; Public API (all `anvil-extend-*' prefixed for safe namespace
 ;; reservation per Doc 38 §3.A/§3.B spec; the Phase A names are
@@ -109,6 +120,26 @@
 ;;     all three classes; pass `:allow-shell t' (etc.) to permit a
 ;;     class.  Returns the resulting plist.
 ;;
+;;   (anvil-extend-record-rationale NAME &key purpose use-case      -- Phase D
+;;                                       author tags policy
+;;                                       related-tools registry-kind
+;;                                       version body-excerpt change-summary)
+;;     Append a rationale entry for NAME under
+;;     `anvil-extend-rationale-storage-dir'.  Returns a plist
+;;     `(:status :recorded :name NAME :file PATH :version N
+;;       :redactions COUNT)'.  When the rationale file already
+;;     exists, a new `vN+1' change-log entry is appended (never
+;;     overwriting prior history) per Doc 38 §3.D.
+;;
+;;   (anvil-extend-recall-rationale NAME)                     -- Phase D
+;;     Read the latest rationale entry for NAME and return a plist
+;;     parsed from the Markdown header.  Returns nil when no
+;;     rationale was ever recorded.
+;;
+;;   (anvil-extend-list-rationales)                           -- Phase D
+;;     Enumerate every rationale file under storage as a list of
+;;     plists `(:name :purpose-summary :version :file)'.
+;;
 ;; MCP tools registered against `emacs-eval':
 ;;
 ;;   `anvil-extend-scaffold'              (Phase A) — emit scaffold files
@@ -116,9 +147,12 @@
 ;;   `anvil-extend-watch'                 (Phase B) — install auto-reload watch
 ;;   `anvil-extend-eval-sandboxed'        (Phase C) — sandbox v0 eval
 ;;   `anvil-extend-scan-dangerous-forms'  (Phase C) — AST policy scan
+;;   `anvil-extend-record-rationale'      (Phase D) — store rationale Markdown
+;;   `anvil-extend-recall-rationale'      (Phase D) — fetch latest rationale
+;;   `anvil-extend-list-rationales'       (Phase D) — enumerate rationales
 ;;
-;; Phases D-F (rationale auto-record / NeLisp execute path / ephemeral-
-;; permanent promotion gates) remain out of scope per Doc 38 §3.D-§3.F.
+;; Phases E, F (NeLisp execute path / ephemeral-permanent promotion
+;; gates) remain out of scope per Doc 38 §3.E-§3.F.
 ;; Phase C v1 (real syscall sandbox = seccomp / RLIMIT / chroot /
 ;; namespace) is the future Phase 9d.A6 task per Doc 38 §3.C.v1 / §6.
 
@@ -195,6 +229,38 @@ directory before swapping it into the canonical storage dir, so
 a partial / corrupt artifact never overwrites the live one.  See
 Doc 38 §3.B step 1 (`staging') and §2.7 A (transactional reload)."
   :type 'directory
+  :group 'anvil-extend)
+
+(defcustom anvil-extend-rationale-storage-dir
+  (expand-file-name "~/.anvil-extend/rationale/")
+  "Directory where Phase D rationale Markdown files are written.
+
+Each `anvil-extend-record-rationale' call writes (or appends to)
+`extend_<NAME>.md' under this directory using the layout in
+Doc 38 §3.D so `anvil-memory-search' can later surface the file
+to a different Claude session.
+
+The directory is created on demand.  Tests rebind this via
+`let' to keep CI hermetic."
+  :type 'directory
+  :group 'anvil-extend)
+
+(defcustom anvil-extend-secret-scan-allow-patterns nil
+  "Whitelist of regexps that suppress the rationale secret scanner.
+
+Matches against the FULL line in which a candidate secret was
+detected.  Use this to silence false positives such as a hex
+string used as a fixture identifier.  Patterns are tried in
+order; the first match marks the line as benign and skips
+redaction.  See Doc 38 §3.D D11 (`secret pattern scan')."
+  :type '(repeat regexp)
+  :group 'anvil-extend)
+
+(defcustom anvil-extend-rationale-default-registry-kind 'ephemeral
+  "Default `:registry-kind' tag applied when not supplied to
+`anvil-extend-record-rationale'.  Tracks Doc 38 §2.4 / §2.5
+ephemeral-vs-permanent split."
+  :type '(choice (const ephemeral) (const permanent))
   :group 'anvil-extend)
 
 ;;;; --- internal helpers ---------------------------------------------------
@@ -368,7 +434,9 @@ surface or keep it dormant."
 ;;;; --- public: scaffold ---------------------------------------------------
 
 ;;;###autoload
-(cl-defun anvil-extend-scaffold (name &key params body docstring)
+(cl-defun anvil-extend-scaffold (name &key params body docstring
+                                      purpose use-case author tags
+                                      policy related-tools registry-kind)
   "Generate the three scaffold files for extension NAME.
 
 NAME is a symbol matching `anvil-extend--name-regexp'.  PARAMS is
@@ -378,12 +446,25 @@ up the function body; if nil, a placeholder `(progn nil)' body is
 emitted so the generated file still compiles.  DOCSTRING is a
 string used both for the `defun' and as the MCP tool description.
 
+When PURPOSE is non-nil the call also fires Phase D auto-record:
+`anvil-extend-record-rationale' is invoked with PURPOSE, USE-CASE,
+AUTHOR, TAGS, POLICY, RELATED-TOOLS and REGISTRY-KIND so the
+caller can capture the rationale in the same MCP round-trip that
+emits the scaffold.  When PURPOSE is omitted no rationale is
+recorded and Phase D stays inert (Doc 38 §3.D — recording is
+opt-in to keep the scaffold call backwards-compatible with Phase
+A clients that pre-date Phase D).
+
 Returns a plist:
 
   (:elisp-file PATH
    :test-file  PATH
    :register-stub PATH
-   :status     :created)"
+   :status     :created
+   :rationale  PLIST-OR-NIL)
+
+Where `:rationale' is the result of
+`anvil-extend-record-rationale' (or nil when PURPOSE was omitted)."
   (anvil-extend--check-name name)
   (anvil-extend--ensure-storage)
   (let* ((paths   (anvil-extend--paths name))
@@ -400,7 +481,23 @@ Returns a plist:
     (anvil-extend--write
      (plist-get paths :register-stub)
      (anvil-extend--render-register name doc*))
-    (append paths (list :status :created))))
+    (let ((rationale
+           (when purpose
+             (let ((excerpt (when body*
+                              (mapconcat #'prin1-to-string body* "\n"))))
+               (ignore-errors
+                 (anvil-extend-record-rationale
+                  name
+                  :purpose purpose
+                  :use-case use-case
+                  :author author
+                  :tags tags
+                  :policy policy
+                  :related-tools related-tools
+                  :registry-kind registry-kind
+                  :body-excerpt excerpt
+                  :change-summary "scaffold"))))))
+      (append paths (list :status :created :rationale rationale)))))
 
 ;;;; --- public: load -------------------------------------------------------
 
@@ -1121,7 +1218,511 @@ what they asked for."
                  :memory-limit (or memory-limit
                                    anvil-extend-sandbox-memory-limit)))))))))
 
-;;;; --- MCP wrappers -------------------------------------------------------
+;;;; --- Phase D: rationale auto-record ------------------------------------
+
+(defconst anvil-extend--rationale-file-prefix "extend_"
+  "Prefix used for rationale Markdown files under storage.
+
+The full filename is `<prefix><NAME>.md', e.g.
+`extend_pdf-page-count.md'.  `anvil-memory--infer-type' classifies
+this as `memo' (no `feedback_' / `project_' / `reference_' /
+`user_' prefix), matching Doc 38 §3.D's recommendation.")
+
+(defconst anvil-extend--rationale-version-regexp
+  "^# extend-[^ ]+ rationale (v\\([0-9]+\\))$"
+  "Regexp pinning the latest version number in a rationale header.
+
+Matches the line `# extend-<NAME> rationale (v<N>)' written by
+`anvil-extend--render-rationale'; the first capture is N.  Used
+by `anvil-extend--next-version' so re-recording a rationale
+bumps the version monotonically.")
+
+(defconst anvil-extend--secret-patterns
+  '(;; .env-style assignment of a value that looks like a secret:
+    ;; matches `KEY=value', `KEY: value', `export KEY=value' where
+    ;; the KEY contains TOKEN/SECRET/PASSWORD/KEY/API/AUTH/PWD.
+    "\\b\\(?:[A-Z_][A-Z0-9_]*\\(?:TOKEN\\|SECRET\\|PASSWORD\\|API[_-]?KEY\\|AUTH\\|PWD\\|PASSWD\\|PRIVATE[_-]?KEY\\)\\)\\b\\s-*[:=]\\s-*['\"]?\\([^'\"\n[:space:]]\\{6,\\}\\)"
+    ;; OpenAI / Anthropic style key prefixes with at least 16 trailing chars.
+    "\\b\\(sk-[A-Za-z0-9_-]\\{16,\\}\\)"
+    "\\b\\(sk-ant-[A-Za-z0-9_-]\\{16,\\}\\)"
+    ;; GitHub token prefixes (ghp_ / gho_ / ghu_ / ghs_ / ghr_).
+    "\\b\\(gh[pousr]_[A-Za-z0-9]\\{20,\\}\\)"
+    ;; AWS access key id (must be exactly 20 chars per AWS docs).
+    "\\b\\(AKIA[0-9A-Z]\\{16\\}\\)"
+    ;; PEM-style private-key block start markers.
+    "\\(-----BEGIN \\(?:RSA \\|OPENSSH \\|EC \\|DSA \\|PGP \\)?PRIVATE KEY-----\\)")
+  "Regex catalogue for `anvil-extend--scan-secrets'.
+
+Each entry has at least one capture group — the first capture is
+treated as the actual secret payload that gets redacted.  Patterns
+are deliberately conservative (long minimum length, well-known
+prefixes) to keep false-positive noise low; users can extend
+suppression via `anvil-extend-secret-scan-allow-patterns'.
+
+Per Doc 38 §3.D D11 — anvil-dev's gitleaks scanner is an external
+binary (`anvil-dev--audit-scan-secrets'), so this in-process
+catalogue lets the SDK redact rationale text on machines that do
+not have gitleaks installed.")
+
+(defun anvil-extend--ensure-rationale-storage ()
+  "Create `anvil-extend-rationale-storage-dir' if absent.
+Returns its expanded absolute path with a trailing slash."
+  (let ((dir (file-name-as-directory
+              (expand-file-name anvil-extend-rationale-storage-dir))))
+    (unless (file-directory-p dir)
+      (make-directory dir t))
+    dir))
+
+(defun anvil-extend--rationale-path (name)
+  "Return the absolute path of the rationale Markdown file for NAME.
+
+The path lives under `anvil-extend-rationale-storage-dir' and
+follows the `extend_<NAME>.md' convention so
+`anvil-memory--infer-type' classifies it as `memo'."
+  (let ((dir (anvil-extend--ensure-rationale-storage)))
+    (expand-file-name (concat anvil-extend--rationale-file-prefix
+                              (symbol-name name)
+                              ".md")
+                      dir)))
+
+(defun anvil-extend--allow-line-p (line)
+  "Return non-nil when LINE matches a user whitelist regexp.
+
+Whitelist comes from `anvil-extend-secret-scan-allow-patterns'.
+A non-nil return suppresses redaction of LINE."
+  (cl-some (lambda (re)
+             (and (stringp re)
+                  (string-match-p re line)))
+           anvil-extend-secret-scan-allow-patterns))
+
+(defun anvil-extend--scan-secrets (text)
+  "Return a list of plists describing secret-like fragments in TEXT.
+
+Each plist has the form:
+  (:line LINE-NUMBER :rule INDEX :match RAW-MATCH :replacement REDACTED).
+
+LINE-NUMBER is 1-based.  INDEX identifies which entry of
+`anvil-extend--secret-patterns' fired (so future allow-by-rule
+rules can target it).  RAW-MATCH is the substring that the
+catalogue regex captured; REDACTED is what
+`anvil-extend--redact-secrets' will swap in.  Lines matching
+`anvil-extend-secret-scan-allow-patterns' are skipped.
+
+The scanner is regex-only, never shells out, and ignores binary
+input that does not contain newlines (Doc 38 §3.D D11 — degrades
+gracefully when text contains no candidates)."
+  (let ((findings nil)
+        (rule-idx 0))
+    (when (and (stringp text) (not (string-empty-p text)))
+      (dolist (pat anvil-extend--secret-patterns)
+        (let ((start 0))
+          (while (and (< start (length text))
+                      (string-match pat text start))
+            (let* ((full   (match-string 0 text))
+                   (group  (or (match-string 1 text) full))
+                   (m-end  (match-end 0))
+                   ;; Compute 1-based line of the match start.
+                   (line-num
+                    (1+ (cl-count ?\n text :end (match-beginning 0))))
+                   ;; Carve out the matched line itself for the
+                   ;; whitelist consultation.
+                   (line-start
+                    (or (cl-position ?\n text :end (match-beginning 0)
+                                     :from-end t)
+                        -1))
+                   (line-start (1+ line-start))
+                   (line-end
+                    (or (cl-position ?\n text :start (match-beginning 0))
+                        (length text)))
+                   (line (substring text line-start line-end)))
+              (unless (anvil-extend--allow-line-p line)
+                (push (list :line line-num
+                            :rule rule-idx
+                            :match group
+                            :replacement
+                            (anvil-extend--redaction-for group))
+                      findings))
+              (setq start (max m-end (1+ start))))))
+        (setq rule-idx (1+ rule-idx))))
+    (nreverse findings)))
+
+(defun anvil-extend--redaction-for (raw)
+  "Return the redacted form of RAW.
+
+Preserves the first 4-6 chars (so a session log retains the
+prefix `sk-' / `ghp_' / etc.  for diagnosis) and replaces the
+rest with the literal `[REDACTED]' marker.  Short matches
+(< 8 chars) are wholly replaced because the prefix would leak
+the full secret."
+  (let* ((s (or raw "")))
+    (cond
+     ((< (length s) 8) "[REDACTED]")
+     ((string-match "\\`\\(sk-ant-\\|sk-\\|ghp_\\|gho_\\|ghu_\\|ghs_\\|ghr_\\|AKIA\\)" s)
+      (concat (match-string 0 s) "[REDACTED]"))
+     ((string-prefix-p "-----BEGIN" s) "-----BEGIN [REDACTED] PRIVATE KEY-----")
+     (t (concat (substring s 0 (min 4 (length s))) "[REDACTED]")))))
+
+(defun anvil-extend--redact-secrets (text)
+  "Return TEXT with every match of `anvil-extend--secret-patterns' redacted.
+
+Returns a cons (REDACTED-TEXT . FINDINGS) where FINDINGS is the
+list of plists produced by `anvil-extend--scan-secrets' so the
+caller can surface the count to the user.  Empty / nil TEXT
+returns (\"\" . nil)."
+  (if (or (null text) (string-empty-p text))
+      (cons "" nil)
+    (let* ((findings (anvil-extend--scan-secrets text))
+           ;; Apply replacements longest-match-first so a partial
+           ;; replacement does not corrupt a longer match.
+           (sorted (cl-sort (copy-sequence findings) #'>
+                            :key (lambda (f) (length (plist-get f :match)))))
+           (out text))
+      (dolist (f sorted)
+        (let ((m (plist-get f :match))
+              (r (plist-get f :replacement)))
+          (when (and (stringp m) (not (string-empty-p m)) (stringp r))
+            (setq out (replace-regexp-in-string
+                       (regexp-quote m) r out t t)))))
+      (cons out findings))))
+
+(defun anvil-extend--read-file-utf8 (path)
+  "Return the UTF-8 contents of PATH, or nil when the file is missing."
+  (when (file-exists-p path)
+    (with-temp-buffer
+      (let ((coding-system-for-read 'utf-8))
+        (insert-file-contents path))
+      (buffer-substring-no-properties (point-min) (point-max)))))
+
+(defun anvil-extend--write-file-utf8 (path content)
+  "Write CONTENT to PATH atomically using utf-8-unix coding."
+  (let ((coding-system-for-write 'utf-8-unix))
+    (with-temp-file path
+      (insert content))))
+
+(defun anvil-extend--current-version (path)
+  "Return the latest version integer recorded in rationale PATH, or 0."
+  (let ((text (anvil-extend--read-file-utf8 path))
+        (ver 0))
+    (when text
+      (let ((start 0))
+        (while (string-match anvil-extend--rationale-version-regexp text start)
+          (let ((n (string-to-number (match-string 1 text))))
+            (when (> n ver) (setq ver n)))
+          (setq start (match-end 0)))))
+    ver))
+
+(defun anvil-extend--next-version (path)
+  "Return 1 for a new rationale file, otherwise current + 1."
+  (let ((cur (anvil-extend--current-version path)))
+    (1+ cur)))
+
+(cl-defun anvil-extend--render-rationale-header
+    (name version &key purpose use-case author tags
+          policy related-tools registry-kind requires
+          body-excerpt)
+  "Produce the Markdown header block for a rationale entry.
+
+See Doc 38 §3.D for the canonical layout.  All fields are passed
+through `anvil-extend--redact-secrets' before they land in the
+buffer, so no caller can sneak a secret past the scanner."
+  (let* ((iso (format-time-string "%Y-%m-%dT%H:%M:%S%z"))
+         (taglist (cond
+                   ((null tags) "")
+                   ((listp tags)
+                    (mapconcat (lambda (x)
+                                 (cond ((symbolp x) (symbol-name x))
+                                       ((stringp x) x)
+                                       (t (format "%S" x))))
+                               tags ", "))
+                   (t (format "%S" tags))))
+         (rel-tools (cond
+                     ((null related-tools) "")
+                     ((listp related-tools)
+                      (mapconcat (lambda (x)
+                                   (cond ((symbolp x) (symbol-name x))
+                                         ((stringp x) x)
+                                         (t (format "%S" x))))
+                                 related-tools ", "))
+                     (t (format "%S" related-tools))))
+         (req-list (cond
+                    ((null requires) "")
+                    ((listp requires)
+                     (mapconcat (lambda (x)
+                                  (cond ((symbolp x) (symbol-name x))
+                                        ((stringp x) x)
+                                        (t (format "%S" x))))
+                                requires ", "))
+                    (t (format "%S" requires))))
+         (kind (or registry-kind
+                   anvil-extend-rationale-default-registry-kind))
+         (body-clip (when body-excerpt
+                      (let* ((lines (split-string body-excerpt "\n"))
+                             (head (seq-take lines 30)))
+                        (mapconcat #'identity head "\n")))))
+    (format "# extend-%s rationale (v%d)
+
+- created-at: %s
+- created-by-session: %s
+- registry-kind: %s
+- description: %s
+- use-case: %s
+- related-tools: %s
+- policy: %s
+- requires: %s
+- tags: %s
+- body excerpt: %s
+
+## change-log
+"
+            (symbol-name name)
+            version
+            iso
+            (or author "claude")
+            (symbol-name kind)
+            (or purpose "")
+            (or use-case "")
+            rel-tools
+            (or policy "safe")
+            req-list
+            taglist
+            (or body-clip ""))))
+
+(defun anvil-extend--render-change-log-line
+    (version &optional summary)
+  "Produce the change-log entry for VERSION (an integer).
+SUMMARY is a free-form one-line summary of the change."
+  (let ((date (format-time-string "%Y-%m-%d")))
+    (format "- v%d: %s %s\n"
+            version
+            date
+            (or summary
+                (if (= version 1) "initial record" "rationale updated")))))
+
+;;;###autoload
+(cl-defun anvil-extend-record-rationale
+    (name &key purpose use-case author tags
+          policy related-tools registry-kind requires
+          version body-excerpt change-summary)
+  "Record (or extend) the rationale Markdown for extension NAME.
+
+The file lives under `anvil-extend-rationale-storage-dir' and
+follows the layout in Doc 38 §3.D — a header block carrying the
+LOCKED keys plus a `## change-log' tail that grows by one line on
+every re-record.
+
+Keyword arguments:
+  PURPOSE         — 1-line summary of why this tool exists (`description').
+  USE-CASE        — expected scenario / when to invoke.
+  AUTHOR          — string identifying the recorder (default `claude').
+  TAGS            — list of symbols / strings used by `anvil-memory-search'.
+  POLICY          — `safe' | `shell-allowed' | `network-allowed' |
+                    `unrestricted' (defaults to `safe').
+  RELATED-TOOLS   — list of MCP tool ids the session considered.
+  REGISTRY-KIND   — `ephemeral' | `permanent' (defaults from
+                    `anvil-extend-rationale-default-registry-kind').
+  REQUIRES        — package list (permanent only).
+  VERSION         — override the auto-bumped version.  Mostly for tests.
+  BODY-EXCERPT    — first 30 lines of the function body; redacted.
+  CHANGE-SUMMARY  — single-line summary appended to `## change-log'.
+
+All free-form fields (PURPOSE / USE-CASE / RELATED-TOOLS /
+BODY-EXCERPT) are filtered through `anvil-extend--redact-secrets'
+before they hit disk so a careless `:body-excerpt' containing a
+PEM block or `OPENAI_API_KEY=…' line is redacted in place.
+
+Returns a plist:
+  (:status :recorded
+   :name NAME
+   :file PATH
+   :version N
+   :redactions COUNT)
+
+When NAME has no prior rationale, a fresh file is written with
+`v1'.  Otherwise the existing file is preserved and a new
+`# extend-<NAME> rationale (v<N+1>)' header is appended along with
+a `## change-log' entry — older versions are never overwritten,
+matching Doc 38 §3.D's `change-log' rule."
+  (anvil-extend--check-name name)
+  (let* ((path     (anvil-extend--rationale-path name))
+         (existing (anvil-extend--read-file-utf8 path))
+         (next-ver (or version (anvil-extend--next-version path)))
+         (redact-payload
+          (mapconcat (lambda (s) (or s ""))
+                     (list purpose
+                           use-case
+                           (cond ((null related-tools) "")
+                                 ((listp related-tools)
+                                  (mapconcat (lambda (x)
+                                               (cond ((symbolp x) (symbol-name x))
+                                                     ((stringp x) x)
+                                                     (t (format "%S" x))))
+                                             related-tools ", "))
+                                 (t (format "%S" related-tools)))
+                           body-excerpt)
+                     "\n"))
+         (scanned (anvil-extend--redact-secrets redact-payload))
+         (redactions (length (cdr scanned)))
+         ;; Re-split the redacted payload back into the original
+         ;; field positions so each field is individually redacted.
+         (parts (split-string (car scanned) "\n" nil))
+         (red-purpose      (nth 0 parts))
+         (red-use-case     (nth 1 parts))
+         (red-related-text (nth 2 parts))
+         (red-body-excerpt (nth 3 parts))
+         (related-list-redacted
+          (when (and red-related-text (not (string-empty-p red-related-text)))
+            (mapcar #'string-trim (split-string red-related-text ","))))
+         (header
+          (anvil-extend--render-rationale-header
+           name next-ver
+           :purpose red-purpose
+           :use-case red-use-case
+           :author author
+           :tags tags
+           :policy policy
+           :related-tools (or related-list-redacted related-tools)
+           :registry-kind registry-kind
+           :requires requires
+           :body-excerpt red-body-excerpt))
+         (change-line
+          (anvil-extend--render-change-log-line next-ver change-summary))
+         (final
+          (cond
+           ((null existing)
+            (concat header change-line))
+           (t
+            ;; Append a new header + change-log line.  Two leading
+            ;; blank lines visually separate the new version from
+            ;; the previous trailing change-log entry.
+            (concat existing
+                    (if (string-suffix-p "\n\n" existing) "" "\n\n")
+                    header change-line)))))
+    (anvil-extend--write-file-utf8 path final)
+    (list :status :recorded
+          :name name
+          :file path
+          :version next-ver
+          :redactions redactions)))
+
+;;;###autoload
+(defun anvil-extend-recall-rationale (name)
+  "Read NAME's latest rationale entry and return a plist.
+
+Returns nil when no rationale was ever recorded for NAME.
+Otherwise the plist carries:
+  (:name NAME
+   :file PATH
+   :version LATEST-N
+   :purpose STRING-OR-NIL
+   :use-case STRING-OR-NIL
+   :author STRING-OR-NIL
+   :registry-kind SYMBOL-OR-NIL
+   :policy STRING-OR-NIL
+   :related-tools LIST-OF-STRINGS
+   :requires LIST-OF-STRINGS
+   :tags LIST-OF-STRINGS
+   :body-excerpt STRING-OR-NIL
+   :created STRING-OR-NIL)
+
+Only the *latest* version section is parsed; older versions live
+in the file but are intentionally not surfaced via the recall API
+(callers that need history can read the file directly)."
+  (anvil-extend--check-name name)
+  (let* ((path (anvil-extend--rationale-path name))
+         (text (anvil-extend--read-file-utf8 path)))
+    (when text
+      (let* ((ver (anvil-extend--current-version path))
+             (header-re (format "^# extend-%s rationale (v%d)\n"
+                                (regexp-quote (symbol-name name))
+                                ver))
+             (start (and (string-match header-re text)
+                         (match-end 0)))
+             (rest (and start (substring text start)))
+             (next-header-re "^# extend-[^\n]+ rationale (v[0-9]+)$")
+             (end (and rest
+                       (if (string-match next-header-re rest)
+                           (match-beginning 0)
+                         (length rest))))
+             (section (and rest (substring rest 0 end))))
+        (when section
+          (let ((field
+                 (lambda (key)
+                   (when (string-match
+                          (format "^- %s: \\(.*\\)$" (regexp-quote key))
+                          section)
+                     (let ((v (string-trim (match-string 1 section))))
+                       (and (not (string-empty-p v)) v)))))
+                (split-list
+                 (lambda (s)
+                   (when (and s (not (string-empty-p s)))
+                     (mapcar #'string-trim (split-string s ","))))))
+            (list :name name
+                  :file path
+                  :version ver
+                  :purpose       (funcall field "description")
+                  :use-case      (funcall field "use-case")
+                  :author        (funcall field "created-by-session")
+                  :registry-kind (let ((k (funcall field "registry-kind")))
+                                   (and k (intern k)))
+                  :policy        (funcall field "policy")
+                  :related-tools (funcall split-list
+                                          (funcall field "related-tools"))
+                  :requires      (funcall split-list
+                                          (funcall field "requires"))
+                  :tags          (funcall split-list
+                                          (let ((tag-line
+                                                 (and (string-match
+                                                       "^- tags: \\(.*\\)$"
+                                                       section)
+                                                      (string-trim
+                                                       (match-string 1 section)))))
+                                            tag-line))
+                  :body-excerpt  (funcall field "body excerpt")
+                  :created       (funcall field "created-at"))))))))
+
+;;;###autoload
+(defun anvil-extend-list-rationales ()
+  "Return a list of plists describing every rationale on disk.
+
+Each plist:
+  (:name SYMBOL :purpose-summary STRING :version INT :file PATH).
+
+The directory is scanned for `extend_*.md' files and each is
+parsed for its latest version + description.  Files that are
+unreadable or whose header is malformed are skipped silently so
+a single bad file does not poison the listing."
+  (let* ((dir (file-name-as-directory
+               (expand-file-name anvil-extend-rationale-storage-dir))))
+    (if (not (file-directory-p dir))
+        nil
+      (let* ((files (directory-files
+                     dir t (concat "\\`"
+                                   (regexp-quote
+                                    anvil-extend--rationale-file-prefix)
+                                   ".+\\.md\\'")
+                     t))
+             rows)
+        (dolist (path files)
+          (let* ((base (file-name-base path))
+                 (name-str
+                  (substring base
+                             (length anvil-extend--rationale-file-prefix)))
+                 (sym (intern name-str))
+                 (recall (ignore-errors
+                           (anvil-extend-recall-rationale sym))))
+            (when recall
+              (push (list :name sym
+                          :purpose-summary (or (plist-get recall :purpose)
+                                               "")
+                          :version (plist-get recall :version)
+                          :file (plist-get recall :file))
+                    rows))))
+        (sort rows
+              (lambda (a b)
+                (string< (symbol-name (plist-get a :name))
+                         (symbol-name (plist-get b :name)))))))))
+
+;;;; --- Phase D: scaffold auto-hook ---------------------------------------
 
 ;; Forward declarations to silence the byte-compiler when anvil-server
 ;; is not on `load-path' at compile time (e.g. running ERT in a fresh
@@ -1245,6 +1846,90 @@ string \"nil\" when FORM passes the active policy."
    (let* ((parsed (anvil-extend--coerce-form form))
           (hits (anvil-extend-scan-dangerous-forms parsed)))
      (format "%S" hits))))
+(defun anvil-extend--coerce-list-of-strings (val)
+  "Coerce VAL into a list of strings.
+Accepts nil, a single string, a list of strings/symbols, or a
+comma-separated string.  Used by Phase D MCP wrappers so JSON
+clients can pass a string instead of an Elisp list."
+  (cond
+   ((null val) nil)
+   ((symbolp val) (list (symbol-name val)))
+   ((stringp val)
+    (mapcar #'string-trim (split-string val "," t)))
+   ((listp val)
+    (mapcar (lambda (x)
+              (cond ((symbolp x) (symbol-name x))
+                    ((stringp x) x)
+                    (t (format "%S" x))))
+            val))
+   (t (list (format "%S" val)))))
+
+(defun anvil-extend--tool-record-rationale
+    (name &optional purpose use-case author tags
+          policy related-tools registry-kind)
+  "MCP wrapper for `anvil-extend-record-rationale'.
+
+MCP Parameters:
+  name - extension name (string or symbol; lowercase + hyphens)
+  purpose - 1-line summary of why the tool was created
+  use-case - expected scenario / when to invoke
+  author - free-form author string (default `claude')
+  tags - list of tag strings (or comma-separated string)
+  policy - safe | shell-allowed | network-allowed | unrestricted
+  related-tools - list of MCP tool ids the session considered
+  registry-kind - ephemeral | permanent
+
+Returns the printed plist returned by
+`anvil-extend-record-rationale' (`:status :recorded ...').  All
+free-form fields are filtered through `anvil-extend--redact-secrets'
+before they hit disk."
+  (anvil-server-with-error-handling
+   (let* ((sym  (anvil-extend--coerce-name name))
+          (rk   (cond
+                 ((null registry-kind) nil)
+                 ((symbolp registry-kind) registry-kind)
+                 ((stringp registry-kind) (intern registry-kind))
+                 (t nil)))
+          (pol  (cond
+                 ((null policy) nil)
+                 ((symbolp policy) (symbol-name policy))
+                 ((stringp policy) policy)
+                 (t nil)))
+          (result (anvil-extend-record-rationale
+                   sym
+                   :purpose purpose
+                   :use-case use-case
+                   :author author
+                   :tags (anvil-extend--coerce-list-of-strings tags)
+                   :policy pol
+                   :related-tools
+                   (anvil-extend--coerce-list-of-strings related-tools)
+                   :registry-kind rk)))
+     (format "%S" result))))
+
+(defun anvil-extend--tool-recall-rationale (name)
+  "MCP wrapper for `anvil-extend-recall-rationale'.
+
+MCP Parameters:
+  name - extension name (string or symbol; lowercase + hyphens)
+
+Returns the printed plist describing NAME's latest rationale, or
+the literal string `nil' when no rationale was ever recorded."
+  (anvil-server-with-error-handling
+   (let* ((sym (anvil-extend--coerce-name name))
+          (result (anvil-extend-recall-rationale sym)))
+     (format "%S" result))))
+
+(defun anvil-extend--tool-list-rationales ()
+  "MCP wrapper for `anvil-extend-list-rationales'.
+
+MCP Parameters: (none)
+
+Returns a printed list of plists `(:name :purpose-summary
+:version :file)', one per rationale Markdown file under
+`anvil-extend-rationale-storage-dir'."
+  (anvil-server-with-error-handling
+   (format "%S" (anvil-extend-list-rationales))))
 
 ;;;; --- module lifecycle ---------------------------------------------------
 
@@ -1254,10 +1939,13 @@ string \"nil\" when FORM passes the active policy."
 
 Phase A registers `anvil-extend-scaffold'.  Phase B adds
 `anvil-extend-reload' (transactional hot-reload after edit) and
-`anvil-extend-watch' (auto-reload on file change).  `load' /
-`test' / `list' / `remove' / `reload-all' / `unwatch' /
-`watch-all' stay function-only because they are typically driven
-interactively while iterating on the generated source."
+`anvil-extend-watch' (auto-reload on file change).  Phase D adds
+`anvil-extend-record-rationale' / `anvil-extend-recall-rationale'
+/ `anvil-extend-list-rationales' so the Markdown rationale store
+is reachable from the MCP surface.  `load' / `test' / `list' /
+`remove' / `reload-all' / `unwatch' / `watch-all' stay
+function-only because they are typically driven interactively
+while iterating on the generated source."
   (interactive)
   (require 'anvil-server)
   (anvil-server-register-tool
@@ -1328,7 +2016,47 @@ enforcement is the future Phase v1 (Doc 38 §3.C.v1 / §6).")
 Returns a list of `(:form ... :reason CLASS)' hits (CLASS is one
 of `:shell', `:fileio', `:network'), or nil if FORM only uses
 callables that the active policy allows.  Pure read-only — no
-subprocess hop, no host-side eval.  Phase C v0 of Doc 38 §3.C."))
+subprocess hop, no host-side eval.  Phase C v0 of Doc 38 §3.C.")
+  (anvil-server-register-tool
+   #'anvil-extend--tool-record-rationale
+   :id "anvil-extend-record-rationale"
+   :intent '(extend rationale memory record)
+   :layer 'experimental
+   :stability 'experimental
+   :server-id anvil-extend-server-id
+   :description
+   "Record (or extend) the rationale Markdown file for an extension.
+Stores `purpose' / `use-case' / `author' / `tags' / `policy' /
+`related-tools' / `registry-kind' under
+`anvil-extend-rationale-storage-dir' so a future Claude session
+can reach the reasoning via `anvil-memory-search'.  Free-form
+fields are filtered through a regex secret scanner before they
+hit disk (Phase D of Doc 38 §3.D LOCKED v2).")
+  (anvil-server-register-tool
+   #'anvil-extend--tool-recall-rationale
+   :id "anvil-extend-recall-rationale"
+   :intent '(extend rationale memory recall)
+   :layer 'experimental
+   :stability 'experimental
+   :server-id anvil-extend-server-id
+   :description
+   "Read the latest rationale entry for an extension.
+Returns a plist with `:purpose' / `:use-case' / `:author' /
+`:tags' / `:related-tools' / `:registry-kind' / `:policy' /
+`:body-excerpt' / `:created' / `:version', or nil when no
+rationale was ever recorded.  Older versions live in the file
+but are not surfaced via this API (Phase D of Doc 38 §3.D).")
+  (anvil-server-register-tool
+   #'anvil-extend--tool-list-rationales
+   :id "anvil-extend-list-rationales"
+   :intent '(extend rationale memory list)
+   :layer 'experimental
+   :stability 'experimental
+   :server-id anvil-extend-server-id
+   :description
+   "Enumerate every rationale file under storage as a list of plists.
+Each entry: `(:name :purpose-summary :version :file)'.  Files
+that fail to parse are skipped silently (Phase D of Doc 38 §3.D)."))
 
 (defun anvil-extend-disable ()
   "Unregister anvil-extend's MCP tools."
@@ -1338,7 +2066,10 @@ subprocess hop, no host-side eval.  Phase C v0 of Doc 38 §3.C."))
                   "anvil-extend-reload"
                   "anvil-extend-watch"
                   "anvil-extend-eval-sandboxed"
-                  "anvil-extend-scan-dangerous-forms"))
+                  "anvil-extend-scan-dangerous-forms"
+                  "anvil-extend-record-rationale"
+                  "anvil-extend-recall-rationale"
+                  "anvil-extend-list-rationales"))
       (ignore-errors
         (anvil-server-unregister-tool id anvil-extend-server-id)))))
 
