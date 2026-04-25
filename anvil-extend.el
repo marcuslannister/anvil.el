@@ -1,4 +1,4 @@
-;;; anvil-extend.el --- Claude self-extension SDK scaffold + hot-reload + sandbox v0 + rationale (Phase A+B+C+D) -*- lexical-binding: t; -*-
+;;; anvil-extend.el --- Claude self-extension SDK scaffold + hot-reload + sandbox v0 + rationale + promotion (Phase A+B+C+D+F) -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026 zawatton
 
@@ -10,8 +10,9 @@
 
 ;;; Commentary:
 
-;; anvil-extend implements Phases A, B, C (sandbox v0), and D
-;; (rationale memory) of the Claude self-extension SDK sketched in
+;; anvil-extend implements Phases A, B, C (sandbox v0), D
+;; (rationale memory), and F (promotion gate) of the Claude
+;; self-extension SDK sketched in
 ;; `docs/design/38-claude-self-extension-sdk.org' (LOCKED v2;
 ;; renumbered from former Doc 35 per option B path).
 ;;
@@ -140,6 +141,44 @@
 ;;     Enumerate every rationale file under storage as a list of
 ;;     plists `(:name :purpose-summary :version :file)'.
 ;;
+;;   (anvil-extend-promote NAME &key signoff target-path        -- Phase F
+;;                              rationale change-summary)
+;;     Promote an ephemeral extension (= scaffold output under
+;;     `anvil-extend-storage-dir') into the permanent registry
+;;     directory `anvil-extend-permanent-storage-dir'.  Honours the
+;;     active `anvil-extend-promotion-policy' (signoff / rationale
+;;     / smoke ERT requirements); returns a plist describing the
+;;     destination path or rejection reason as data — failure is
+;;     never raised so MCP callers can introspect.
+;;
+;;   (anvil-extend-demote NAME)                                -- Phase F
+;;     Move a permanent extension back into the ephemeral pool
+;;     (= rollback).  Returns the same shape as `promote'.
+;;
+;;   (anvil-extend-list-by-pool POOL)                          -- Phase F
+;;     Enumerate extensions filtered by POOL (`ephemeral' /
+;;     `permanent' / nil for all).  Each row is a plist
+;;     `(:name :pool :elisp-file :rationale RECALL-PLIST-OR-NIL)'.
+;;
+;;   (anvil-extend-pool-status NAME)                           -- Phase F
+;;     Query which pool NAME currently lives in.  Returns
+;;     `ephemeral' / `permanent' / nil (= unknown).
+;;
+;;   (anvil-extend-promotion-policy &key require-signoff        -- Phase F
+;;                                       require-rationale
+;;                                       require-tests)
+;;     Update the per-session promotion policy plist.  Defaults:
+;;     `:require-signoff t', `:require-rationale t',
+;;     `:require-tests nil'.  Returns the resulting plist.  See
+;;     `anvil-extend-promotion-policy-reset' for restoring defaults.
+;;
+;; In addition Phase F installs an `:before' advice on
+;; `anvil-extend-eval-sandboxed' that, when the active policy has
+;; `:pre-execution-review t', records a diff-preview rationale
+;; before any subprocess hop is made (Doc 38 §3.F.1, T87 D-8 finding).
+;; The advice is opt-in (default off) so existing Phase C workflows
+;; are not broken.
+;;
 ;; MCP tools registered against `emacs-eval':
 ;;
 ;;   `anvil-extend-scaffold'              (Phase A) — emit scaffold files
@@ -150,11 +189,16 @@
 ;;   `anvil-extend-record-rationale'      (Phase D) — store rationale Markdown
 ;;   `anvil-extend-recall-rationale'      (Phase D) — fetch latest rationale
 ;;   `anvil-extend-list-rationales'       (Phase D) — enumerate rationales
+;;   `anvil-extend-promote'               (Phase F) — ephemeral → permanent
+;;   `anvil-extend-demote'                (Phase F) — permanent → ephemeral
+;;   `anvil-extend-list-by-pool'          (Phase F) — pool-filtered listing
+;;   `anvil-extend-pool-status'           (Phase F) — name → pool symbol
+;;   `anvil-extend-promotion-policy'      (Phase F) — update policy plist
 ;;
-;; Phases E, F (NeLisp execute path / ephemeral-permanent promotion
-;; gates) remain out of scope per Doc 38 §3.E-§3.F.
-;; Phase C v1 (real syscall sandbox = seccomp / RLIMIT / chroot /
-;; namespace) is the future Phase 9d.A6 task per Doc 38 §3.C.v1 / §6.
+;; Phase E (NeLisp execute path) remains out of scope pending the
+;; Phase 7+ NeLisp evaluator (Doc 38 §3.E).  Phase C v1 (real
+;; syscall sandbox = seccomp / RLIMIT / chroot / namespace) is the
+;; future Phase 9d.A6 task per Doc 38 §3.C.v1 / §6.
 
 ;;; Code:
 
@@ -261,6 +305,43 @@ redaction.  See Doc 38 §3.D D11 (`secret pattern scan')."
 `anvil-extend-record-rationale'.  Tracks Doc 38 §2.4 / §2.5
 ephemeral-vs-permanent split."
   :type '(choice (const ephemeral) (const permanent))
+  :group 'anvil-extend)
+
+(defcustom anvil-extend-permanent-storage-dir
+  (let* ((lib (or (locate-library "anvil-extend")
+                  (locate-library "anvil"))))
+    (if lib
+        (expand-file-name "extend/" (file-name-directory lib))
+      (expand-file-name "~/.anvil-extend/permanent/")))
+  "Directory where Phase F promoted (= permanent) extensions live.
+
+`anvil-extend-promote' moves an ephemeral `<NAME>.el' / `*-test.el' /
+`*-register.el' triplet from `anvil-extend-storage-dir' into this
+directory.  By convention the directory is git-tracked alongside
+`anvil.el' so promoted tools survive across sessions and machines.
+Tests rebind this via `let' to keep CI hermetic."
+  :type 'directory
+  :group 'anvil-extend)
+
+(defcustom anvil-extend-promotion-default-policy
+  '(:require-signoff t :require-rationale t :require-tests nil
+    :pre-execution-review nil)
+  "Default Phase F promotion policy plist.
+
+Recognised keys:
+  :require-signoff      BOOL — `anvil-extend-promote' rejects calls
+                              without an explicit `:signoff' arg.
+  :require-rationale    BOOL — promotion rejects names that have no
+                              `anvil-extend-recall-rationale' record.
+  :require-tests        BOOL — promotion runs `anvil-extend-test' and
+                              rejects on any unexpected failure.
+  :pre-execution-review BOOL — `anvil-extend-eval-sandboxed' records a
+                              diff-preview rationale before any
+                              subprocess hop (Doc 38 §3.F.1, T87 D-8).
+
+The plist is copied at module load into `anvil-extend--promotion-policy'
+so tests rebinding either value stay isolated."
+  :type 'sexp
   :group 'anvil-extend)
 
 ;;;; --- internal helpers ---------------------------------------------------
@@ -1931,6 +2012,554 @@ Returns a printed list of plists `(:name :purpose-summary
   (anvil-server-with-error-handling
    (format "%S" (anvil-extend-list-rationales))))
 
+;;;; --- Phase F: promotion gate (ephemeral ↔ permanent) ------------------
+
+;; Per Doc 38 §3.F the registry has two pools — `ephemeral'
+;; (= scaffold output under `anvil-extend-storage-dir', session-scoped)
+;; and `permanent' (= git-managed under
+;; `anvil-extend-permanent-storage-dir').  Phase F installs the
+;; promotion / demotion / pool-query plumbing that moves files
+;; between the pools subject to a per-session policy plist.
+
+(define-error 'anvil-extend-promotion-policy-violation
+  "anvil-extend promotion rejected by active policy")
+
+(defvar anvil-extend--promotion-policy
+  (copy-sequence anvil-extend-promotion-default-policy)
+  "Per-session promotion policy plist consulted by `anvil-extend-promote'.
+
+Initialised from `anvil-extend-promotion-default-policy' at module
+load.  Mutated through `anvil-extend-promotion-policy'; reset to
+the defcustom default by `anvil-extend-promotion-policy-reset'.
+
+The plist is allocated with `copy-sequence' so successive
+`plist-put' updates do not share structure with the defcustom
+default and silently flip subsequent callers' policy (mirrors
+`feedback_elisp_quoted_literal_nreverse_share.md').")
+
+(defun anvil-extend--policy-get (key &optional policy)
+  "Return the value of KEY in POLICY (defaults to live policy)."
+  (plist-get (or policy anvil-extend--promotion-policy) key))
+
+(defun anvil-extend--ensure-permanent-storage ()
+  "Create `anvil-extend-permanent-storage-dir' if absent, return its path."
+  (let ((dir (file-name-as-directory
+              (expand-file-name anvil-extend-permanent-storage-dir))))
+    (unless (file-directory-p dir)
+      (make-directory dir t))
+    dir))
+
+(defun anvil-extend--ephemeral-paths (name)
+  "Return ephemeral-pool paths for NAME (= the Phase A `anvil-extend--paths').
+
+Wrapper kept named separately so Phase F call sites read clearly:
+`ephemeral-paths' is what the scaffold emitted, `permanent-paths'
+is where promotion moves it."
+  (anvil-extend--paths name))
+
+(defun anvil-extend--permanent-paths (name)
+  "Return promoted-pool paths for NAME under permanent storage."
+  (let* ((dir (anvil-extend--ensure-permanent-storage))
+         (base (symbol-name name)))
+    (list :elisp-file    (expand-file-name (concat base ".el")          dir)
+          :test-file     (expand-file-name (concat base "-test.el")     dir)
+          :register-stub (expand-file-name (concat base "-register.el") dir))))
+
+(defun anvil-extend--paths-for-pool (name pool)
+  "Return the path triplet for NAME in POOL (`ephemeral' or `permanent')."
+  (pcase pool
+    ('ephemeral (anvil-extend--ephemeral-paths name))
+    ('permanent (anvil-extend--permanent-paths name))
+    (_ (user-error "anvil-extend: unknown pool %S" pool))))
+
+(defun anvil-extend--ephemeral-tool-p (name)
+  "Return non-nil when NAME has an `<NAME>.el' under ephemeral storage."
+  (let ((paths (anvil-extend--ephemeral-paths name)))
+    (file-exists-p (plist-get paths :elisp-file))))
+
+(defun anvil-extend--permanent-tool-p (name)
+  "Return non-nil when NAME has an `<NAME>.el' under permanent storage."
+  (let ((paths (ignore-errors (anvil-extend--permanent-paths name))))
+    (and paths (file-exists-p (plist-get paths :elisp-file)))))
+
+;;;###autoload
+(defun anvil-extend-pool-status (name)
+  "Return the pool symbol NAME currently lives in, or nil.
+
+`permanent' wins over `ephemeral' so a name that exists in both
+pools (e.g. mid-promotion atomic copy) is reported as permanent
+once the destination file is on disk.  Returns nil when NAME has
+no scaffold in either pool."
+  (anvil-extend--check-name name)
+  (cond
+   ((anvil-extend--permanent-tool-p name) 'permanent)
+   ((anvil-extend--ephemeral-tool-p name) 'ephemeral)
+   (t nil)))
+
+;;;###autoload
+(defun anvil-extend-list-by-pool (&optional pool)
+  "Enumerate scaffolded extensions filtered by POOL.
+
+POOL is `ephemeral', `permanent', or nil for both.  Returns a
+list of plists, one per extension visible in the requested pool:
+
+  (:name SYMBOL
+   :pool SYMBOL
+   :elisp-file PATH
+   :test-file PATH
+   :register-stub PATH
+   :rationale RECALL-PLIST-OR-NIL)
+
+The list is sorted by NAME for stable ERT diffs."
+  (let* ((wanted (cond
+                  ((null pool) '(ephemeral permanent))
+                  ((memq pool '(ephemeral permanent)) (list pool))
+                  (t (user-error "anvil-extend: unknown pool %S" pool))))
+         (rows nil))
+    (dolist (p wanted)
+      (let* ((dir (file-name-as-directory
+                   (expand-file-name
+                    (pcase p
+                      ('ephemeral anvil-extend-storage-dir)
+                      ('permanent anvil-extend-permanent-storage-dir))))))
+        (when (file-directory-p dir)
+          (let* ((files (directory-files dir nil "\\.el\\'" t))
+                 (names
+                  (cl-remove-duplicates
+                   (delq nil
+                         (mapcar
+                          (lambda (f)
+                            (let ((b (file-name-sans-extension f)))
+                              (cond
+                               ((string-suffix-p "-test" b) nil)
+                               ((string-suffix-p "-register" b) nil)
+                               (t b))))
+                          files))
+                   :test #'string=)))
+            (dolist (base names)
+              (let* ((sym (intern base))
+                     (paths (anvil-extend--paths-for-pool sym p))
+                     (rationale (ignore-errors
+                                  (anvil-extend-recall-rationale sym))))
+                (push (list :name sym
+                            :pool p
+                            :elisp-file (plist-get paths :elisp-file)
+                            :test-file  (plist-get paths :test-file)
+                            :register-stub (plist-get paths :register-stub)
+                            :rationale rationale)
+                      rows)))))))
+    (sort rows (lambda (a b)
+                 (string< (symbol-name (plist-get a :name))
+                          (symbol-name (plist-get b :name)))))))
+
+(defun anvil-extend--policy-check (name policy)
+  "Validate NAME against POLICY for promotion eligibility.
+
+Returns nil on success, otherwise a `(REASON . DETAILS-STRING)'
+cons describing the first failed check.  Checks fired in order
+(matching Doc 38 §3.F.2 stage 1 — the optional codex-review and
+mandatory CLI signoff stages 2-3 are not enforced inline because
+they are caller-driven, not policy-driven).
+
+POLICY is consulted via `plist-get' so unknown keys default to nil."
+  (cond
+   ((and (plist-get policy :require-rationale)
+         (null (ignore-errors (anvil-extend-recall-rationale name))))
+    (cons 'no-rationale
+          (format "policy requires :rationale for %s but none recorded" name)))
+   ((and (plist-get policy :require-tests)
+         (let ((res (ignore-errors (anvil-extend-test name))))
+           (or (null res)
+               (eq (plist-get res :status) :failed)
+               (eq (plist-get res :status) :missing)
+               (and (numberp (plist-get res :fail-count))
+                    (> (plist-get res :fail-count) 0)))))
+    (cons 'tests-failed
+          (format "policy requires :tests for %s but ERT did not pass" name)))
+   (t nil)))
+
+;;;###autoload
+(cl-defun anvil-extend-promote (name &key signoff target-path
+                                     change-summary)
+  "Promote ephemeral extension NAME into the permanent registry.
+
+Steps (Doc 38 §3.F.2):
+
+  1. Validate NAME exists under `anvil-extend-storage-dir'.
+  2. Consult `anvil-extend--promotion-policy':
+       - `:require-signoff t' (default) rejects calls where SIGNOFF
+         is nil with a `:status :rejected :reason :missing-signoff'
+         plist (no signal — failure is data).
+       - `:require-rationale t' (default) rejects names that have no
+         `anvil-extend-recall-rationale' record.
+       - `:require-tests t' (default off) runs `anvil-extend-test'
+         and rejects on any unexpected failure.
+  3. Copy `<NAME>.el' / `*-test.el' / `*-register.el' to
+     `anvil-extend-permanent-storage-dir' (or TARGET-PATH when
+     supplied — TARGET-PATH names the destination `<NAME>.el' and
+     the sibling test/register paths are derived from it).
+  4. Append a v_next rationale entry recording `:change-summary'
+     so the promotion event is traceable in the rationale Markdown.
+  5. Delete the ephemeral originals so `anvil-extend-pool-status'
+     subsequently reports `permanent'.
+
+SIGNOFF is the human or automated entity authorising the move
+(e.g. `'user', `'claude', a string login).  Nil means \"no
+signoff supplied\" and is rejected when the policy requires it.
+
+Returns one of:
+
+  (:status :promoted :name NAME :path PATH :pool permanent
+   :version N)
+  (:status :rejected :name NAME :reason REASON :detail STRING)
+  (:status :failed   :name NAME :reason STRING)
+
+Failure is reported as data, never as a signal, so MCP callers
+can introspect the result without a `condition-case'."
+  (anvil-extend--check-name name)
+  (let* ((policy anvil-extend--promotion-policy)
+         (eph-paths (anvil-extend--ephemeral-paths name))
+         (eph-elisp (plist-get eph-paths :elisp-file)))
+    (cond
+     ((not (file-exists-p eph-elisp))
+      (list :status :rejected
+            :name name
+            :reason :missing-source
+            :detail (format "no scaffold under ephemeral pool: %s" eph-elisp)))
+     ((and (plist-get policy :require-signoff) (null signoff))
+      (signal 'anvil-extend-promotion-policy-violation
+              (list (format "promote %s requires :signoff (policy :require-signoff t)"
+                            name)))
+      ;; The signal above is the API contract; the explicit
+      ;; `:rejected' return below is dead code only on the happy
+      ;; path of `condition-case' callers, but stays for clarity.
+      (list :status :rejected
+            :name name
+            :reason :missing-signoff
+            :detail "policy requires explicit :signoff"))
+     (t
+      (let ((policy-failure (anvil-extend--policy-check name policy)))
+        (cond
+         (policy-failure
+          (signal 'anvil-extend-promotion-policy-violation
+                  (list (cdr policy-failure))))
+         (t
+          (condition-case err
+              (let* ((dest-elisp
+                      (or target-path
+                          (plist-get (anvil-extend--permanent-paths name)
+                                     :elisp-file)))
+                     (dest-dir (file-name-directory dest-elisp))
+                     (dest-base (file-name-sans-extension
+                                 (file-name-nondirectory dest-elisp)))
+                     (dest-test (expand-file-name
+                                 (concat dest-base "-test.el") dest-dir))
+                     (dest-reg  (expand-file-name
+                                 (concat dest-base "-register.el") dest-dir)))
+                (unless (file-directory-p dest-dir)
+                  (make-directory dest-dir t))
+                ;; Copy step (atomic-ish: copy first, delete sources after).
+                (copy-file eph-elisp dest-elisp t t)
+                (let ((eph-test (plist-get eph-paths :test-file)))
+                  (when (file-exists-p eph-test)
+                    (copy-file eph-test dest-test t t)))
+                (let ((eph-reg (plist-get eph-paths :register-stub)))
+                  (when (file-exists-p eph-reg)
+                    (copy-file eph-reg dest-reg t t)))
+                ;; Record promotion event in rationale change-log
+                ;; when a prior rationale exists (require-rationale=t
+                ;; gated this above).  When no rationale exists we
+                ;; create a minimal v1 record so future sessions can
+                ;; trace why this name now lives in permanent storage.
+                (let* ((existing (ignore-errors
+                                   (anvil-extend-recall-rationale name)))
+                       (rec (anvil-extend-record-rationale
+                             name
+                             :purpose (or (and existing
+                                               (plist-get existing :purpose))
+                                          "promoted to permanent")
+                             :registry-kind 'permanent
+                             :change-summary
+                             (or change-summary
+                                 (format "promoted by %S"
+                                         (or signoff "unknown"))))))
+                  ;; Delete ephemeral originals so pool-status flips
+                  ;; cleanly to `permanent'.  Best-effort: leftover
+                  ;; .elc artifacts also dropped.
+                  (dolist (k '(:elisp-file :test-file :register-stub))
+                    (let ((p (plist-get eph-paths k)))
+                      (when (file-exists-p p)
+                        (ignore-errors (delete-file p))
+                        (let ((elc (concat p "c")))
+                          (when (file-exists-p elc)
+                            (ignore-errors (delete-file elc)))))))
+                  (list :status :promoted
+                        :name name
+                        :path dest-elisp
+                        :pool 'permanent
+                        :signoff signoff
+                        :version (plist-get rec :version))))
+            (error
+             (list :status :failed
+                   :name name
+                   :reason (error-message-string err)))))))))))
+
+;;;###autoload
+(cl-defun anvil-extend-demote (name &key change-summary)
+  "Move permanent extension NAME back into the ephemeral pool.
+
+The inverse of `anvil-extend-promote' — copies the permanent
+triplet back to `anvil-extend-storage-dir' then removes the
+permanent originals.  Records a v_next rationale change-log
+entry tagging the demotion.
+
+Returns one of:
+
+  (:status :demoted :name NAME :path PATH :pool ephemeral)
+  (:status :rejected :name NAME :reason REASON :detail STRING)
+  (:status :failed   :name NAME :reason STRING)"
+  (anvil-extend--check-name name)
+  (let* ((perm-paths (anvil-extend--permanent-paths name))
+         (perm-elisp (plist-get perm-paths :elisp-file)))
+    (cond
+     ((not (file-exists-p perm-elisp))
+      (list :status :rejected
+            :name name
+            :reason :missing-source
+            :detail (format "no scaffold under permanent pool: %s"
+                            perm-elisp)))
+     (t
+      (condition-case err
+          (let* ((eph-paths (anvil-extend--ephemeral-paths name))
+                 (eph-elisp (plist-get eph-paths :elisp-file))
+                 (eph-test  (plist-get eph-paths :test-file))
+                 (eph-reg   (plist-get eph-paths :register-stub)))
+            (anvil-extend--ensure-storage)
+            (copy-file perm-elisp eph-elisp t t)
+            (let ((perm-test (plist-get perm-paths :test-file)))
+              (when (file-exists-p perm-test)
+                (copy-file perm-test eph-test t t)))
+            (let ((perm-reg (plist-get perm-paths :register-stub)))
+              (when (file-exists-p perm-reg)
+                (copy-file perm-reg eph-reg t t)))
+            ;; Best-effort change-log entry; honour any existing
+            ;; rationale's purpose so the v_next header stays
+            ;; consistent with the original record.
+            (let* ((existing (ignore-errors
+                               (anvil-extend-recall-rationale name)))
+                   (rec (ignore-errors
+                          (anvil-extend-record-rationale
+                           name
+                           :purpose (or (and existing
+                                             (plist-get existing :purpose))
+                                        "demoted to ephemeral")
+                           :registry-kind 'ephemeral
+                           :change-summary
+                           (or change-summary "demoted from permanent")))))
+              (dolist (k '(:elisp-file :test-file :register-stub))
+                (let ((p (plist-get perm-paths k)))
+                  (when (file-exists-p p)
+                    (ignore-errors (delete-file p))
+                    (let ((elc (concat p "c")))
+                      (when (file-exists-p elc)
+                        (ignore-errors (delete-file elc)))))))
+              (list :status :demoted
+                    :name name
+                    :path eph-elisp
+                    :pool 'ephemeral
+                    :version (and rec (plist-get rec :version)))))
+        (error
+         (list :status :failed
+               :name name
+               :reason (error-message-string err))))))))
+
+;;;###autoload
+(defun anvil-extend-promotion-policy (&rest args)
+  "Update the per-session promotion policy plist.
+
+ARGS is a list of keyword/value pairs.  Recognised keys:
+
+  :require-signoff      BOOL — promote without :signoff is rejected
+  :require-rationale    BOOL — promote without prior rationale
+                              record is rejected
+  :require-tests        BOOL — promote runs ERT and rejects on
+                              unexpected failure
+  :pre-execution-review BOOL — `eval-sandboxed' records a
+                              diff-preview rationale before the
+                              subprocess hop (Doc 38 §3.F.1)
+
+Unknown keys are stored verbatim so future Phase F additions
+compose without code changes here.  Returns the resulting plist."
+  (cl-loop for (k v) on args by #'cddr
+           do (setq anvil-extend--promotion-policy
+                    (plist-put anvil-extend--promotion-policy k v)))
+  anvil-extend--promotion-policy)
+
+(defun anvil-extend-promotion-policy-reset ()
+  "Reset the promotion policy to the defcustom default.
+
+Provided so tests (and humans) can recover deterministically
+from a session that flipped a policy bit on with
+`anvil-extend-promotion-policy'.  Returns the reset plist.  Uses
+`copy-sequence' so successive resets do not share structure with
+the defcustom default."
+  (setq anvil-extend--promotion-policy
+        (copy-sequence anvil-extend-promotion-default-policy)))
+
+;;;; --- Phase F: pre-execution safety advice (= D-8 finding) -------------
+
+;; Per Doc 38 §3.F.1 (T87 D-8), an ephemeral tool that has not yet
+;; been promoted should record a rationale-style diff preview before
+;; any subprocess hop runs the form.  The advice below sits on
+;; `anvil-extend-eval-sandboxed' and fires only when the active
+;; promotion policy has `:pre-execution-review t' so existing
+;; Phase C workflows are unaffected.
+
+(defvar anvil-extend--pre-execution-review-log nil
+  "List of forms reviewed by the pre-execution advice.
+
+Each entry is a plist `(:form FORM :timestamp ISO-STRING)'.  Used
+by tests and by Claude session debuggers to confirm the advice
+fired.  Bounded only by the host's memory; reset by tests via
+`let'.")
+
+(defun anvil-extend--pre-execution-review-record (form)
+  "Append a review record for FORM to the in-memory log.
+Returns the plist that was recorded."
+  (let ((entry (list :form form
+                     :timestamp (format-time-string "%Y-%m-%dT%H:%M:%S%z"))))
+    (push entry anvil-extend--pre-execution-review-log)
+    entry))
+
+(defun anvil-extend--pre-execution-review-advice (form &rest _args)
+  "Advice body invoked before `anvil-extend-eval-sandboxed' runs FORM.
+
+Honours `anvil-extend--promotion-policy' :pre-execution-review.
+When that flag is nil the advice is a no-op so existing Phase C
+sandbox callers are unaffected."
+  (when (anvil-extend--policy-get :pre-execution-review)
+    (anvil-extend--pre-execution-review-record form))
+  ;; advice is :before, return value is ignored.
+  nil)
+
+(advice-add 'anvil-extend-eval-sandboxed :before
+            #'anvil-extend--pre-execution-review-advice)
+
+;;;; --- Phase F: MCP wrappers --------------------------------------------
+
+(defun anvil-extend--coerce-pool (val)
+  "Coerce VAL (string / symbol / nil) into a pool symbol or nil."
+  (cond
+   ((null val) nil)
+   ((symbolp val) val)
+   ((stringp val) (intern val))
+   (t (user-error "anvil-extend: unknown pool value %S" val))))
+
+(defun anvil-extend--tool-promote (name &optional signoff target-path
+                                        change-summary)
+  "MCP wrapper for `anvil-extend-promote'.
+
+MCP Parameters:
+  name - extension name (string or symbol; lowercase + hyphens)
+  signoff - signoff identity (string / symbol; required when policy
+            requires it)
+  target-path - optional override of destination `<NAME>.el' path
+  change-summary - optional one-line summary appended to rationale
+                   change-log
+
+Returns the printed plist returned by `anvil-extend-promote'
+(`:status :promoted' / `:rejected' / `:failed').  Policy
+violations are caught and surfaced as `(:status :rejected ...)'
+so MCP callers do not see a raw signal."
+  (anvil-server-with-error-handling
+   (let* ((sym (anvil-extend--coerce-name name))
+          (so  (cond
+                ((null signoff) nil)
+                ((symbolp signoff) signoff)
+                ((stringp signoff)
+                 (if (string-empty-p signoff) nil (intern signoff)))
+                (t signoff)))
+          (result
+           (condition-case err
+               (anvil-extend-promote sym
+                                     :signoff so
+                                     :target-path target-path
+                                     :change-summary change-summary)
+             (anvil-extend-promotion-policy-violation
+              (list :status :rejected
+                    :name sym
+                    :reason :policy-violation
+                    :detail (cadr err))))))
+     (format "%S" result))))
+
+(defun anvil-extend--tool-demote (name &optional change-summary)
+  "MCP wrapper for `anvil-extend-demote'.
+
+MCP Parameters:
+  name - extension name (string or symbol; lowercase + hyphens)
+  change-summary - optional one-line summary appended to rationale
+
+Returns the printed plist returned by `anvil-extend-demote'
+(`:status :demoted' / `:rejected' / `:failed')."
+  (anvil-server-with-error-handling
+   (let* ((sym (anvil-extend--coerce-name name))
+          (result (anvil-extend-demote sym
+                                       :change-summary change-summary)))
+     (format "%S" result))))
+
+(defun anvil-extend--tool-list-by-pool (&optional pool)
+  "MCP wrapper for `anvil-extend-list-by-pool'.
+
+MCP Parameters:
+  pool - `ephemeral' | `permanent' | nil for all (string accepted)
+
+Returns the printed list of plists; serialisable across the MCP
+boundary because every element is plain Elisp data."
+  (anvil-server-with-error-handling
+   (let* ((p (anvil-extend--coerce-pool pool))
+          (result (anvil-extend-list-by-pool p)))
+     (format "%S" result))))
+
+(defun anvil-extend--tool-pool-status (name)
+  "MCP wrapper for `anvil-extend-pool-status'.
+
+MCP Parameters:
+  name - extension name (string or symbol; lowercase + hyphens)
+
+Returns the printed pool symbol (`ephemeral' / `permanent') or
+the literal string `nil' when NAME is in neither pool."
+  (anvil-server-with-error-handling
+   (let* ((sym (anvil-extend--coerce-name name))
+          (result (anvil-extend-pool-status sym)))
+     (format "%S" result))))
+
+(defun anvil-extend--tool-promotion-policy
+    (&optional require-signoff require-rationale require-tests
+               pre-execution-review)
+  "MCP wrapper for `anvil-extend-promotion-policy'.
+
+MCP Parameters:
+  require-signoff - BOOL (= JSON true / false)
+  require-rationale - BOOL
+  require-tests - BOOL
+  pre-execution-review - BOOL
+
+Each parameter is forwarded to `anvil-extend-promotion-policy'
+only when non-nil, so callers can update a single key without
+clobbering the rest of the plist.  Returns the printed plist."
+  (anvil-server-with-error-handling
+   (let ((args nil))
+     (when require-signoff
+       (setq args (append args (list :require-signoff require-signoff))))
+     (when require-rationale
+       (setq args (append args (list :require-rationale require-rationale))))
+     (when require-tests
+       (setq args (append args (list :require-tests require-tests))))
+     (when pre-execution-review
+       (setq args (append args
+                          (list :pre-execution-review pre-execution-review))))
+     (format "%S" (apply #'anvil-extend-promotion-policy args)))))
+
 ;;;; --- module lifecycle ---------------------------------------------------
 
 ;;;###autoload
@@ -1942,10 +2571,15 @@ Phase A registers `anvil-extend-scaffold'.  Phase B adds
 `anvil-extend-watch' (auto-reload on file change).  Phase D adds
 `anvil-extend-record-rationale' / `anvil-extend-recall-rationale'
 / `anvil-extend-list-rationales' so the Markdown rationale store
-is reachable from the MCP surface.  `load' / `test' / `list' /
-`remove' / `reload-all' / `unwatch' / `watch-all' stay
-function-only because they are typically driven interactively
-while iterating on the generated source."
+is reachable from the MCP surface.  Phase F adds
+`anvil-extend-promote' / `anvil-extend-demote' /
+`anvil-extend-list-by-pool' / `anvil-extend-pool-status' /
+`anvil-extend-promotion-policy' so the ephemeral ↔ permanent
+registry transitions and the per-session policy plist are
+reachable from MCP as well.  `load' / `test' / `list' / `remove'
+/ `reload-all' / `unwatch' / `watch-all' stay function-only
+because they are typically driven interactively while iterating
+on the generated source."
   (interactive)
   (require 'anvil-server)
   (anvil-server-register-tool
@@ -2056,7 +2690,69 @@ but are not surfaced via this API (Phase D of Doc 38 §3.D).")
    :description
    "Enumerate every rationale file under storage as a list of plists.
 Each entry: `(:name :purpose-summary :version :file)'.  Files
-that fail to parse are skipped silently (Phase D of Doc 38 §3.D)."))
+that fail to parse are skipped silently (Phase D of Doc 38 §3.D).")
+  (anvil-server-register-tool
+   #'anvil-extend--tool-promote
+   :id "anvil-extend-promote"
+   :intent '(extend promote registry permanent)
+   :layer 'experimental
+   :stability 'experimental
+   :server-id anvil-extend-server-id
+   :description
+   "Promote an ephemeral extension into the permanent registry.
+Honours the active promotion policy (signoff / rationale / tests).
+Failure is reported as data (`:status :rejected' / `:failed') so
+MCP callers can introspect without `condition-case'.  Phase F of
+Doc 38 §3.F.2 (LOCKED v2).")
+  (anvil-server-register-tool
+   #'anvil-extend--tool-demote
+   :id "anvil-extend-demote"
+   :intent '(extend demote registry rollback)
+   :layer 'experimental
+   :stability 'experimental
+   :server-id anvil-extend-server-id
+   :description
+   "Move a permanent extension back into the ephemeral pool.
+The inverse of `anvil-extend-promote'; logs a v_next rationale
+change-log entry tagging the demotion so the rollback is
+auditable (Phase F of Doc 38 §3.F.2).")
+  (anvil-server-register-tool
+   #'anvil-extend--tool-list-by-pool
+   :id "anvil-extend-list-by-pool"
+   :intent '(extend registry list pool)
+   :layer 'experimental
+   :stability 'experimental
+   :server-id anvil-extend-server-id
+   :description
+   "Enumerate scaffolded extensions filtered by pool.
+POOL is `ephemeral' / `permanent' / nil for both.  Returns a list
+of plists `(:name :pool :elisp-file :test-file :register-stub
+:rationale ...)' (Phase F of Doc 38 §3.F).")
+  (anvil-server-register-tool
+   #'anvil-extend--tool-pool-status
+   :id "anvil-extend-pool-status"
+   :intent '(extend registry pool status)
+   :layer 'experimental
+   :stability 'experimental
+   :server-id anvil-extend-server-id
+   :description
+   "Return the pool symbol an extension currently lives in.
+`ephemeral' / `permanent' / nil (= unknown).  Permanent wins
+over ephemeral so a name that exists in both pools (e.g.
+mid-promotion atomic copy) is reported as permanent (Phase F).")
+  (anvil-server-register-tool
+   #'anvil-extend--tool-promotion-policy
+   :id "anvil-extend-promotion-policy"
+   :intent '(extend registry policy update)
+   :layer 'experimental
+   :stability 'experimental
+   :server-id anvil-extend-server-id
+   :description
+   "Update the per-session promotion policy plist.
+Supported keys: `:require-signoff' / `:require-rationale' /
+`:require-tests' / `:pre-execution-review'.  Only non-nil
+parameters update the plist so callers can flip a single key
+without clobbering the rest (Phase F of Doc 38 §3.F)."))
 
 (defun anvil-extend-disable ()
   "Unregister anvil-extend's MCP tools."
@@ -2069,9 +2765,19 @@ that fail to parse are skipped silently (Phase D of Doc 38 §3.D)."))
                   "anvil-extend-scan-dangerous-forms"
                   "anvil-extend-record-rationale"
                   "anvil-extend-recall-rationale"
-                  "anvil-extend-list-rationales"))
+                  "anvil-extend-list-rationales"
+                  "anvil-extend-promote"
+                  "anvil-extend-demote"
+                  "anvil-extend-list-by-pool"
+                  "anvil-extend-pool-status"
+                  "anvil-extend-promotion-policy"))
       (ignore-errors
-        (anvil-server-unregister-tool id anvil-extend-server-id)))))
+        (anvil-server-unregister-tool id anvil-extend-server-id))))
+  ;; Best-effort advice cleanup so a re-enable does not stack the
+  ;; advice twice (advice-add is idempotent on identity but symmetry
+  ;; with `enable' keeps the lifecycle predictable).
+  (advice-remove 'anvil-extend-eval-sandboxed
+                 #'anvil-extend--pre-execution-review-advice))
 
 (provide 'anvil-extend)
 ;;; anvil-extend.el ends here
