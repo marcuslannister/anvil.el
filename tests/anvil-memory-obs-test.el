@@ -299,6 +299,102 @@
         (should (>= (length rows) 1))))))
 
 
+;;;; --- Phase 2: rule-based compression tests -----------------------------
+
+(defun anvil-memory-obs-test--seed-session (session-id n)
+  "Insert N observations for SESSION-ID and return the row ids list."
+  (anvil-memory-obs--upsert-session session-id)
+  (cl-loop for i from 1 to n
+           collect (anvil-memory-obs--insert-observation
+                    :session-id session-id
+                    :hook (if (= i 1) "session-start" "post-tool-use")
+                    :tool-name (if (cl-evenp i) "Read" "Bash")
+                    :body (format "obs-body-%d details on this step" i))))
+
+(ert-deftest anvil-memory-obs-summarize-skips-tiny-sessions ()
+  "summarize-session returns nil when below the min-observations gate."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-rule-based))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 5))
+      (anvil-memory-obs-test--seed-session "tiny" 3)
+      (should (null (anvil-memory-obs-summarize-session "tiny")))
+      (should (zerop (length
+                      (sqlite-select (anvil-memory-obs--db)
+                                     "SELECT id FROM obs_summaries")))))))
+
+(ert-deftest anvil-memory-obs-summarize-inserts-rule-based-summary ()
+  "summarize-session writes a summary row with correct id range."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-rule-based))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3))
+      (let* ((ids (anvil-memory-obs-test--seed-session "comp1" 5))
+             (sid (anvil-memory-obs-summarize-session "comp1")))
+        (should (integerp sid))
+        (let ((row (car (sqlite-select
+                         (anvil-memory-obs--db)
+                         "SELECT obs_start_id, obs_end_id, summary
+                            FROM obs_summaries WHERE id = ?"
+                         (list sid)))))
+          (should (= (nth 0 row) (car ids)))
+          (should (= (nth 1 row) (car (last ids))))
+          (should (string-match-p "obs-body-1" (nth 2 row)))
+          (should (string-match-p "obs-body-5" (nth 2 row))))))))
+
+(ert-deftest anvil-memory-obs-summarize-mirrors-into-fts ()
+  "Summary body is searchable through the FTS5 mirror."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-rule-based))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3))
+      (anvil-memory-obs-test--seed-session "comp2" 4)
+      (anvil-memory-obs-summarize-session "comp2")
+      ;; Use a hyphen-free token so unicode61 / trigram tokenisers
+      ;; behave the same way; the body fixture contains "details on
+      ;; this step" verbatim.
+      (let ((rows (sqlite-select
+                   (anvil-memory-obs--db)
+                   "SELECT rowid FROM obs_summaries_fts
+                     WHERE obs_summaries_fts MATCH 'details'")))
+        (should (>= (length rows) 1))))))
+
+(ert-deftest anvil-memory-obs-summarize-respects-none-fallback ()
+  "fallback = none => no summary row even with enough observations."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-rule-based))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3)
+          (anvil-memory-obs-compress-fallback 'none))
+      (anvil-memory-obs-test--seed-session "comp3" 5)
+      (should (null (anvil-memory-obs-summarize-session "comp3")))
+      (should (zerop (length
+                      (sqlite-select (anvil-memory-obs--db)
+                                     "SELECT id FROM obs_summaries")))))))
+
+(ert-deftest anvil-memory-obs-summarize-truncates-long-bodies ()
+  "Bodies longer than rule-excerpt-chars * 2 are summarised with `[…]'."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-rule-based))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3)
+          (anvil-memory-obs-compress-rule-excerpt-chars 10))
+      (anvil-memory-obs--upsert-session "comp4")
+      (dotimes (_ 4)
+        (anvil-memory-obs--insert-observation
+         :session-id "comp4" :hook "post-tool-use"
+         :body (concat "HEAD"
+                       (make-string 200 ?x)
+                       "TAIL")))
+      (anvil-memory-obs-summarize-session "comp4")
+      (let ((summary (caar (sqlite-select
+                            (anvil-memory-obs--db)
+                            "SELECT summary FROM obs_summaries"))))
+        (should (string-match-p "HEAD" summary))
+        (should (string-match-p "TAIL" summary))
+        (should (string-match-p "\\[…\\]" summary))))))
+
+
 ;;;; --- purge tests --------------------------------------------------------
 
 (ert-deftest anvil-memory-obs-purge-removes-old-low-importance ()

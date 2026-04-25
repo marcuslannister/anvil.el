@@ -128,8 +128,32 @@ Set to nil to keep every row regardless of importance."
                  integer)
   :group 'anvil-memory-obs)
 
+
+;;;; --- Phase 2: compression knobs ---------------------------------------
+
+(defcustom anvil-memory-obs-compress-min-observations 5
+  "Skip session summarisation when fewer than this many obs rows exist.
+Tiny sessions are not worth a summary row."
+  :type 'integer
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-compress-rule-excerpt-chars 200
+  "Characters retained from the head and tail when rule-based summary runs.
+Total fallback length is roughly twice this value."
+  :type 'integer
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-compress-fallback 'rule-based
+  "Behaviour when AI compression is unavailable or skipped.
+  `rule-based' — concat first/last excerpts of each observation.
+  `none'       — skip; no summary row is created."
+  :type '(choice (const :tag "Rule-based excerpt" rule-based)
+                 (const :tag "No summary"         none))
+  :group 'anvil-memory-obs)
+
 (defconst anvil-memory-obs-supported
-  '(schema record importance redact integration purge)
+  '(schema record importance redact integration purge
+           compress-rule-based)
   "Capability tags this module currently provides.
 Tests `skip-unless' their tag is in this list so a half-shipped
 feature never breaks CI.  Phase milestones append tags here.")
@@ -451,6 +475,94 @@ Returns the number of observation rows removed."
                      placeholders)
              ids)))
         (length ids)))))
+
+
+;;;; --- Phase 2: compression --------------------------------------------
+
+(defun anvil-memory-obs--gather-observations (session-id)
+  "Return rows (id ts hook tool body importance) for SESSION-ID, oldest first."
+  (sqlite-select
+   (anvil-memory-obs--db)
+   "SELECT id, ts, hook, tool_name, body, importance
+      FROM obs_observations
+      WHERE session_id = ?
+      ORDER BY id ASC"
+   (list session-id)))
+
+(defun anvil-memory-obs--rule-based-summary (obs-rows)
+  "Build a deterministic summary from OBS-ROWS without an LLM.
+Concatenates each row's hook + body excerpt; the result is one
+short paragraph suitable as a temporary stand-in until Phase 2
+ships the AI path."
+  (let* ((cap anvil-memory-obs-compress-rule-excerpt-chars)
+         (lines
+          (cl-loop for row in obs-rows
+                   for hook = (nth 2 row)
+                   for body = (or (nth 4 row) "")
+                   for excerpt = (if (<= (length body) cap)
+                                     body
+                                   (concat (substring body 0 cap)
+                                           " […] "
+                                           (substring body (- (length body)
+                                                              cap))))
+                   collect (format "[%s] %s" hook excerpt))))
+    (string-join lines "\n")))
+
+(defun anvil-memory-obs--rule-based-topic (obs-rows)
+  "Pick a coarse topic for OBS-ROWS by majority hook + tool name."
+  (let* ((tools (cl-loop for row in obs-rows
+                         for tool = (nth 3 row)
+                         when (and tool (not (string-empty-p tool)))
+                         collect tool))
+         (most-tool (when tools
+                      (caar (sort
+                             (mapcar (lambda (s) (cons s 1)) tools)
+                             (lambda (a _) (stringp (car a)))))))
+         (count (length obs-rows)))
+    (if most-tool
+        (format "%d obs (%s)" count most-tool)
+      (format "%d obs" count))))
+
+(defun anvil-memory-obs--insert-summary (session-id topic summary
+                                                    obs-start-id obs-end-id)
+  "Persist a summary row and its FTS5 mirror.  Returns the row id."
+  (let* ((db (anvil-memory-obs--db))
+         (ts (anvil-memory-obs--now)))
+    (sqlite-execute
+     db
+     "INSERT INTO obs_summaries
+        (session_id, obs_start_id, obs_end_id, topic, summary, ts)
+        VALUES (?, ?, ?, ?, ?, ?)"
+     (list session-id obs-start-id obs-end-id
+           (or topic "") summary ts))
+    (let ((rowid (caar (sqlite-select db "SELECT last_insert_rowid()"))))
+      (sqlite-execute
+       db
+       "INSERT INTO obs_summaries_fts (rowid, topic, summary)
+          VALUES (?, ?, ?)"
+       (list rowid (or topic "") summary))
+      rowid)))
+
+(defun anvil-memory-obs-summarize-session (session-id &optional force-fallback)
+  "Compress SESSION-ID's observations into a single summary row.
+Phase 1 of compression: only the rule-based fallback is wired up.
+FORCE-FALLBACK is accepted for API forward compatibility (Phase 2.2
+adds AI summarisation; the flag bypasses it).
+Returns the new summary row id, or nil when the session is too small
+or no fallback is configured."
+  (ignore force-fallback)                ; will be used in commit 2/4
+  (let* ((rows (anvil-memory-obs--gather-observations session-id))
+         (n (length rows)))
+    (cond
+     ((< n anvil-memory-obs-compress-min-observations) nil)
+     ((eq anvil-memory-obs-compress-fallback 'none)    nil)
+     (t
+      (let ((topic (anvil-memory-obs--rule-based-topic rows))
+            (summary (anvil-memory-obs--rule-based-summary rows))
+            (start-id (nth 0 (car rows)))
+            (end-id   (nth 0 (car (last rows)))))
+        (anvil-memory-obs--insert-summary
+         session-id topic summary start-id end-id))))))
 
 
 ;;;; --- enable / disable stubs --------------------------------------------
