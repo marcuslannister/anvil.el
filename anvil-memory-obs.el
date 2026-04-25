@@ -55,6 +55,11 @@
 (declare-function anvil-orchestrator-submit-and-collect
                   "anvil-orchestrator")
 
+;; Phase 6 promote-candidates uses anvil-memory-save-check to dedup
+;; against the user's existing auto-memory store.  Soft dependency —
+;; the dedup path is opt-in (`:check-against-memory t').
+(declare-function anvil-memory-save-check "anvil-memory")
+
 
 ;;;; --- group + defcustoms -------------------------------------------------
 
@@ -214,7 +219,8 @@ Observations:
   '(schema record importance redact integration purge
            compress-rule-based compress-ai compress-auto budget
            search timeline get summary-search mcp-tools
-           auto-inject auto-inject-integration)
+           auto-inject auto-inject-integration
+           promote-candidates)
   "Capability tags this module currently provides.
 Tests `skip-unless' their tag is in this list so a half-shipped
 feature never breaks CI.  Phase milestones append tags here.")
@@ -1029,6 +1035,108 @@ qualify.  PROJECT-DIR defaults to `default-directory'."
       (anvil-memory-obs--render-preamble capped))))
 
 
+;;;; --- Phase 6: promote candidates ---------------------------------------
+
+(defcustom anvil-memory-obs-promote-min-importance 30
+  "Minimum aggregate observation importance for a promote candidate.
+Sums `obs_observations.importance' across the underlying rows;
+high-impact sessions clear this gate without manual triage."
+  :type 'integer
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-promote-window-days 30
+  "Look back this many days when ranking promote candidates."
+  :type 'integer
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-promote-similar-threshold 0.5
+  "Drop a candidate when a MEMORY.md row has Jaccard similarity >= this.
+Only consulted when `:check-against-memory' is non-nil."
+  :type 'number
+  :group 'anvil-memory-obs)
+
+(cl-defun anvil-memory-obs-promote-candidates
+    (&key limit min-importance check-against-memory window-days)
+  "Return ranked promote candidates from recent compressed summaries.
+Each candidate plist:
+  (:summary-id :session-id :topic :summary :is-ai
+   :total-importance :similar)
+:LIMIT defaults to 5.
+:MIN-IMPORTANCE defaults to
+  `anvil-memory-obs-promote-min-importance'.
+:WINDOW-DAYS defaults to
+  `anvil-memory-obs-promote-window-days'.
+:CHECK-AGAINST-MEMORY (default nil) — when non-nil and
+  `anvil-memory-save-check' is loaded, each candidate is scored
+  against the auto-memory store and rows whose top match is at or
+  above `anvil-memory-obs-promote-similar-threshold' are filtered
+  out; the remaining rows carry the match list under `:similar'."
+  (let* ((db (anvil-memory-obs--db))
+         (limit (or limit 5))
+         (min-imp (or min-importance
+                      anvil-memory-obs-promote-min-importance))
+         (window (or window-days
+                     anvil-memory-obs-promote-window-days))
+         (since (- (anvil-memory-obs--now) (* window 24 60 60)))
+         (rows (sqlite-select
+                db
+                "SELECT s.id, s.session_id, s.topic, s.summary, s.is_ai,
+                        COALESCE(SUM(o.importance), 0) AS imp
+                   FROM obs_summaries s
+                   LEFT JOIN obs_observations o
+                     ON o.session_id = s.session_id
+                    AND o.id >= s.obs_start_id
+                    AND o.id <= s.obs_end_id
+                  WHERE s.ts >= ?
+               GROUP BY s.id
+                 HAVING imp >= ?
+               ORDER BY imp DESC, s.ts DESC
+                  LIMIT ?"
+                (list since min-imp limit)))
+         (rendered (mapcar
+                    (lambda (r)
+                      (list :summary-id (nth 0 r)
+                            :session-id (nth 1 r)
+                            :topic (nth 2 r)
+                            :summary (nth 3 r)
+                            :is-ai (and (nth 4 r) (= (nth 4 r) 1))
+                            :total-importance (nth 5 r)))
+                    rows)))
+    (if (and check-against-memory
+             (fboundp 'anvil-memory-save-check))
+        (delq nil
+              (mapcar
+               (lambda (cand)
+                 (let* ((subject (or (plist-get cand :topic) ""))
+                        (body (or (plist-get cand :summary) ""))
+                        (raw (ignore-errors
+                               (funcall (intern "anvil-memory-save-check")
+                                        subject body)))
+                        ;; raw may be (:candidates list) or a list directly.
+                        (matches (cond
+                                  ((null raw) nil)
+                                  ((and (listp raw) (plist-get raw :candidates))
+                                   (plist-get raw :candidates))
+                                  ((listp raw) raw)
+                                  (t nil)))
+                        (top (when matches
+                               (apply #'max
+                                      (mapcar
+                                       (lambda (m)
+                                         (or (plist-get m :similarity)
+                                             0.0))
+                                       matches)))))
+                   (cond
+                    ((and top
+                          (>= top
+                              anvil-memory-obs-promote-similar-threshold))
+                     nil)
+                    (t
+                     (append cand (list :similar matches))))))
+               rendered))
+      rendered)))
+
+
 ;;;; --- Phase 3: MCP tool wrappers ----------------------------------------
 
 (defun anvil-memory-obs--coerce-int (v default)
@@ -1107,6 +1215,43 @@ Returns (:rows ROWS) ordered by id ASC."
          (anvil-memory-obs-get
           (anvil-memory-obs--coerce-id-list ids)))))
 
+(defun anvil-memory-obs--coerce-bool (v)
+  "Coerce V (nil / bool / string) to `t' / nil."
+  (cond
+   ((null v) nil)
+   ((eq v t) t)
+   ((stringp v)
+    (not (member (downcase v) '("" "false" "nil" "0" "no" "off"))))
+   (t t)))
+
+(defun anvil-memory-obs--tool-promote-candidates
+    (&optional limit min_importance check_against_memory window_days)
+  "List promote candidates ranked by aggregate observation importance.
+
+MCP Parameters:
+  limit                - Optional max candidate count (default 5).
+  min_importance       - Optional importance floor (default 30).
+  check_against_memory - Optional truthy flag.  When set, each
+                         candidate is scored against MEMORY.md via
+                         `anvil-memory-save-check'; rows with a top
+                         match at or above
+                         `anvil-memory-obs-promote-similar-threshold'
+                         are filtered out and the remaining rows
+                         carry the match list as `:similar'.
+  window_days          - Optional look-back days (default 30).
+
+Returns (:rows ROWS)."
+  (anvil-server-with-error-handling
+   (list :rows
+         (anvil-memory-obs-promote-candidates
+          :limit (anvil-memory-obs--coerce-int limit 5)
+          :min-importance
+          (anvil-memory-obs--coerce-int min_importance nil)
+          :check-against-memory
+          (anvil-memory-obs--coerce-bool check_against_memory)
+          :window-days
+          (anvil-memory-obs--coerce-int window_days nil)))))
+
 (defun anvil-memory-obs--tool-summary-search (query &optional limit)
   "Topic-level FTS5 search over compressed session summaries.
 
@@ -1162,6 +1307,17 @@ hook, tool name) for an explicit id list.  Capped at 20 ids per call."
      "FTS5 search over compressed session summaries (topic + summary).
 Each row carries an `:is-ai' boolean so callers can prefer AI-derived
 summaries when available."
+     :read-only t)
+
+    (,(anvil-server-encode-handler #'anvil-memory-obs--tool-promote-candidates)
+     :id "memory-obs-promote-candidates"
+     :intent '(memory observation promote)
+     :layer 'workflow
+     :description
+     "List recent session summaries ranked by aggregate observation
+importance.  Optional `check_against_memory' adds a Jaccard dedup
+pass against MEMORY.md so already-known patterns drop out, leaving
+only candidates worth turning into permanent auto-memory entries."
      :read-only t))
   "Spec list consumed by `anvil-server-register-tools'.")
 

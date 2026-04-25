@@ -1023,6 +1023,129 @@
         (should (string-match-p "truncated" pre))))))
 
 
+;;;; --- Phase 6: promote candidate tests ----------------------------------
+
+(defun anvil-memory-obs-test--seed-high-importance-session (sid n)
+  "Seed N observations with `error' keyword (importance bump) under SID."
+  (anvil-memory-obs--upsert-session sid)
+  (cl-loop for i from 1 to n
+           collect (anvil-memory-obs--insert-observation
+                    :session-id sid
+                    :hook "post-tool-use"
+                    :tool-name "Bash"
+                    :body (format "error %d in build details" i))))
+
+(ert-deftest anvil-memory-obs-promote-candidates-finds-high-importance ()
+  "High-importance summaries surface above the min-importance gate."
+  (skip-unless (anvil-memory-obs-test--supported-p 'promote-candidates))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3))
+      (anvil-memory-obs-test--seed-high-importance-session "pc1" 4)
+      (anvil-memory-obs-summarize-session "pc1")
+      (let ((cands (anvil-memory-obs-promote-candidates
+                    :min-importance 30)))
+        (should (>= (length cands) 1))
+        (should (>= (plist-get (car cands) :total-importance) 30))))))
+
+(ert-deftest anvil-memory-obs-promote-candidates-skips-low-importance ()
+  "Low-importance sessions do not appear as candidates."
+  (skip-unless (anvil-memory-obs-test--supported-p 'promote-candidates))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3))
+      ;; seed-session uses bodies without importance keywords -> imp = 0.
+      (anvil-memory-obs-test--seed-session "pc2" 4)
+      (anvil-memory-obs-summarize-session "pc2")
+      (should (null (anvil-memory-obs-promote-candidates
+                     :min-importance 30))))))
+
+(ert-deftest anvil-memory-obs-promote-candidates-window-filters-old ()
+  "Summaries older than window-days are dropped."
+  (skip-unless (anvil-memory-obs-test--supported-p 'promote-candidates))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3))
+      (let ((ids (anvil-memory-obs-test--seed-high-importance-session
+                  "pc3" 4)))
+        (anvil-memory-obs--insert-summary
+         "pc3" "stale topic" "stale summary"
+         (car ids) (car (last ids)) 1)
+        ;; Backdate the summary to 60 days ago.
+        (sqlite-execute
+         (anvil-memory-obs--db)
+         "UPDATE obs_summaries SET ts = ? WHERE session_id = 'pc3'"
+         (list (- (anvil-memory-obs--now) (* 60 24 60 60)))))
+      (should (null (anvil-memory-obs-promote-candidates
+                     :min-importance 30
+                     :window-days 7))))))
+
+(ert-deftest anvil-memory-obs-promote-candidates-honours-limit ()
+  "Result is capped at :limit."
+  (skip-unless (anvil-memory-obs-test--supported-p 'promote-candidates))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3))
+      (dotimes (i 5)
+        (anvil-memory-obs-test--seed-high-importance-session
+         (format "pc4-%d" i) 4)
+        (anvil-memory-obs-summarize-session (format "pc4-%d" i)))
+      (let ((cands (anvil-memory-obs-promote-candidates
+                    :min-importance 30 :limit 2)))
+        (should (= (length cands) 2))))))
+
+(ert-deftest anvil-memory-obs-promote-candidates-dedup-drops-similar ()
+  "When :check-against-memory and save-check returns a high-similarity
+match, the candidate is filtered out."
+  (skip-unless (anvil-memory-obs-test--supported-p 'promote-candidates))
+  (anvil-memory-obs-test--with-env
+    (cl-letf (((symbol-function 'anvil-memory-save-check)
+               (lambda (&rest _args)
+                 (list :candidates
+                       (list (list :file "feedback_x.md"
+                                   :similarity 0.9))))))
+      (let ((anvil-memory-obs-enabled t)
+            (anvil-memory-obs-compress-min-observations 3)
+            (anvil-memory-obs-promote-similar-threshold 0.5))
+        (anvil-memory-obs-test--seed-high-importance-session "pc5" 4)
+        (anvil-memory-obs-summarize-session "pc5")
+        (should (null (anvil-memory-obs-promote-candidates
+                       :min-importance 30
+                       :check-against-memory t)))))))
+
+(ert-deftest anvil-memory-obs-promote-candidates-dedup-keeps-low-similarity ()
+  "Low-similarity matches are reported under :similar but not filtered."
+  (skip-unless (anvil-memory-obs-test--supported-p 'promote-candidates))
+  (anvil-memory-obs-test--with-env
+    (cl-letf (((symbol-function 'anvil-memory-save-check)
+               (lambda (&rest _args)
+                 (list :candidates
+                       (list (list :file "feedback_x.md"
+                                   :similarity 0.1))))))
+      (let ((anvil-memory-obs-enabled t)
+            (anvil-memory-obs-compress-min-observations 3)
+            (anvil-memory-obs-promote-similar-threshold 0.5))
+        (anvil-memory-obs-test--seed-high-importance-session "pc6" 4)
+        (anvil-memory-obs-summarize-session "pc6")
+        (let ((cands (anvil-memory-obs-promote-candidates
+                      :min-importance 30
+                      :check-against-memory t)))
+          (should (= (length cands) 1))
+          (should (plist-get (car cands) :similar)))))))
+
+(ert-deftest anvil-memory-obs-tool-promote-candidates-coerces-args ()
+  "MCP wrapper accepts digit-string args + truthy strings."
+  (skip-unless (anvil-memory-obs-test--supported-p 'promote-candidates))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3))
+      (anvil-memory-obs-test--seed-high-importance-session "pc7" 4)
+      (anvil-memory-obs-summarize-session "pc7")
+      (let ((result (anvil-memory-obs--tool-promote-candidates
+                     "5" "30" nil "30")))
+        (should (plist-get result :rows))))))
+
+
 ;;;; --- purge tests --------------------------------------------------------
 
 (ert-deftest anvil-memory-obs-purge-removes-old-low-importance ()
