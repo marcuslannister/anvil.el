@@ -46,6 +46,13 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'json)
+
+;; AI compression dispatches through anvil-orchestrator when
+;; available.  The module is loaded lazily; rule-based fallback
+;; works without it.
+(declare-function anvil-orchestrator-submit-and-collect
+                  "anvil-orchestrator")
 
 
 ;;;; --- group + defcustoms -------------------------------------------------
@@ -151,9 +158,43 @@ Total fallback length is roughly twice this value."
                  (const :tag "No summary"         none))
   :group 'anvil-memory-obs)
 
+(defcustom anvil-memory-obs-use-ai-compression nil
+  "When non-nil, `anvil-memory-obs-summarize-session' tries AI first.
+The AI path requires `anvil-orchestrator-submit-and-collect' to be
+loaded.  Failures fall back to the configured
+`anvil-memory-obs-compress-fallback' silently."
+  :type 'boolean
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-compress-provider "claude"
+  "Default provider id passed to `anvil-orchestrator-submit-and-collect'."
+  :type 'string
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-compress-model nil
+  "Default model slug for AI compression (nil = provider default)."
+  :type '(choice (const :tag "Provider default" nil) string)
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-compress-timeout-sec 60
+  "Wall-clock cap for the AI compression call (`:collect-timeout-sec')."
+  :type 'integer
+  :group 'anvil-memory-obs)
+
+(defcustom anvil-memory-obs-compress-prompt-template
+  "You are summarising a software development session for later recall.
+Read the observation log below and respond with **strict JSON only**:
+{\"topic\": \"<= 8 words\", \"summary\": \"1-3 sentences\"}
+
+Observations:
+%s"
+  "Prompt template; %s is replaced by the rendered observation list."
+  :type 'string
+  :group 'anvil-memory-obs)
+
 (defconst anvil-memory-obs-supported
   '(schema record importance redact integration purge
-           compress-rule-based)
+           compress-rule-based compress-ai)
   "Capability tags this module currently provides.
 Tests `skip-unless' their tag is in this list so a half-shipped
 feature never breaks CI.  Phase milestones append tags here.")
@@ -543,24 +584,87 @@ ships the AI path."
        (list rowid (or topic "") summary))
       rowid)))
 
+(defun anvil-memory-obs--render-obs-for-prompt (obs-rows)
+  "Render OBS-ROWS as `[hook] body' lines for the AI prompt."
+  (mapconcat
+   (lambda (row)
+     (format "[%s] %s" (nth 2 row) (or (nth 4 row) "")))
+   obs-rows
+   "\n"))
+
+(defun anvil-memory-obs--strip-code-fences (text)
+  "Drop a leading / trailing ```json fence around TEXT, if any."
+  (let ((s text))
+    (setq s (replace-regexp-in-string
+             "\\`[[:space:]]*```[a-zA-Z]*\n?" "" s))
+    (setq s (replace-regexp-in-string
+             "\n?[[:space:]]*```[[:space:]]*\\'" "" s))
+    s))
+
+(defun anvil-memory-obs--parse-ai-response (text)
+  "Extract (TOPIC . SUMMARY) from TEXT.
+Tries strict JSON first; returns nil on any error so callers can
+fall back to the rule-based path."
+  (when (and (stringp text) (not (string-empty-p text)))
+    (condition-case _err
+        (let* ((cleaned (anvil-memory-obs--strip-code-fences text))
+               (json-object-type 'plist)
+               (json-key-type 'keyword)
+               (json-array-type 'list)
+               (parsed (json-read-from-string cleaned))
+               (topic (plist-get parsed :topic))
+               (summary (plist-get parsed :summary)))
+          (when (and (stringp topic) (stringp summary)
+                     (not (string-empty-p summary)))
+            (cons topic summary)))
+      (error nil))))
+
+(defun anvil-memory-obs--ai-summary (obs-rows)
+  "Submit OBS-ROWS to anvil-orchestrator and parse the JSON response.
+Returns (TOPIC . SUMMARY) on success or nil on any failure path
+(orchestrator unavailable, provider error, malformed JSON, timeout)."
+  (when (and obs-rows
+             (fboundp 'anvil-orchestrator-submit-and-collect))
+    (condition-case _err
+        (let* ((rendered (anvil-memory-obs--render-obs-for-prompt obs-rows))
+               (prompt (format anvil-memory-obs-compress-prompt-template
+                               rendered))
+               (result (funcall (intern "anvil-orchestrator-submit-and-collect")
+                                :provider anvil-memory-obs-compress-provider
+                                :model anvil-memory-obs-compress-model
+                                :prompt prompt
+                                :collect-timeout-sec
+                                anvil-memory-obs-compress-timeout-sec))
+               (status (and (listp result) (plist-get result :status)))
+               (text (when (eq status 'done)
+                       (or (plist-get result :summary)
+                           (plist-get result :text)))))
+          (anvil-memory-obs--parse-ai-response text))
+      (error nil))))
+
 (defun anvil-memory-obs-summarize-session (session-id &optional force-fallback)
   "Compress SESSION-ID's observations into a single summary row.
-Phase 1 of compression: only the rule-based fallback is wired up.
-FORCE-FALLBACK is accepted for API forward compatibility (Phase 2.2
-adds AI summarisation; the flag bypasses it).
-Returns the new summary row id, or nil when the session is too small
-or no fallback is configured."
-  (ignore force-fallback)                ; will be used in commit 2/4
+Tries AI summarisation when
+`anvil-memory-obs-use-ai-compression' is non-nil and
+`anvil-orchestrator-submit-and-collect' is loaded; otherwise (or
+when FORCE-FALLBACK is non-nil) emits the rule-based summary.
+Returns the new summary row id, or nil when the session is below
+the size gate or summaries are disabled."
   (let* ((rows (anvil-memory-obs--gather-observations session-id))
          (n (length rows)))
     (cond
      ((< n anvil-memory-obs-compress-min-observations) nil)
      ((eq anvil-memory-obs-compress-fallback 'none)    nil)
      (t
-      (let ((topic (anvil-memory-obs--rule-based-topic rows))
-            (summary (anvil-memory-obs--rule-based-summary rows))
-            (start-id (nth 0 (car rows)))
-            (end-id   (nth 0 (car (last rows)))))
+      (let* ((ai (when (and (not force-fallback)
+                            anvil-memory-obs-use-ai-compression)
+                   (anvil-memory-obs--ai-summary rows)))
+             (topic (or (car-safe ai)
+                        (anvil-memory-obs--rule-based-topic rows)))
+             (summary (or (cdr-safe ai)
+                          (anvil-memory-obs--rule-based-summary rows)))
+             (start-id (nth 0 (car rows)))
+             (end-id   (nth 0 (car (last rows)))))
         (anvil-memory-obs--insert-summary
          session-id topic summary start-id end-id))))))
 

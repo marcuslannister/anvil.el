@@ -395,6 +395,122 @@
         (should (string-match-p "\\[…\\]" summary))))))
 
 
+;;;; --- Phase 2: AI compression tests -------------------------------------
+
+(ert-deftest anvil-memory-obs-parse-ai-response-strict-json ()
+  "parse-ai-response extracts (topic . summary) from clean JSON."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-ai))
+  (let ((parsed (anvil-memory-obs--parse-ai-response
+                 "{\"topic\":\"refactor parser\",\"summary\":\"Cleaned up parsing.\"}")))
+    (should (equal (car parsed) "refactor parser"))
+    (should (equal (cdr parsed) "Cleaned up parsing."))))
+
+(ert-deftest anvil-memory-obs-parse-ai-response-strips-fences ()
+  "Markdown ```json fences around the JSON are tolerated."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-ai))
+  (let ((parsed (anvil-memory-obs--parse-ai-response
+                 "```json\n{\"topic\":\"X\",\"summary\":\"Y\"}\n```")))
+    (should (equal (car parsed) "X"))
+    (should (equal (cdr parsed) "Y"))))
+
+(ert-deftest anvil-memory-obs-parse-ai-response-rejects-garbage ()
+  "Non-JSON or missing-field bodies return nil."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-ai))
+  (should (null (anvil-memory-obs--parse-ai-response "not json at all")))
+  (should (null (anvil-memory-obs--parse-ai-response
+                 "{\"topic\":\"X\"}")))                ; no summary
+  (should (null (anvil-memory-obs--parse-ai-response ""))))
+
+(ert-deftest anvil-memory-obs-summarize-uses-ai-when-enabled ()
+  "use-ai-compression=t routes through the orchestrator stub."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-ai))
+  (anvil-memory-obs-test--with-env
+    (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+               (lambda (&rest _args)
+                 (list :status 'done
+                       :summary
+                       "{\"topic\":\"AI topic\",\"summary\":\"AI body.\"}"))))
+      (let ((anvil-memory-obs-enabled t)
+            (anvil-memory-obs-use-ai-compression t)
+            (anvil-memory-obs-compress-min-observations 3))
+        (anvil-memory-obs-test--seed-session "ai1" 4)
+        (anvil-memory-obs-summarize-session "ai1")
+        (let ((row (car (sqlite-select
+                         (anvil-memory-obs--db)
+                         "SELECT topic, summary FROM obs_summaries"))))
+          (should (equal (nth 0 row) "AI topic"))
+          (should (equal (nth 1 row) "AI body.")))))))
+
+(ert-deftest anvil-memory-obs-summarize-falls-back-on-orchestrator-error ()
+  "AI failure falls back to rule-based without raising."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-ai))
+  (anvil-memory-obs-test--with-env
+    (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+               (lambda (&rest _args)
+                 (error "boom"))))
+      (let ((anvil-memory-obs-enabled t)
+            (anvil-memory-obs-use-ai-compression t)
+            (anvil-memory-obs-compress-min-observations 3))
+        (anvil-memory-obs-test--seed-session "ai2" 4)
+        (anvil-memory-obs-summarize-session "ai2")
+        (let ((summary (caar (sqlite-select
+                              (anvil-memory-obs--db)
+                              "SELECT summary FROM obs_summaries"))))
+          (should (string-match-p "obs-body-1" summary))
+          (should (string-match-p "obs-body-4" summary)))))))
+
+(ert-deftest anvil-memory-obs-summarize-falls-back-on-malformed-json ()
+  "Garbage AI body yields a rule-based summary instead."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-ai))
+  (anvil-memory-obs-test--with-env
+    (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+               (lambda (&rest _args)
+                 (list :status 'done :summary "definitely not json"))))
+      (let ((anvil-memory-obs-enabled t)
+            (anvil-memory-obs-use-ai-compression t)
+            (anvil-memory-obs-compress-min-observations 3))
+        (anvil-memory-obs-test--seed-session "ai3" 4)
+        (anvil-memory-obs-summarize-session "ai3")
+        (let ((summary (caar (sqlite-select
+                              (anvil-memory-obs--db)
+                              "SELECT summary FROM obs_summaries"))))
+          (should (string-match-p "obs-body" summary)))))))
+
+(ert-deftest anvil-memory-obs-summarize-skips-ai-when-flag-off ()
+  "use-ai-compression=nil never calls the orchestrator."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-ai))
+  (anvil-memory-obs-test--with-env
+    (let ((called nil))
+      (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+                 (lambda (&rest _args)
+                   (setq called t)
+                   (list :status 'done :summary
+                         "{\"topic\":\"X\",\"summary\":\"Y\"}"))))
+        (let ((anvil-memory-obs-enabled t)
+              (anvil-memory-obs-use-ai-compression nil)
+              (anvil-memory-obs-compress-min-observations 3))
+          (anvil-memory-obs-test--seed-session "ai4" 4)
+          (anvil-memory-obs-summarize-session "ai4")
+          (should (null called)))))))
+
+(ert-deftest anvil-memory-obs-summarize-force-fallback-bypasses-ai ()
+  "FORCE-FALLBACK=t skips AI even when use-ai-compression=t."
+  (skip-unless (anvil-memory-obs-test--supported-p 'compress-ai))
+  (anvil-memory-obs-test--with-env
+    (let ((called nil))
+      (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+                 (lambda (&rest _args)
+                   (setq called t)
+                   (list :status 'done :summary
+                         "{\"topic\":\"X\",\"summary\":\"Y\"}"))))
+        (let ((anvil-memory-obs-enabled t)
+              (anvil-memory-obs-use-ai-compression t)
+              (anvil-memory-obs-compress-min-observations 3))
+          (anvil-memory-obs-test--seed-session "ai5" 4)
+          (anvil-memory-obs-summarize-session "ai5" t)
+          (should (null called)))))))
+
+
 ;;;; --- purge tests --------------------------------------------------------
 
 (ert-deftest anvil-memory-obs-purge-removes-old-low-importance ()
