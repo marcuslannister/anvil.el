@@ -286,14 +286,6 @@ both are unset."
 
 ;;;; --- scanner -----------------------------------------------------------
 
-(defun anvil-defs--kinds-function ()
-  "Forms whose name denotes a function or macro for `arity_*' extraction.
-Reads `anvil-sexp--function-defining-forms' lazily so the top
-level of `anvil-defs' does not depend on `anvil-sexp' loading
-(the two modules are mutually optional)."
-  (require 'anvil-sexp)
-  anvil-sexp--function-defining-forms)
-
 ;; Phase 6.5 (Doc 25) で nelisp-defs-index に同名 helper が port 済。
 ;; 本実装は nelisp-defs-index が load-path にあれば nelisp 版へ delegate、
 ;; なければ自前 fallback (anvil 単体動作保証)。下記 5 helpers は purely
@@ -388,7 +380,14 @@ defalias-defined symbols inherit their target's arity.  The two
            (tail (cdr sexp))
            (second (car-safe tail)))
       (cond
-       ((not (memq op (anvil-defs--kinds-function))) nil)
+       ;; Lazy-load `anvil-sexp' for `anvil-sexp--function-defining-forms'
+       ;; (inlined from the former `anvil-defs--kinds-function').  The
+       ;; primary path delegates to `nelisp-defs-index--arglist' above,
+       ;; so this fallback only runs in anvil-only environments where
+       ;; nelisp-defs-index is not loaded.
+       ((not (progn (require 'anvil-sexp)
+                    (memq op anvil-sexp--function-defining-forms)))
+        nil)
        ;; (cl-defmethod NAME [KW ...] ARGLIST BODY).  Skip qualifier
        ;; keywords between NAME and the real arglist.
        ((eq op 'cl-defmethod)
