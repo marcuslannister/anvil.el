@@ -225,7 +225,7 @@ Observations:
            compress-rule-based compress-ai compress-auto budget
            search timeline get summary-search mcp-tools
            auto-inject auto-inject-integration
-           promote-candidates promote)
+           promote-candidates promote ui)
   "Capability tags this module currently provides.
 Tests `skip-unless' their tag is in this list so a half-shipped
 feature never breaks CI.  Phase milestones append tags here.")
@@ -1517,6 +1517,228 @@ the candidate id and confirm the user wants to keep it permanently."))
 (defun anvil-memory-obs--unregister-tools ()
   (anvil-server-unregister-tools anvil-memory-obs--server-id
                                  anvil-memory-obs--tool-specs))
+
+
+;;;; --- Phase 5: Tabulated-list UI ----------------------------------------
+
+(defcustom anvil-memory-obs-ui-row-cap 500
+  "Maximum number of rows the observation / summary list views render."
+  :type 'integer
+  :group 'anvil-memory-obs)
+
+(defun anvil-memory-obs--ts-string (ts)
+  "Format TS (unix epoch integer) as YYYY-MM-DD HH:MM:SS."
+  (if (integerp ts)
+      (format-time-string "%F %T" ts)
+    ""))
+
+(defun anvil-memory-obs--truncate (s n)
+  "Truncate string S to at most N characters."
+  (let ((s (or s "")))
+    (if (> (length s) n) (substring s 0 n) s)))
+
+
+;; --- observations view ---
+
+(defun anvil-memory-obs--observations-entries ()
+  "Build `tabulated-list-entries' from `obs_observations' (newest first)."
+  (let* ((db (anvil-memory-obs--db))
+         (rows (sqlite-select
+                db
+                "SELECT id, ts, session_id, hook, tool_name, body, importance
+                   FROM obs_observations
+                  ORDER BY id DESC
+                  LIMIT ?"
+                (list anvil-memory-obs-ui-row-cap))))
+    (mapcar
+     (lambda (r)
+       (list (number-to-string (nth 0 r))
+             (vector
+              (number-to-string (nth 0 r))
+              (anvil-memory-obs--ts-string (nth 1 r))
+              (or (nth 2 r) "")
+              (or (nth 3 r) "")
+              (or (nth 4 r) "")
+              (anvil-memory-obs--truncate (nth 5 r) 60)
+              (number-to-string (or (nth 6 r) 0)))))
+     rows)))
+
+(defvar anvil-memory-obs-observations-mode-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map tabulated-list-mode-map)
+    (define-key map (kbd "RET") #'anvil-memory-obs--obs-show-current)
+    (define-key map (kbd "g")   #'anvil-memory-obs--obs-refresh)
+    map)
+  "Keymap for `anvil-memory-obs-observations-mode'.")
+
+(define-derived-mode anvil-memory-obs-observations-mode tabulated-list-mode
+  "anvil-obs"
+  "Tabulated view of recent anvil-memory-obs observations."
+  (setq tabulated-list-format
+        [("id"      6  t)
+         ("ts"      19 t)
+         ("session" 16 t)
+         ("hook"    14 t)
+         ("tool"    10 t)
+         ("preview" 60 nil)
+         ("imp"     5  t :right-align t)]
+        tabulated-list-padding 2
+        tabulated-list-sort-key '("id" . t))
+  (tabulated-list-init-header))
+
+(defun anvil-memory-obs--obs-refresh ()
+  "Re-query the obs DB and reprint the current observations buffer."
+  (interactive)
+  (setq tabulated-list-entries (anvil-memory-obs--observations-entries))
+  (tabulated-list-print t))
+
+(defun anvil-memory-obs--obs-show-current ()
+  "Show the full body / payload of the observation at point."
+  (interactive)
+  (let* ((id (tabulated-list-get-id))
+         (id-int (when id (string-to-number id)))
+         (rows (and id-int
+                    (anvil-memory-obs-get (list id-int))))
+         (row (car rows)))
+    (unless row
+      (user-error "No observation at point"))
+    (let ((buf (get-buffer-create "*anvil-memory-obs-observation*")))
+      (with-current-buffer buf
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert (format "id: %s\nts: %s\nsession: %s\nhook: %s\ntool: %s\nimportance: %s\n\n"
+                          (plist-get row :id)
+                          (anvil-memory-obs--ts-string (plist-get row :ts))
+                          (plist-get row :session-id)
+                          (plist-get row :hook)
+                          (plist-get row :tool-name)
+                          (plist-get row :importance)))
+          (insert "--- body ---\n")
+          (insert (or (plist-get row :body) "") "\n")
+          (insert "\n--- payload ---\n")
+          (insert (or (plist-get row :payload-json) "") "\n"))
+        (special-mode))
+      (pop-to-buffer buf))))
+
+;;;###autoload
+(defun anvil-memory-obs-observations ()
+  "Show recent observations in a Tabulated-list buffer."
+  (interactive)
+  (let ((buf (get-buffer-create "*anvil-memory-obs-observations*")))
+    (with-current-buffer buf
+      (anvil-memory-obs-observations-mode)
+      (setq tabulated-list-entries
+            (anvil-memory-obs--observations-entries))
+      (tabulated-list-print))
+    (pop-to-buffer buf)))
+
+
+;; --- summaries view ---
+
+(defun anvil-memory-obs--summaries-entries ()
+  "Build `tabulated-list-entries' from `obs_summaries' (newest first)."
+  (let* ((db (anvil-memory-obs--db))
+         (rows (sqlite-select
+                db
+                "SELECT id, ts, session_id, topic, summary, is_ai
+                   FROM obs_summaries
+                  ORDER BY id DESC
+                  LIMIT ?"
+                (list anvil-memory-obs-ui-row-cap))))
+    (mapcar
+     (lambda (r)
+       (list (number-to-string (nth 0 r))
+             (vector
+              (number-to-string (nth 0 r))
+              (anvil-memory-obs--ts-string (nth 1 r))
+              (or (nth 2 r) "")
+              (anvil-memory-obs--truncate (nth 3 r) 30)
+              (anvil-memory-obs--truncate (nth 4 r) 70)
+              (if (and (nth 5 r) (= (nth 5 r) 1)) "ai" "rule"))))
+     rows)))
+
+(defvar anvil-memory-obs-summaries-mode-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map tabulated-list-mode-map)
+    (define-key map (kbd "RET") #'anvil-memory-obs--sum-show-current)
+    (define-key map (kbd "g")   #'anvil-memory-obs--sum-refresh)
+    (define-key map (kbd "p")   #'anvil-memory-obs--sum-promote-current)
+    map)
+  "Keymap for `anvil-memory-obs-summaries-mode'.")
+
+(define-derived-mode anvil-memory-obs-summaries-mode tabulated-list-mode
+  "anvil-sum"
+  "Tabulated view of compressed anvil-memory-obs summaries."
+  (setq tabulated-list-format
+        [("id"      6  t)
+         ("ts"      19 t)
+         ("session" 16 t)
+         ("topic"   30 t)
+         ("summary" 70 nil)
+         ("kind"    5  t)]
+        tabulated-list-padding 2
+        tabulated-list-sort-key '("id" . t))
+  (tabulated-list-init-header))
+
+(defun anvil-memory-obs--sum-refresh ()
+  "Re-query the obs DB and reprint the current summaries buffer."
+  (interactive)
+  (setq tabulated-list-entries (anvil-memory-obs--summaries-entries))
+  (tabulated-list-print t))
+
+(defun anvil-memory-obs--sum-current-id ()
+  "Return the integer summary id at point, or nil."
+  (let ((id (tabulated-list-get-id)))
+    (when id (string-to-number id))))
+
+(defun anvil-memory-obs--sum-show-current ()
+  "Show the full topic / summary text for the row at point."
+  (interactive)
+  (let* ((id (anvil-memory-obs--sum-current-id))
+         (row (and id (car (sqlite-select
+                            (anvil-memory-obs--db)
+                            "SELECT session_id, topic, summary, is_ai, ts
+                               FROM obs_summaries WHERE id = ?"
+                            (list id))))))
+    (unless row
+      (user-error "No summary at point"))
+    (let ((buf (get-buffer-create "*anvil-memory-obs-summary*")))
+      (with-current-buffer buf
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert (format "id: %s\nts: %s\nsession: %s\ntopic: %s\nkind: %s\n\n"
+                          id
+                          (anvil-memory-obs--ts-string (nth 4 row))
+                          (or (nth 0 row) "")
+                          (or (nth 1 row) "")
+                          (if (and (nth 3 row) (= (nth 3 row) 1)) "ai" "rule")))
+          (insert "--- summary ---\n")
+          (insert (or (nth 2 row) "") "\n"))
+        (special-mode))
+      (pop-to-buffer buf))))
+
+(defun anvil-memory-obs--sum-promote-current ()
+  "Promote the summary at point via `anvil-memory-obs-promote'."
+  (interactive)
+  (let* ((id (anvil-memory-obs--sum-current-id)))
+    (unless id (user-error "No summary at point"))
+    (when (yes-or-no-p (format "Promote summary %d to auto-memory? " id))
+      (let ((result (anvil-memory-obs-promote id)))
+        (message "Promoted to %s (index updated: %s)"
+                 (plist-get result :file)
+                 (plist-get result :index-updated))))))
+
+;;;###autoload
+(defun anvil-memory-obs-summaries ()
+  "Show compressed summaries in a Tabulated-list buffer."
+  (interactive)
+  (let ((buf (get-buffer-create "*anvil-memory-obs-summaries*")))
+    (with-current-buffer buf
+      (anvil-memory-obs-summaries-mode)
+      (setq tabulated-list-entries
+            (anvil-memory-obs--summaries-entries))
+      (tabulated-list-print))
+    (pop-to-buffer buf)))
 
 
 ;;;; --- enable / disable --------------------------------------------------
