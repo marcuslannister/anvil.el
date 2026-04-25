@@ -1286,6 +1286,112 @@ match, the candidate is filtered out."
   (should (<= (length (anvil-memory-obs--slug (make-string 200 ?a))) 30)))
 
 
+;;;; --- Phase 5: Tabulated-list UI tests ----------------------------------
+
+(ert-deftest anvil-memory-obs-observations-entries-shape ()
+  "observations entries return one row per obs, with vector cells."
+  (skip-unless (anvil-memory-obs-test--supported-p 'ui))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-memory-obs-test--seed-session "ui1" 3)
+      (let ((entries (anvil-memory-obs--observations-entries)))
+        (should (= (length entries) 3))
+        (let ((row (car entries)))
+          ;; Tabulated-list entries are (id . [v0 v1 ...]).
+          (should (stringp (car row)))
+          (should (vectorp (nth 1 row)))
+          (should (= (length (nth 1 row)) 7)))))))
+
+(ert-deftest anvil-memory-obs-observations-entries-newest-first ()
+  "observations entries are ordered by id DESC."
+  (skip-unless (anvil-memory-obs-test--supported-p 'ui))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-memory-obs-test--seed-session "ui2" 4)
+      (let* ((entries (anvil-memory-obs--observations-entries))
+             (ids (mapcar (lambda (e)
+                            (string-to-number (car e)))
+                          entries)))
+        (should (equal ids (sort (copy-sequence ids) #'>)))))))
+
+(ert-deftest anvil-memory-obs-observations-entries-respect-row-cap ()
+  "Row cap is honoured by the entries function."
+  (skip-unless (anvil-memory-obs-test--supported-p 'ui))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-ui-row-cap 2))
+      (anvil-memory-obs-test--seed-session "ui3" 5)
+      (let ((entries (anvil-memory-obs--observations-entries)))
+        (should (= (length entries) 2))))))
+
+(ert-deftest anvil-memory-obs-observations-buffer-renders ()
+  "`anvil-memory-obs-observations' creates a properly-set-up buffer."
+  (skip-unless (anvil-memory-obs-test--supported-p 'ui))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (display-buffer-alist nil))
+      (anvil-memory-obs-test--seed-session "ui4" 3)
+      (save-window-excursion
+        (anvil-memory-obs-observations))
+      (let ((buf (get-buffer "*anvil-memory-obs-observations*")))
+        (unwind-protect
+            (progn
+              (should buf)
+              (with-current-buffer buf
+                (should (eq major-mode 'anvil-memory-obs-observations-mode))
+                (should (vectorp tabulated-list-format))
+                (should tabulated-list-entries)))
+          (when buf (kill-buffer buf)))))))
+
+
+;; --- summaries view -----
+
+(ert-deftest anvil-memory-obs-summaries-entries-shape ()
+  "Summaries entries return one row per summary with 6-cell vectors."
+  (skip-unless (anvil-memory-obs-test--supported-p 'ui))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3))
+      (anvil-memory-obs-test--seed-session "uis1" 4)
+      (anvil-memory-obs-summarize-session "uis1")
+      (let ((entries (anvil-memory-obs--summaries-entries)))
+        (should (= (length entries) 1))
+        (should (= (length (nth 1 (car entries))) 6))))))
+
+(ert-deftest anvil-memory-obs-summaries-entries-mark-ai-vs-rule ()
+  "Kind cell is `ai' for AI summaries and `rule' otherwise."
+  (skip-unless (anvil-memory-obs-test--supported-p 'ui))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t))
+      (anvil-memory-obs--upsert-session "uis2")
+      (anvil-memory-obs--insert-summary "uis2" "tA" "ai-body"   1 1 1)
+      (anvil-memory-obs--insert-summary "uis2" "tB" "rule-body" 1 1 nil)
+      (let* ((entries (anvil-memory-obs--summaries-entries))
+             (kinds (mapcar (lambda (e) (aref (nth 1 e) 5)) entries)))
+        (should (member "ai" kinds))
+        (should (member "rule" kinds))))))
+
+(ert-deftest anvil-memory-obs-summaries-buffer-renders ()
+  "`anvil-memory-obs-summaries' creates a properly-set-up buffer."
+  (skip-unless (anvil-memory-obs-test--supported-p 'ui))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-compress-min-observations 3)
+          (display-buffer-alist nil))
+      (anvil-memory-obs-test--seed-session "uis3" 4)
+      (anvil-memory-obs-summarize-session "uis3")
+      (save-window-excursion
+        (anvil-memory-obs-summaries))
+      (let ((buf (get-buffer "*anvil-memory-obs-summaries*")))
+        (unwind-protect
+            (progn
+              (should buf)
+              (with-current-buffer buf
+                (should (eq major-mode 'anvil-memory-obs-summaries-mode))
+                (should tabulated-list-entries)))
+          (when buf (kill-buffer buf)))))))
+
+
 ;;;; --- purge tests --------------------------------------------------------
 
 (ert-deftest anvil-memory-obs-purge-removes-old-low-importance ()
