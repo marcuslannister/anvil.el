@@ -50,6 +50,12 @@
 ;; anvil.el).  Soft load — defer to require so byte-compile works in
 ;; both anvil-only and anvil+nelisp environments.
 (require 'nelisp-defs-index nil 'noerror)
+;; `--excluded-p' rebinds the nelisp-side defvar via `let' to honour
+;; user customisation of `anvil-defs-exclude-patterns'.  Declare the
+;; symbol as special so byte-compile in an anvil-only environment
+;; (nelisp-defs-index not loaded) treats the binding as dynamic
+;; rather than emitting "unused lexical variable".
+(defvar nelisp-defs-index-exclude-patterns)
 
 ;; anvil-sexp is required lazily (inside functions that use its
 ;; reader helpers) because anvil-sexp also optionally requires us
@@ -249,9 +255,17 @@ user's responsibility (and cheap — sub-second on project scale)."
 ;;;; --- file discovery ---------------------------------------------------
 
 (defun anvil-defs--excluded-p (path)
-  "Return non-nil when PATH matches one of `anvil-defs-exclude-patterns'."
-  (cl-some (lambda (re) (string-match-p re path))
-           anvil-defs-exclude-patterns))
+  "Return non-nil when PATH matches one of `anvil-defs-exclude-patterns'.
+Delegates to `nelisp-defs-index--excluded-p' when available, with the
+nelisp pattern variable temporarily rebound to `anvil-defs-exclude-patterns'
+so user customisation on the anvil side wins (the two defvars carry
+identical defaults, but anvil exposes a `defcustom' that users may
+extend)."
+  (if (fboundp 'nelisp-defs-index--excluded-p)
+      (let ((nelisp-defs-index-exclude-patterns anvil-defs-exclude-patterns))
+        (nelisp-defs-index--excluded-p path))
+    (cl-some (lambda (re) (string-match-p re path))
+             anvil-defs-exclude-patterns)))
 
 (defun anvil-defs--collect-files (&optional paths)
   "Return absolute .el paths under PATHS (default `anvil-defs-paths').
@@ -356,30 +370,43 @@ Handles shapes the naive (caddr sexp) form misses:
     is a docstring rather than an arglist (returns nil — arity is
     not statically extractable for those macros)
   - `cl-defstruct' whose CADR is `(NAME :option ...)' and has no
-    separate arglist (returns nil)."
-  (let* ((op (car sexp))
-         (tail (cdr sexp))
-         (second (car-safe tail)))
-    (cond
-     ((not (memq op (anvil-defs--kinds-function))) nil)
-     ;; (cl-defmethod NAME [KW ...] ARGLIST BODY).  Skip qualifier
-     ;; keywords between NAME and the real arglist.
-     ((eq op 'cl-defmethod)
-      (let ((rest (cdr-safe tail)))
-        (while (and rest (keywordp (car rest)))
-          (setq rest (cdr rest)))
-        (let ((candidate (car-safe rest)))
-          (when (listp candidate) candidate))))
-     ;; Define-*-mode macros — no statically-known arglist shape.
-     ((memq op '(define-minor-mode define-derived-mode
-                 define-globalized-minor-mode
-                 define-obsolete-function-alias))
-      nil)
-     ;; Standard (OP NAME ARGLIST ...) shape.
-     (t
-      (let ((third (car-safe (cdr-safe tail))))
-        (when (and (symbolp second) (listp third))
-          third))))))
+    separate arglist (returns nil)
+Delegates to `nelisp-defs-index--arglist' when available.
+
+Behavioural divergence (untested, anvil-only): the legacy fallback
+recognises `defalias' / `define-globalized-minor-mode' /
+`define-obsolete-function-alias' via `anvil-sexp--function-defining-forms'
+but the nelisp backend does not list them.  After delegation,
+`defalias' arity goes from a misleading `(2 . 2)' (taking the quoted
+target symbol shape as a 2-arg arglist) to `nil' — a bug fix, since
+defalias-defined symbols inherit their target's arity.  The two
+`define-*-mode' / `-obsolete-function-alias' cases already returned
+`nil' on both sides."
+  (if (fboundp 'nelisp-defs-index--arglist)
+      (nelisp-defs-index--arglist sexp)
+    (let* ((op (car sexp))
+           (tail (cdr sexp))
+           (second (car-safe tail)))
+      (cond
+       ((not (memq op (anvil-defs--kinds-function))) nil)
+       ;; (cl-defmethod NAME [KW ...] ARGLIST BODY).  Skip qualifier
+       ;; keywords between NAME and the real arglist.
+       ((eq op 'cl-defmethod)
+        (let ((rest (cdr-safe tail)))
+          (while (and rest (keywordp (car rest)))
+            (setq rest (cdr rest)))
+          (let ((candidate (car-safe rest)))
+            (when (listp candidate) candidate))))
+       ;; Define-*-mode macros — no statically-known arglist shape.
+       ((memq op '(define-minor-mode define-derived-mode
+                   define-globalized-minor-mode
+                   define-obsolete-function-alias))
+        nil)
+       ;; Standard (OP NAME ARGLIST ...) shape.
+       (t
+        (let ((third (car-safe (cdr-safe tail))))
+          (when (and (symbolp second) (listp third))
+            third)))))))
 
 (defun anvil-defs--walk-each (xs fn)
   "Apply FN to each element of XS, tolerating improper / dotted lists.
