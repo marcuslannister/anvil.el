@@ -129,7 +129,7 @@ Set to nil to keep every row regardless of importance."
   :group 'anvil-memory-obs)
 
 (defconst anvil-memory-obs-supported
-  '(schema record importance redact integration)
+  '(schema record importance redact integration purge)
   "Capability tags this module currently provides.
 Tests `skip-unless' their tag is in this list so a half-shipped
 feature never breaks CI.  Phase milestones append tags here.")
@@ -411,6 +411,65 @@ SUMMARY is the (truncated) tool result/argument summary."
        :hook "session-end"
        :body (format "session %s ended" session-id)
        :ts now))))
+
+
+;;;; --- purge --------------------------------------------------------------
+
+(defun anvil-memory-obs-purge (&optional age-days importance-threshold)
+  "Delete observation rows older than AGE-DAYS with importance below threshold.
+AGE-DAYS defaults to `anvil-memory-obs-purge-age-days'.
+IMPORTANCE-THRESHOLD defaults to
+`anvil-memory-obs-purge-importance-threshold'.  When the threshold
+is nil, no rows are deleted regardless of age.
+Returns the number of observation rows removed."
+  (let* ((db (anvil-memory-obs--db))
+         (age (or age-days anvil-memory-obs-purge-age-days))
+         (thr (or importance-threshold
+                  anvil-memory-obs-purge-importance-threshold))
+         (cutoff (- (anvil-memory-obs--now) (* age 24 60 60))))
+    (if (null thr)
+        0
+      ;; Capture target ids first so the FTS5 mirror delete and the
+      ;; main delete operate on the same set even if the clock ticks
+      ;; between the two statements.
+      (let* ((rows (sqlite-select
+                    db
+                    "SELECT id FROM obs_observations
+                      WHERE ts < ? AND importance < ?"
+                    (list cutoff thr)))
+             (ids (mapcar #'car rows)))
+        (when ids
+          (let ((placeholders (mapconcat (lambda (_) "?") ids ",")))
+            (sqlite-execute
+             db
+             (format "DELETE FROM obs_observations_fts WHERE rowid IN (%s)"
+                     placeholders)
+             ids)
+            (sqlite-execute
+             db
+             (format "DELETE FROM obs_observations WHERE id IN (%s)"
+                     placeholders)
+             ids)))
+        (length ids)))))
+
+
+;;;; --- enable / disable stubs --------------------------------------------
+
+(defun anvil-memory-obs-enable ()
+  "Enable the observation capture module.
+Phase 1 has no MCP tools to register; this stub exists so
+`anvil--load-module' can call it uniformly with other modules.
+Phase 3+ will register the search MCP tools here."
+  (interactive)
+  ;; Touch the DB so a misconfigured `anvil-memory-obs-db-path'
+  ;; surfaces immediately rather than at the first record call.
+  (when anvil-memory-obs-enabled
+    (ignore (anvil-memory-obs--db))))
+
+(defun anvil-memory-obs-disable ()
+  "Disable the observation capture module: close the DB if open."
+  (interactive)
+  (anvil-memory-obs--close))
 
 
 (provide 'anvil-memory-obs)

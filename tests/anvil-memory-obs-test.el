@@ -299,6 +299,89 @@
         (should (>= (length rows) 1))))))
 
 
+;;;; --- purge tests --------------------------------------------------------
+
+(ert-deftest anvil-memory-obs-purge-removes-old-low-importance ()
+  "Old observations with importance below the threshold are deleted."
+  (skip-unless (anvil-memory-obs-test--supported-p 'purge))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-purge-age-days 30)
+          (anvil-memory-obs-purge-importance-threshold 10))
+      (let* ((db (anvil-memory-obs--db))
+             (very-old (- (anvil-memory-obs--now) (* 60 24 60 60)))
+             (yesterday (- (anvil-memory-obs--now) (* 1 24 60 60))))
+        (anvil-memory-obs--upsert-session "p1")
+        (anvil-memory-obs--insert-observation
+         :session-id "p1" :hook "post-tool-use"
+         :body "trivial read" :ts very-old)
+        (anvil-memory-obs--insert-observation
+         :session-id "p1" :hook "user-prompt"
+         :body "fresh prompt" :ts yesterday)
+        (let ((deleted (anvil-memory-obs-purge)))
+          (should (= deleted 1)))
+        (let ((rows (sqlite-select
+                     db "SELECT body FROM obs_observations")))
+          (should (= (length rows) 1))
+          (should (equal (nth 0 (car rows)) "fresh prompt")))))))
+
+(ert-deftest anvil-memory-obs-purge-keeps-high-importance ()
+  "Old observations with importance at or above threshold are retained."
+  (skip-unless (anvil-memory-obs-test--supported-p 'purge))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-purge-age-days 30)
+          (anvil-memory-obs-purge-importance-threshold 10))
+      (let* ((db (anvil-memory-obs--db))
+             (very-old (- (anvil-memory-obs--now) (* 60 24 60 60))))
+        (anvil-memory-obs--upsert-session "p2")
+        ;; "error" keyword bumps importance to 30, above threshold 10.
+        (anvil-memory-obs--insert-observation
+         :session-id "p2" :hook "user-prompt"
+         :body "saw a critical error in build" :ts very-old)
+        (should (zerop (anvil-memory-obs-purge)))
+        (should (= (length
+                    (sqlite-select db "SELECT id FROM obs_observations"))
+                   1))))))
+
+(ert-deftest anvil-memory-obs-purge-cleans-fts ()
+  "Purged rows are also removed from the FTS5 mirror."
+  (skip-unless (anvil-memory-obs-test--supported-p 'purge))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-purge-age-days 30)
+          (anvil-memory-obs-purge-importance-threshold 10))
+      (let* ((db (anvil-memory-obs--db))
+             (very-old (- (anvil-memory-obs--now) (* 60 24 60 60))))
+        (anvil-memory-obs--upsert-session "p3")
+        (anvil-memory-obs--insert-observation
+         :session-id "p3" :hook "post-tool-use"
+         :body "uniquetokenxyz" :ts very-old)
+        (anvil-memory-obs-purge)
+        (let ((rows (sqlite-select
+                     db
+                     "SELECT rowid FROM obs_observations_fts
+                       WHERE obs_observations_fts MATCH 'uniquetokenxyz'")))
+          (should (zerop (length rows))))))))
+
+(ert-deftest anvil-memory-obs-purge-with-nil-threshold-keeps-all ()
+  "Threshold = nil disables purge."
+  (skip-unless (anvil-memory-obs-test--supported-p 'purge))
+  (anvil-memory-obs-test--with-env
+    (let ((anvil-memory-obs-enabled t)
+          (anvil-memory-obs-purge-age-days 1)
+          (anvil-memory-obs-purge-importance-threshold nil))
+      (anvil-memory-obs--upsert-session "p4")
+      (anvil-memory-obs--insert-observation
+       :session-id "p4" :hook "user-prompt"
+       :body "ancient" :ts 0)
+      (should (zerop (anvil-memory-obs-purge)))
+      (should (= (length
+                  (sqlite-select (anvil-memory-obs--db)
+                                 "SELECT id FROM obs_observations"))
+                 1)))))
+
+
 ;;;; --- anvil-session integration tests ------------------------------------
 
 (require 'anvil-session nil t)
