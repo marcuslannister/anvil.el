@@ -1,0 +1,17 @@
+# gitleaks fingerprint allowlist for false-positive test fixtures.
+#
+# Each line is a fingerprint produced by `gitleaks detect --redact'
+# (commit-sha:path:rule-id:line-number).  Use sparingly — every entry
+# represents a fixture string that *intentionally* looks like a secret
+# so the surrounding test can exercise redaction / scrubbing logic.
+# When the fixture moves to a new line, regenerate the fingerprint.
+
+# tests/anvil-extend-phaseD-test.el:220 — fixture verifying that the
+# secret-scan whitelist suppresses both the env-var and `sk-…' regex
+# matches on the same line (T101 anvil-extend Phase C).
+6d69255bfb356f6b57d21852f289124b0b78d993:tests/anvil-extend-phaseD-test.el:generic-api-key:220
+
+# tests/anvil-memory-obs-test.el:280 — fixture verifying the
+# observation-record path redacts a fake `api_key=...' value before
+# storage (T102 anvil-extend Phase D memory rationale).
+ba09476dc3c439ce94467bba6351cd99645d1d6f:tests/anvil-memory-obs-test.el:generic-api-key:280

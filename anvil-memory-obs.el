@@ -1,4 +1,5 @@
 ;;; anvil-memory-obs.el --- Observation capture for session lifecycle  -*- lexical-binding: t; -*-
+;;; anvil-audit: tools-wrapped-at-registration
 
 ;; Copyright (C) 2026 zawatton
 
