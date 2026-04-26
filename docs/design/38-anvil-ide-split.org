@@ -5,14 +5,38 @@
 
 * Status
 :PROPERTIES:
-:STATE: DRAFT (= module audit + classification done; impl phases pending user signoff)
+:STATE: PHASE-B-SHIPPED (= 5/5 wave merged develop, Phase C-D pending)
 :CREATED: 2026-04-26
+:PHASE-A-SHIPPED: 2026-04-26
+:PHASE-B-SHIPPED: 2026-04-26
 :OWNER: zawatton
 :END:
 
-DRAFT 2026-04-26: NeLisp-side capability audit (= Explore agent dispatch,
-this commit) + per-module classification table closed.  Impl Phase B (=
-adapter wave) + Phase C-D (= rename + split) await separate user signoff.
+- Phase A (= classification audit) SHIPPED 2026-04-26 7fd181b.
+- Phase B (= adapter wave) SHIPPED 2026-04-26 (B1-B5 全 merge):
+  - B1 anvil-buffer = no change (PURE confirmed via NeLisp smoke ERT)
+  - B2 anvil-elisp = +294/-38, +7 ERT (= bafe183)
+  - B3 anvil-org-index = +59/-24 (= 6461d97)
+  - B4 anvil-org = +72/-7, classification + 5 PHASE-C marker (= f89161a)
+  - B5 anvil-browser = +4/-2 docstring-only (= e74ece1)
+  - make test-all 1601/1607 pass / 0 failed.
+- Phase C-D (= rename + split) await separate user signoff.
+
+** Audit corrections from Phase B execution
+
+Phase A の audit には 2 件の精度補正が必要 (= B1 + B5 で発見):
+
+- §2.1 *anvil-buffer*: "drop-in compatible" 表現は不正確。NeLisp の
+  =nelisp-emacs-compat.el= は drop-in 置換でなく、=nelisp-ec-*= prefix
+  の **namespace-disjoint な parallel buffer world**。Stage D = NeLisp
+  が Emacs *内*で動く構成、anvil-buffer はネイティブ Emacs buffer 使用、
+  両 buffer world が共存。PURE 分類は実用上正解だが理由が違う。
+
+- §1.1 *anvil-browser*: "1 ヶ所の =org-capture-templates= 参照" は
+  実は **docstring 内 backquote ref** (= =anvil-browser.el:119=)、
+  runtime read/write でない。byte-compiler は docstring backquote の
+  bind-check しない、anvil-browser は org-mode 不要で既に load 可能。
+  Phase B5 では docstring を明確化 (= 4 行修正) のみ実施。
 
 * §0 要旨
 
