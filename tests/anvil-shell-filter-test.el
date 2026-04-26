@@ -527,6 +527,72 @@
   (should (eq 'ruff          (anvil-shell-filter-lookup "ruff check src/"))))
 
 
+;;;; --- tee-grep regex line filter ----------------------------------------
+
+(ert-deftest anvil-shell-filter-test/tee-grep-keeps-matching-lines ()
+  "tee-grep returns only lines matching the regex."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee-grep))
+  (let* ((raw "alpha line\nbeta line\ngamma line\nalpha tail\n")
+         (out (anvil-shell-filter--grep-lines raw "alpha" 200 0)))
+    (should (equal (cdr out) "alpha line\nalpha tail"))
+    (should (null (car out)))))
+
+(ert-deftest anvil-shell-filter-test/tee-grep-truncates-long-lines ()
+  "tee-grep truncates per-line beyond max-line-bytes with sentinel."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee-grep))
+  (let* ((long (concat "OVERALL: " (make-string 500 ?x)))
+         (raw (concat long "\n"))
+         (out (cdr (anvil-shell-filter--grep-lines raw "OVERALL" 80 0))))
+    (should (< (length out) 100))
+    (should (string-match-p "…(\\([0-9]+\\) bytes elided)" out))))
+
+(ert-deftest anvil-shell-filter-test/tee-grep-tail-fallback-on-zero-match ()
+  "tee-grep falls back to last N lines when regex yields zero matches."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee-grep))
+  (let* ((raw "line1\nline2\nline3\nline4\nline5\n")
+         (cell (anvil-shell-filter--grep-lines raw "ZZZ-no-match" 200 2))
+         (used (car cell))
+         (out (cdr cell)))
+    (should used)
+    (should (string-match-p "line5" out))
+    (should-not (string-match-p "line1" out))))
+
+(ert-deftest anvil-shell-filter-test/tee-grep-tail-fallback-disabled ()
+  "tee-grep returns empty string when fallback is 0 + zero matches."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee-grep))
+  (let* ((raw "line1\nline2\n")
+         (cell (anvil-shell-filter--grep-lines raw "ZZZ" 200 0)))
+    (should (null (car cell)))
+    (should (string-empty-p (cdr cell)))))
+
+(ert-deftest anvil-shell-filter-test/tee-grep-truncate-line-helper ()
+  "`--truncate-line' wraps oversized strings with elision sentinel."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee-grep))
+  (should (equal (anvil-shell-filter--truncate-line "abc" 10) "abc"))
+  (let ((out (anvil-shell-filter--truncate-line (make-string 200 ?y) 60)))
+    (should (< (length out) 80))
+    (should (string-match-p "…(140 bytes elided)\\'" out))))
+
+(ert-deftest anvil-shell-filter-test/tee-grep-end-to-end ()
+  "End-to-end: shell echo + grep + tee + match-count + raw retrieval."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee-grep))
+  (anvil-shell-filter-test--with-state
+   (let* ((cmd "printf 'fib-30 PASS 12.4x\\nfact-iter FAIL 0.3x\\nOVERALL: PASS\\n'")
+          (result (anvil-shell-filter-tee-grep cmd
+                                               :grep "OVERALL\\|PASS\\|FAIL"
+                                               :max-line-bytes 200
+                                               :tail-fallback 0)))
+     (should (= 0 (plist-get result :exit)))
+     (should (= 3 (plist-get result :match-count)))
+     (should (null (plist-get result :used-fallback)))
+     (should (string-match-p "OVERALL: PASS" (plist-get result :compressed)))
+     (should (< (plist-get result :compressed-size)
+                (plist-get result :raw-size)))
+     (should (stringp (plist-get result :tee-id)))
+     (let ((raw (anvil-shell-filter-tee-get (plist-get result :tee-id))))
+       (should (string-match-p "fib-30 PASS" raw))))))
+
+
 (provide 'anvil-shell-filter-test)
 
 ;;; anvil-shell-filter-test.el ends here

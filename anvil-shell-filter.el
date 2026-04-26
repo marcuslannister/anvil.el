@@ -80,7 +80,7 @@
                emacs-batch make dispatch tee gain
                gh git-log-graph pip-install npm-install
                docker-ps docker-logs kubectl-get aws-s3-ls
-               prettier ruff phase2a-dispatch)
+               prettier ruff phase2a-dispatch tee-grep)
   "Capability tags this module currently provides.
 Tests in tests/anvil-shell-filter-test.el gate their `skip-unless'
 on membership here so a half-shipped filter never breaks CI.  The
@@ -112,6 +112,20 @@ same list so each test can self-describe its capability gate.")
 
 (defcustom anvil-shell-filter-default-timeout 60
   "Timeout (seconds) for `anvil-shell-filter-run' shell invocations."
+  :type 'integer
+  :group 'anvil-shell-filter)
+
+(defcustom anvil-shell-tee-grep-default-max-line-bytes 200
+  "Per-line truncation cap used by `anvil-shell-filter-tee-grep'.
+Lines longer than this are wrapped with a `…(N bytes elided)' sentinel
+so the compressed output stays predictable for downstream parsers."
+  :type 'integer
+  :group 'anvil-shell-filter)
+
+(defcustom anvil-shell-tee-grep-default-tail-fallback 50
+  "When an `anvil-shell-filter-tee-grep' regex matches zero lines, return
+the last N lines of stdout as a fallback rather than an empty result.
+Set to 0 to disable the fallback."
   :type 'integer
   :group 'anvil-shell-filter)
 
@@ -696,6 +710,99 @@ detail."
           :truncated truncated)))
 
 
+;;;; --- tee-grep: regex line filter + per-line truncate -------------------
+
+(defun anvil-shell-filter--truncate-line (line max-bytes)
+  "Return LINE truncated to MAX-BYTES (with elision sentinel) when longer."
+  (if (or (null max-bytes) (zerop max-bytes) (<= (length line) max-bytes))
+      line
+    (format "%s…(%d bytes elided)"
+            (substring line 0 (max 1 (- max-bytes 24)))
+            (- (length line) max-bytes))))
+
+(defun anvil-shell-filter--grep-lines (raw regex max-line-bytes tail-fallback)
+  "Return lines from RAW that match REGEX, each truncated to MAX-LINE-BYTES.
+When zero lines match, return the last TAIL-FALLBACK lines instead."
+  (let* ((lines (split-string (or raw "") "\n" nil))
+         (matches (cl-remove-if-not
+                   (lambda (l) (string-match-p regex l))
+                   lines))
+         (used-fallback nil)
+         (selected
+          (if (and (null matches) (> tail-fallback 0))
+              (progn (setq used-fallback t)
+                     (let ((n (length lines)))
+                       (if (<= n tail-fallback)
+                           lines
+                         (nthcdr (- n tail-fallback) lines))))
+            matches)))
+    (cons used-fallback
+          (mapconcat (lambda (l)
+                       (anvil-shell-filter--truncate-line l max-line-bytes))
+                     selected
+                     "\n"))))
+
+;;;###autoload
+(defun anvil-shell-filter-tee-grep (cmd &rest opts)
+  "Run shell CMD, return only stdout lines matching `:grep' regex.
+Each retained line is truncated to `:max-line-bytes' (default
+`anvil-shell-tee-grep-default-max-line-bytes').  Raw stdout is always
+tee'd so callers can fetch the full output via `shell-tee-get'.
+
+OPTS plist:
+  :grep             regex; lines that don't match are dropped (required)
+  :max-line-bytes   per-line truncation cap (default 200)
+  :tail-fallback    when zero lines match, return last N lines instead
+                    (default 50; pass 0 to disable)
+  :timeout          seconds, defaults to `--default-timeout'
+  :cwd              working directory
+
+Returns a plist:
+  :exit             shell exit code
+  :compressed       filtered output (newline-joined)
+  :raw-size         length of raw stdout
+  :compressed-size  length of compressed output
+  :match-count      number of lines selected
+  :used-fallback    t when tail-fallback was triggered
+  :tee-id           id under which raw stdout was saved
+  :stderr           raw stderr
+  :truncated        non-nil when shell buffers truncated"
+  (let* ((grep (or (plist-get opts :grep)
+                   (error "anvil-shell-filter-tee-grep: :grep is required")))
+         (max-line-bytes (or (plist-get opts :max-line-bytes)
+                             anvil-shell-tee-grep-default-max-line-bytes))
+         (tail-fallback (let ((v (plist-get opts :tail-fallback)))
+                          (if (numberp v) v
+                            anvil-shell-tee-grep-default-tail-fallback)))
+         (timeout (or (plist-get opts :timeout)
+                      anvil-shell-filter-default-timeout))
+         (cwd (plist-get opts :cwd))
+         (result (anvil-shell cmd (list :timeout timeout :cwd cwd
+                                        :max-output nil)))
+         (exit (plist-get result :exit))
+         (raw (or (plist-get result :stdout) ""))
+         (stderr (or (plist-get result :stderr) ""))
+         (truncated (plist-get result :truncated))
+         (grep-result (anvil-shell-filter--grep-lines
+                       raw grep max-line-bytes tail-fallback))
+         (used-fallback (car grep-result))
+         (compressed (cdr grep-result))
+         (raw-size (length raw))
+         (compressed-size (length compressed))
+         (tee-id (anvil-shell-filter--tee-put raw))
+         (match-count (length (split-string compressed "\n" nil))))
+    (anvil-shell-filter--gain-record 'tee-grep raw-size compressed-size)
+    (list :exit exit
+          :compressed compressed
+          :raw-size raw-size
+          :compressed-size compressed-size
+          :match-count (if (string-empty-p compressed) 0 match-count)
+          :used-fallback used-fallback
+          :tee-id tee-id
+          :stderr stderr
+          :truncated truncated)))
+
+
 ;;;; --- MCP tool handlers --------------------------------------------------
 
 (defun anvil-shell-filter--coerce-int (v default)
@@ -770,6 +877,39 @@ case."
            :raw (or raw "")
            :found (and raw t)))))
 
+(defun anvil-shell-filter--tool-shell-tee-grep
+    (cmd grep &optional max_line_bytes tail_fallback timeout_sec cwd)
+  "Run shell CMD, return only stdout lines matching GREP regex.
+
+MCP Parameters:
+  cmd             - Shell command line.  Required.
+  grep            - Regex; lines that don't match are dropped.  Required.
+  max_line_bytes  - Per-line truncation cap (default 200).
+  tail_fallback   - When zero lines match, return last N lines instead
+                    (default 50; pass 0 to disable).
+  timeout_sec     - Optional timeout override in seconds.
+  cwd             - Optional working directory.
+
+Returns (:exit :compressed :raw-size :compressed-size :match-count
+:used-fallback :tee-id :stderr :truncated).  Raw stdout is always
+saved under the tee namespace; recover via `shell-tee-get'."
+  (anvil-server-with-error-handling
+   (let* ((max-line (anvil-shell-filter--coerce-int
+                     max_line_bytes
+                     anvil-shell-tee-grep-default-max-line-bytes))
+          (tail (anvil-shell-filter--coerce-int
+                 tail_fallback
+                 anvil-shell-tee-grep-default-tail-fallback))
+          (timeout (anvil-shell-filter--coerce-int
+                    timeout_sec anvil-shell-filter-default-timeout))
+          (cwd* (and (stringp cwd) (not (string-empty-p cwd)) cwd)))
+     (anvil-shell-filter-tee-grep cmd
+                                  :grep grep
+                                  :max-line-bytes max-line
+                                  :tail-fallback tail
+                                  :timeout timeout
+                                  :cwd cwd*))))
+
 (defun anvil-shell-filter--tool-shell-gain (&optional days)
   "Return cumulative filter savings over the last DAYS days.
 
@@ -814,6 +954,20 @@ callers re-compress output they already have (from a prior
 Retention is governed by `anvil-shell-tee-ttl-sec' (default 1h);
 expired ids return :found nil."
      :read-only t)
+
+    (,(anvil-server-encode-handler #'anvil-shell-filter--tool-shell-tee-grep)
+     :id "shell-tee-grep"
+     :intent '(shell)
+     :layer 'io
+     :description
+     "Run a shell command, drop stdout lines that don't match GREP regex,
+truncate each retained line to MAX_LINE_BYTES (default 200), and tee
+the raw stdout for later retrieval via `shell-tee-get'.  When zero
+lines match GREP, falls back to the last TAIL_FALLBACK lines (default
+50) so the caller never gets an empty result by accident.  Designed
+for `make bench-actual', `cargo test', `pytest', etc — extract just
+the OVERALL / gate / fail-summary lines without parsing on the
+client side.")
 
     (,(anvil-server-encode-handler #'anvil-shell-filter--tool-shell-gain)
      :id "shell-gain"
