@@ -81,3 +81,44 @@ The problems I had — "I can't edit large org files," "Excel makes communicatio
 
 Humans build tools, and then build the next thing using those tools — let's use Anvil to forge Emacs into the AI's strongest tool!!
 With Emacs, that is possible.
+
+* Phase 4 — NeLisp integration era (v1.0)
+
+Phase 3 made Emacs the AI's strongest tool. Phase 4 makes the same
+workbench reachable for people who don't want to install Emacs.
+
+The pivot is [[https://github.com/zawatton/nelisp][NeLisp]] — a pure-Elisp implementation of the Emacs Lisp
+runtime, with its own native compiler and a small Rust binary
+(=anvil-runtime=, ~421KB) that reads + evaluates Elisp without
+needing the Emacs C core.
+
+What this means in practice:
+
+- =bin/anvil mcp serve --no-emacs= now spawns the Rust binary directly
+  — zero Emacs processes at runtime.
+- The same anvil tools (file-batch, shell-tee-grep, http-fetch,
+  data-set-path, …) are exposed through MCP, served by the Rust
+  evaluator instead of an emacs --batch subprocess.
+- Existing Emacs users keep using anvil exactly as before — the
+  bundled-Emacs path (=bin/anvil mcp serve=, default) is unchanged.
+
+For new users, distribution is now a single tarball:
+
+#+BEGIN_SRC sh
+tar xzf anvil-stage-d-v3.0-linux-x86_64.tar.gz   # ~2.3 MB
+./anvil-stage-d-v3.0/bin/anvil mcp serve --no-emacs
+#+END_SRC
+
+No Emacs install, no Cask, no MELPA dance — just the Rust binary +
+anvil source + NeLisp libraries.
+
+The IDE-side layer (treesit code navigation, the worker dashboard,
+Info/Help lookup) split out into [[https://github.com/zawatton/anvil-ide.el][anvil-ide.el]] in the same release.
+What's left in =anvil.el= is the AI-side workbench: stdio MCP server,
+tool registry, library helpers. Human IDE features and AI tooling
+now live in separate packages, free to evolve at different speeds.
+
+The original premise hasn't changed — humans build tools, then build
+the next thing using those tools. v1.0 just removes the last
+prerequisite from the AI side: you no longer need to be an Emacs
+user to bring the workbench to the agent.
