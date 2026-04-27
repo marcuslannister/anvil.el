@@ -55,8 +55,36 @@ Phase A の audit には 3 件の精度補正:
   =treesit-*= wrap で Emacs 29+ tree-sitter binding 必須。Phase E で
   =(require 'anvil-ide-treesit nil 'noerror)= に soft 化 + test
   =--ide-ready= predicate gating で対応 (= ide layer 抜きでは skip)。
-  将来 *Phase F* で 3 module 自体を anvil-ide.el 行きに再分類するか、
-  もしくは NeLisp 側に tree-sitter binding 追加で PURE 維持か再判断。
+  *Phase F* (2026-04-27 SHIPPED) で backend 抽象化 (= AI 利用考慮で
+  anvil.el 残留)。
+
+** Phase F SHIPPED (= treesit backend abstraction)
+
+user 指摘 "AI も TS/JS/Python 編集する時に使えた方が良い" を反映、
+ts/js/py を anvil-ide.el 行きにせず anvil.el に残し、treesit 依存を
+backend 抽象化:
+
+- =anvil-treesit-backend.el= (新規 484 LOC):
+  - =anvil-treesit-backend-pick LANG= → 'treesit / 'subprocess / nil
+  - =-parse / -query / -node-text / -node-range= 4 base op
+  - 既存 =anvil-treesit-*= helper API も 1:1 re-export (= 呼び出し側無修正)
+- treesit backend impl = SHIPPED (Emacs 経路は今すぐ動作)
+- subprocess backend = STUB (= =;; PHASE-G-SUBPROCESS-BACKEND-CANDIDATE=
+  marker、=:not-implemented-yet= 構造化 user-error 返却)
+- ts/js/py 3 file は require chain のみ更新 (= 各 ~13 LOC)
+
+test impact: =make test-all 1472/1599 → 1598/1604 pass / 0 failed=
+(= 126 IDE-gated test を in-tree で復活)。
+
+** Phase G — subprocess backend impl (= 未着手)
+
+NeLisp standalone で TS/JS/Python 構造解析を可能にする残作業:
+- TypeScript: =tsc --jsx= or tree-sitter CLI 経由 AST 取得
+- JavaScript: acorn / esbuild --analyze
+- Python: =python -c "import ast; print(...)"=
+
+Phase G impl = 4 stub function (= =anvil-treesit-backend-subprocess-*=)
+を実装するだけ、interface 確定済。
 
 ** Audit corrections from Phase B execution
 
