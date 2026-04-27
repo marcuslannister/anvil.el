@@ -5,13 +5,15 @@
 
 * Status
 :PROPERTIES:
-:STATE: PHASE-D-E-SHIPPED (= 全 phase 完了、anvil-ide.el extract repo は user 判断で GitHub 公開)
+:STATE: PHASE-G-SHIPPED (= 全 phase A-G 完了、anvil-ide.el extract repo は user 判断で GitHub 公開)
 :CREATED: 2026-04-26
 :PHASE-A-SHIPPED: 2026-04-26
 :PHASE-B-SHIPPED: 2026-04-26
 :PHASE-C-SHIPPED: 2026-04-27
 :PHASE-D-SHIPPED: 2026-04-27
 :PHASE-E-SHIPPED: 2026-04-27
+:PHASE-F-SHIPPED: 2026-04-27
+:PHASE-G-SHIPPED: 2026-04-27
 :OWNER: zawatton
 :END:
 
@@ -34,6 +36,14 @@
   6 ide file rm + ts/js/py を soft-noerror require + test に
   =--ide-ready= predicate gating + README update。
   make test-all 1472/1599 pass / 0 failed / 127 skipped (= 119 IDE-gated)。
+- Phase F (= treesit backend abstraction) SHIPPED 2026-04-27:
+  =anvil-treesit-backend.el= 新規 484 LOC、ts/js/py 3 module を backend
+  dispatch に切替、subprocess 経路は stub。make test-all 1598/1604。
+- Phase G (= subprocess backend impl) SHIPPED 2026-04-27:
+  4 base op (parse/query/node-text/node-range) が python3/acorn 経由
+  で実 AST を返す。tool 不在は構造化 =:tool-not-found= で graceful、
+  empty source / parse-error / unsupported-lang も全て plist 化。
+  +12 ERT (skip-unless on tool availability)、make test-all 1610/1616。
 
 ** Audit corrections from Phase B + D-E execution
 
@@ -76,15 +86,59 @@ backend 抽象化:
 test impact: =make test-all 1472/1599 → 1598/1604 pass / 0 failed=
 (= 126 IDE-gated test を in-tree で復活)。
 
-** Phase G — subprocess backend impl (= 未着手)
+** Phase G SHIPPED (= subprocess backend impl)
 
-NeLisp standalone で TS/JS/Python 構造解析を可能にする残作業:
-- TypeScript: =tsc --jsx= or tree-sitter CLI 経由 AST 取得
-- JavaScript: acorn / esbuild --analyze
-- Python: =python -c "import ast; print(...)"=
+NeLisp standalone で TS/JS/Python 構造解析を可能にする実装:
 
-Phase G impl = 4 stub function (= =anvil-treesit-backend-subprocess-*=)
-を実装するだけ、interface 確定済。
+- =anvil-treesit-backend-subprocess-parse SOURCE LANG= → 共通 AST plist
+  - python: =python3 -c <inline ast.dump JSON>= (stdin → JSON)
+  - javascript: =acorn --ecma2020 --locations= (stdin → JSON)
+  - typescript / tsx: 現状 acorn fallback (= 型注釈 lose、構造のみ)。
+    Phase G+1 で =tsc --noEmit= or ts-morph による正式パスを追加候補。
+- =anvil-treesit-backend-subprocess-query AST SELECTOR= → list of nodes
+  - SELECTOR は string node-type or =(:type STRING)= plist
+- =anvil-treesit-backend-subprocess-node-text NODE [SOURCE]= → string or nil
+  - SOURCE 既定は AST root が捕捉した parse 時の SOURCE
+- =anvil-treesit-backend-subprocess-node-range NODE= → =(START . END)= or nil
+
+共通 AST shape (plist):
+
+#+BEGIN_SRC elisp
+(:type     "FunctionDef"      ; node type 文字列
+ :start    INTEGER             ; 0-based offset
+ :end      INTEGER             ; 0-based exclusive
+ :name     "foo"               ; identifier when applicable
+ :children (...)               ; list of common-shape plists
+ :backend  'subprocess
+ :lang     'python
+ :source   "...full source..." ; root only
+ :raw      ...)                ; original parser plist
+#+END_SRC
+
+Tool 不在の graceful degrade:
+
+#+BEGIN_SRC elisp
+(:status :tool-not-found
+ :lang   'python
+ :tool   "python3"
+ :backend 'subprocess
+ :hint   "anvil-treesit-backend: subprocess backend for python needs \
+python3 on PATH (install python3 for python support)")
+#+END_SRC
+
+その他の構造化 error: =:parse-error= (syntax 失敗 + lineno)、
+=:subprocess-failed= (非 0 exit + stderr)、=:subprocess-timeout= (デフォルト
+30s、=anvil-treesit-backend-subprocess-timeout= で調整)、
+=:unsupported-lang= (python/javascript/typescript/tsx 以外)。
+
+Phase G で残置される subprocess 未実装 op (引き続き
+=:not-implemented-yet= 構造化 user-error):
+- =ensure-grammar= (treesit 専用 概念のため subprocess では NA)
+- =compile-query= (tree-sitter query DSL は subprocess に対応物なし)
+- =with-root= (file IO + parser tear-down 連携、Phase H 候補)
+
+test impact: =make test-all 1598/1604 → 1610/1616 pass / 0 failed=
+(= +12 ERT、tool 不在 host では =skip-unless= で skip 扱い)。
 
 ** Audit corrections from Phase B execution
 
