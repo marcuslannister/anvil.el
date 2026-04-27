@@ -60,6 +60,67 @@ else
 	}
 fi
 
+# --- Retry wrapper for emacsclient ------------------------------------
+# Absorbs the ~few-second window where `emacs --daemon' is being
+# restarted: emacsclient then fails with "can't find socket" /
+# "Connection refused" until the new daemon's server file is ready.
+# Retrying silently keeps the MCP pipe alive so upstream Claude Code
+# (or whoever is driving this bridge) doesn't see a hard failure for
+# a routine daemon bounce.
+#
+# Configure with env vars (defaults chosen to cover a typical restart):
+#   ANVIL_EMACSCLIENT_RETRY_MAX        attempts (default 60)
+#   ANVIL_EMACSCLIENT_RETRY_DELAY_MS   delay per attempt in ms (default 100)
+# 60 * 100ms = 6 seconds of tolerance.
+ANVIL_EMACSCLIENT_RETRY_MAX=${ANVIL_EMACSCLIENT_RETRY_MAX:-60}
+ANVIL_EMACSCLIENT_RETRY_DELAY_MS=${ANVIL_EMACSCLIENT_RETRY_DELAY_MS:-100}
+
+# anvil_emacsclient_retry STDERR_FILE -- EMACSCLIENT_ARGS...
+#
+# Run `emacsclient EMACSCLIENT_ARGS...', retrying on transient socket-
+# missing / connection-refused errors.  STDERR_FILE receives stderr of
+# the final attempt.  Non-socket failures (e.g. elisp errors) surface
+# immediately so genuine faults aren't masked.
+# Prints emacsclient's stdout on success; exits with emacsclient's rc.
+anvil_emacsclient_retry() {
+	local stderr_file="$1"
+	shift
+	if [ "${1-}" = "--" ]; then shift; fi
+
+	local attempt=0 out="" rc=0
+	while :; do
+		set +e
+		out=$(emacsclient "$@" 2>"$stderr_file")
+		rc=$?
+		set -e
+		if [ "$rc" -eq 0 ]; then
+			printf '%s' "$out"
+			return 0
+		fi
+		if [ -s "$stderr_file" ] \
+			&& grep -qE "can't find socket|Connection refused|server.*not.*running|No such file or directory" "$stderr_file"; then
+			attempt=$((attempt + 1))
+			if [ "$attempt" -ge "$ANVIL_EMACSCLIENT_RETRY_MAX" ]; then
+				mcp_debug_log "RETRY-EXHAUSTED" "attempts=$attempt max=$ANVIL_EMACSCLIENT_RETRY_MAX rc=$rc"
+				printf '%s' "$out"
+				return "$rc"
+			fi
+			if [ "$attempt" -eq 1 ] || [ $((attempt % 10)) -eq 0 ]; then
+				mcp_debug_log "RETRY" "attempt=$attempt rc=$rc stderr=$(tr '\n' ' ' <"$stderr_file" | cut -c1-120)"
+			fi
+			if [ "$ANVIL_EMACSCLIENT_RETRY_DELAY_MS" -gt 0 ]; then
+				local delay_sec
+				delay_sec=$(awk -v ms="$ANVIL_EMACSCLIENT_RETRY_DELAY_MS" 'BEGIN{printf "%.3f", ms/1000}')
+				sleep "$delay_sec"
+			fi
+			continue
+		fi
+		# Non-retriable failure — surface immediately.
+		printf '%s' "$out"
+		return "$rc"
+	done
+}
+
 # Parse command line arguments
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -121,16 +182,17 @@ fi
 
 # Initialize MCP if init function is provided
 if [ -n "$INIT_FUNCTION" ]; then
-	# shellcheck disable=SC2124
-	readonly INIT_CMD="emacsclient ${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} -e \"($INIT_FUNCTION)\""
-
-	mcp_debug_log "INIT-CALL" "$INIT_CMD"
+	mcp_debug_log "INIT-CALL" "emacsclient ${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} -e ($INIT_FUNCTION) (with retry)"
 
 	# Execute the command and capture output and return code
 	init_stderr_file="/tmp/mcp-init-stderr.$$-$(date +%s%N)"
 	mcp_debug_log "INIT-STDERR-FILE" "$init_stderr_file"
-	INIT_OUTPUT=$(eval "$INIT_CMD" 2>"$init_stderr_file")
+	set +e
+	INIT_OUTPUT=$(anvil_emacsclient_retry "$init_stderr_file" -- \
+		${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} \
+		-e "($INIT_FUNCTION)")
 	INIT_RC=$?
+	set -e
 
 	# Log results
 	mcp_debug_log "INIT-RC" "$INIT_RC"
@@ -143,8 +205,97 @@ else
 	mcp_debug_log "INFO" "Skipping init function call (none provided)"
 fi
 
+# --- T71: MCP Content-Length framing read helpers --------------------
+# The standard MCP stdio transport frames messages as:
+#
+#     Content-Length: <N>\r\n
+#     \r\n
+#     <N bytes JSON body>
+#
+# Older callers may still emit line-delimited JSON.  We sniff the first
+# byte of each request: if it is `{', treat as legacy line mode; if it
+# is `C' (start of "Content-Length:"), treat as framed.  Mode is
+# decided per-request to keep the legacy fallback transparent for
+# dev/test invocations.
+#
+# Output: when input was framed, emit a framed response; otherwise emit
+# legacy single-line JSON.
+
+# anvil_mcp_read_framed_message
+#
+# Reads one MCP framed message from STDIN.  Headers are read line by
+# line until an empty line; then exactly N bytes of body are read.
+# Prints the JSON body on STDOUT (no trailing newline).  Returns 1 on
+# EOF or malformed framing, 2 if no Content-Length header found.
+anvil_mcp_read_framed_message() {
+	local first_line="$1"
+	local header_line content_length=""
+
+	# Process the already-consumed first line.
+	# Strip trailing CR (DOS line endings).
+	first_line="${first_line%$'\r'}"
+	if [[ "$first_line" =~ ^[Cc]ontent-[Ll]ength:[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+		content_length="${BASH_REMATCH[1]}"
+	fi
+
+	# Read remaining header lines until blank line.
+	while IFS= read -r header_line; do
+		header_line="${header_line%$'\r'}"
+		if [ -z "$header_line" ]; then
+			break
+		fi
+		if [[ "$header_line" =~ ^[Cc]ontent-[Ll]ength:[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+			content_length="${BASH_REMATCH[1]}"
+		fi
+	done
+
+	if [ -z "$content_length" ]; then
+		return 2
+	fi
+
+	# Read exactly content_length bytes of body.
+	# `head -c N` is portable across GNU/BSD coreutils for byte count.
+	local body
+	body=$(head -c "$content_length")
+	if [ -z "$body" ]; then
+		return 1
+	fi
+	printf '%s' "$body"
+	return 0
+}
+
+# anvil_mcp_emit_framed_response BODY
+#
+# Emits BODY framed with Content-Length.  N is computed in bytes
+# (not characters) because the MCP spec mandates byte length.
+anvil_mcp_emit_framed_response() {
+	local body="$1"
+	local n
+	# `wc -c' counts bytes (LANG=C ensures no locale weirdness).
+	n=$(LC_ALL=C printf '%s' "$body" | wc -c)
+	# Strip leading whitespace from wc output (BSD pads).
+	n="${n##* }"
+	printf 'Content-Length: %s\r\n\r\n%s' "$n" "$body"
+}
+
 # Process input and print response
-while read -r line; do
+while IFS= read -r line; do
+	# T71: detect framing.  An MCP framed request begins with
+	# `Content-Length:' (case-insensitive); legacy line-delimited
+	# requests begin with `{'.
+	# Strip CR for cross-platform safety.
+	_anvil_first_line="${line%$'\r'}"
+	_anvil_framed=0
+	if [[ "$_anvil_first_line" =~ ^[Cc]ontent-[Ll]ength: ]]; then
+		_anvil_framed=1
+		mcp_debug_log "FRAMING" "Content-Length detected"
+		# Re-read full framed message; reuse the already-consumed line.
+		line=$(anvil_mcp_read_framed_message "$_anvil_first_line") || {
+			mcp_debug_log "FRAMING-ERROR" "rc=$? first=$_anvil_first_line"
+			continue
+		}
+	fi
+
 	# Log the incoming request
 	mcp_debug_log "REQUEST" "$line"
 
@@ -159,9 +310,17 @@ while read -r line; do
 	# Handle nil responses from notifications by converting to empty string
 	elisp_expr="(base64-encode-string (encode-coding-string (or (anvil-server-process-jsonrpc (base64-decode-string \"$base64_input\") \"$SERVER_ID\") \"\") 'utf-8 t) t)"
 
-	# Get response from emacsclient - capture stderr for debugging
+	# Get response from emacsclient (with retry across daemon restarts).
+	# Capture stderr for debugging and rc for logging only; existing code
+	# downstream treats an empty `base64_response' as a soft failure.
 	stderr_file="/tmp/mcp-stderr.$$-$(date +%s%N)"
-	base64_response=$(emacsclient "${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"}" -e "$elisp_expr" 2>"$stderr_file")
+	set +e
+	base64_response=$(anvil_emacsclient_retry "$stderr_file" -- \
+		${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} \
+		-e "$elisp_expr")
+	_anvil_client_rc=$?
+	set -e
+	mcp_debug_log "EMACSCLIENT-RC" "$_anvil_client_rc"
 
 	# Check for stderr output
 	if [ -s "$stderr_file" ]; then
@@ -228,27 +387,37 @@ while read -r line; do
 
 	# Only output non-empty responses
 	if [ -n "$formatted_response" ]; then
-		# Output the response
-		echo "$formatted_response"
+		if [ "$_anvil_framed" = "1" ]; then
+			# T71: framed output for MCP-compliant clients.
+			anvil_mcp_emit_framed_response "$formatted_response"
+		else
+			# Legacy line-delimited output (dev / test mode).
+			echo "$formatted_response"
+		fi
 	fi
 done
 
 # Stop MCP if stop function is provided
 if [ -n "$STOP_FUNCTION" ]; then
 	mcp_debug_log "INFO" "Stopping MCP with function: $STOP_FUNCTION"
-
-	# shellcheck disable=SC2124
-	readonly STOP_CMD="emacsclient ${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} -e \"($STOP_FUNCTION)\""
-
-	mcp_debug_log "STOP-CALL" "$STOP_CMD"
+	mcp_debug_log "STOP-CALL" "emacsclient ${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} -e ($STOP_FUNCTION) (with retry)"
 
 	# Execute the command and capture output and return code
-	STOP_OUTPUT=$(eval "$STOP_CMD" 2>&1)
+	stop_stderr_file="/tmp/mcp-stop-stderr.$$-$(date +%s%N)"
+	set +e
+	STOP_OUTPUT=$(anvil_emacsclient_retry "$stop_stderr_file" -- \
+		${SOCKET_OPTIONS[@]+"${SOCKET_OPTIONS[@]}"} \
+		-e "($STOP_FUNCTION)")
 	STOP_RC=$?
+	set -e
 
 	# Log results
 	mcp_debug_log "STOP-RC" "$STOP_RC"
 	mcp_debug_log "STOP-OUTPUT" "$STOP_OUTPUT"
+	if [ -s "$stop_stderr_file" ]; then
+		mcp_debug_log "STOP-STDERR" "$(cat "$stop_stderr_file")"
+	fi
+	rm -f "$stop_stderr_file"
 else
 	mcp_debug_log "INFO" "Skipping stop function call (none provided)"
 fi

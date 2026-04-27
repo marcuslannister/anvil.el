@@ -13,7 +13,12 @@
 
 (require 'ert)
 (require 'cl-lib)
-(require 'anvil-treesit)
+;; Doc 38 Phase F — anvil-treesit-backend re-exports the legacy
+;; anvil-treesit-* helpers, so `anvil-js-test--ide-ready' (= fboundp
+;; anvil-treesit-language-for-file) becomes true on Emacs without the
+;; extracted IDE layer.  Legacy soft-require kept for compat.
+(require 'anvil-treesit-backend nil 'noerror)
+(require 'anvil-ide-treesit nil 'noerror)
 (require 'anvil-ts)
 (require 'anvil-js)
 
@@ -27,29 +32,46 @@
                     (file-name-directory
                      (or load-file-name buffer-file-name))))
 
+(defun anvil-js-test--ide-ready ()
+  "Return non-nil when anvil-ide-treesit is loaded (= Doc 38 Phase E)."
+  (fboundp 'anvil-treesit-language-for-file))
+
 (defun anvil-js-test--grammar-ready ()
   "Return non-nil when the JavaScript grammar is loadable."
   (and (fboundp 'treesit-language-available-p)
        (treesit-language-available-p 'javascript)))
 
 (defmacro anvil-js-test--requires-grammar (&rest body)
-  "Skip the test body unless tree-sitter-javascript is available."
+  "Skip the test body unless tree-sitter-javascript is available
+AND the anvil-ide-treesit layer is loaded (= Doc 38 Phase E gate)."
   (declare (indent 0))
-  `(if (anvil-js-test--grammar-ready)
+  `(cond
+    ((not (anvil-js-test--ide-ready))
+     (ert-skip "anvil-ide-treesit not loaded (= ide layer absent)"))
+    ((anvil-js-test--grammar-ready) (progn ,@body))
+    (t (ert-skip "tree-sitter-javascript grammar not installed"))))
+
+(defmacro anvil-js-test--requires-ide (&rest body)
+  "Skip BODY when anvil-ide-treesit isn't loaded.  For tests that
+exercise pure dispatch helpers but still depend on the IDE layer."
+  (declare (indent 0))
+  `(if (anvil-js-test--ide-ready)
        (progn ,@body)
-     (ert-skip "tree-sitter-javascript grammar not installed")))
+     (ert-skip "anvil-ide-treesit not loaded (= ide layer absent)")))
 
 ;;;; --- pure / grammar-independent -----------------------------------------
 
 (ert-deftest anvil-js-test-lang-for-file-accepts-all-js-extensions ()
+ (anvil-js-test--requires-ide
   (dolist (ext '("js" "jsx" "mjs" "cjs"))
-    (should (eq 'javascript (anvil-js--lang-for-file (concat "/x/app." ext))))))
+    (should (eq 'javascript (anvil-js--lang-for-file (concat "/x/app." ext)))))))
 
 (ert-deftest anvil-js-test-lang-for-file-rejects-ts ()
   "anvil-js refuses .ts / .tsx so callers can't bypass anvil-ts."
+ (anvil-js-test--requires-ide
   (should-error (anvil-js--lang-for-file "/x/app.ts") :type 'user-error)
   (should-error (anvil-js--lang-for-file "/x/app.tsx") :type 'user-error)
-  (should-error (anvil-js--lang-for-file "/x/foo.py") :type 'user-error))
+  (should-error (anvil-js--lang-for-file "/x/foo.py") :type 'user-error)))
 
 ;;;; --- JS locators vs fixture ---------------------------------------------
 
@@ -157,7 +179,8 @@ preserved."
                   :type 'user-error)))
 
 (ert-deftest anvil-js-test-list-imports-errors-on-nil-file ()
-  (should-error (anvil-js-list-imports nil) :type 'user-error))
+ (anvil-js-test--requires-ide
+  (should-error (anvil-js-list-imports nil) :type 'user-error)))
 
 ;;;; --- Phase 2: edit helpers ---------------------------------------------
 

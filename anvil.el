@@ -4,7 +4,7 @@
 
 ;; Author: zawatton
 ;; Keywords: comm, tools, ai, mcp
-;; Version: 0.4.1
+;; Version: 1.0.0
 ;; Package-Requires: ((emacs "28.2"))
 ;; URL: https://github.com/zawatton21/anvil.el
 
@@ -97,10 +97,24 @@ These are not loaded by default.  Available modules:
                 + task-summary + notes into anvil-state ns=session
                 (TTL 14d) and returns a `preamble-suggested' resume
                 block; `session-resume' / -list / -delete round out
-                the primitive set.  Phase 3 hooks (PreCompact,
+                the primitive set.  Phase 3 hooks (PreCompact, Stop,
                 SessionStart, PostToolUse, UserPromptSubmit,
                 SessionEnd) and the anvil-hook install command ship
                 under the same module (Doc 17, requires `state')
+- `compact'   — Autonomous /compact orchestration (Doc 36 Phase 1).
+                Aggressive auto-compact layer: Stop hook triggers a
+                segment-boundary snapshot + nudge when transcript
+                crosses a configurable threshold (default 45%,
+                cooldown 25%); UserPromptSubmit emits a JSON
+                additionalContext telling the model to invoke
+                /compact on the next turn; SessionStart restores
+                the parked snapshot as preamble.  Complements
+                Claude Code's hardcoded ~83.5% auto-compact with a
+                user-tunable earlier trigger for long autonomous
+                sessions.  Requires `state' and integrates with
+                `session' (Stop event).  Five MCP tools: compact-
+                estimate / -should-trigger / -snapshot / -restore /
+                -hook.
 - `http'      — HTTP client via `url-retrieve-synchronously' with a
                 state-backed ETag/TTL cache (Doc 09 Phase 1a)
 - `orchestrator' — Parallel AI CLI dispatcher (claude today, more
@@ -125,9 +139,11 @@ These are not loaded by default.  Available modules:
 - `bisect'    — Test-driven git bisect that pins a failing ERT
                 test to the introducing commit via worktree-
                 isolated emacs --batch steps (Doc 13 Phase 1)
-- `treesit'   — Tree-sitter shared core for per-language structural
+- `ide-treesit' — Tree-sitter shared core for per-language structural
                 editing modules (Doc 21).  Registers no tools
-                itself; language modules depend on it.
+                itself; language modules depend on it.  Renamed
+                from `treesit' in Doc 38 Phase C (= IDE layer
+                relocation).
 - `py'        — Python read-only structural locators: py-list-imports
                 / py-list-functions / py-list-classes / py-list-methods
                 / py-list-decorators / py-find-definition /
@@ -229,7 +245,36 @@ These are not loaded by default.  Available modules:
                 destructive).  Doc 29 Phase 1a, requires Emacs
                 29+.  Phase 1b (FTS5 + contradiction detection +
                 URL HEAD) and Phase 2 (decay + promote) stay
-                DRAFT."
+                DRAFT.
+- `memory-obs' — Session lifecycle observation capture.  Records
+                Claude Code hook events (session-start, user-prompt,
+                post-tool-use, stop, session-end) into a separate
+                SQLite + FTS5 store at
+                `anvil-memory-obs-db-path'.  Body is redacted for
+                common secret patterns and an importance heuristic
+                runs at insert time.  Opt-in via
+                `anvil-memory-obs-enabled' (default nil); when off,
+                the integrated `fboundp' guards in `session' make it
+                a complete no-op.  Doc 37 Phase 1, requires Emacs
+                29+ and `session'.  Phase 2 (AI compression),
+                Phase 3 (3-layer search MCP tools), Phase 4
+                (auto-inject), Phase 5 (UI), Phase 6 (promote) and
+                Phase 7 (vector) stay DRAFT.
+- `extend'    — Claude self-extension SDK scaffold (Doc 35 Phase
+                A, DRAFT v0).  Adds the
+                `anvil-extend-scaffold' MCP tool: a Claude Code
+                session can emit `<NAME>.el' (function body) +
+                `<NAME>-test.el' (ERT skeleton) +
+                `<NAME>-register.el' (MCP register stub) into
+                `anvil-extend-storage-dir' (default
+                ~/.anvil-extend/) in a single call, then run
+                `anvil-extend-load' / `-test' / `-list' / `-remove'
+                from the same session to iterate.  Phase A is
+                scaffold-only: hot-reload (Phase B), sandbox
+                eval (Phase C), rationale auto-record (Phase D),
+                NeLisp execute path (Phase E), and ephemeral /
+                permanent promotion (Phase F) stay DRAFT until
+                Doc 35 reaches LOCKED."
   :type '(repeat symbol)
   :group 'anvil)
 

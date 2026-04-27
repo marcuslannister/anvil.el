@@ -422,29 +422,84 @@ the shell wrapper does not crash the Claude hook pipeline."
        (let* ((session-id (or (nth 0 args) "unknown"))
               (task-summary (nth 1 args))
               (notes (nth 2 args))
-              (name (anvil-session--auto-snapshot-name session-id)))
-         (anvil-session-snapshot name
-                                 :task-summary task-summary
-                                 :notes notes)))
+              (name (anvil-session--auto-snapshot-name session-id))
+              (snap (anvil-session-snapshot name
+                                            :task-summary task-summary
+                                            :notes notes)))
+         (when (fboundp 'anvil-compact-on-pre-compact)
+           (funcall (intern "anvil-compact-on-pre-compact") session-id))
+         snap))
+      ('post-compact
+       (let* ((session-id (or (nth 0 args) "unknown")))
+         (if (fboundp 'anvil-compact-on-post-compact)
+             (funcall (intern "anvil-compact-on-post-compact") session-id)
+           (list :decision :compact-not-loaded))))
+      ('stop
+       (let* ((session-id (or (nth 0 args) "unknown"))
+              (transcript-path (nth 1 args)))
+         (when (fboundp 'anvil-memory-obs-record-stop)
+           (funcall (intern "anvil-memory-obs-record-stop")
+                    session-id transcript-path))
+         (if (fboundp 'anvil-compact-on-stop)
+             (funcall (intern "anvil-compact-on-stop")
+                      session-id
+                      :transcript-path transcript-path)
+           (list :decision :compact-not-loaded))))
       ('session-start
        (let* ((session-id (or (nth 0 args) "unknown"))
-              (snap (anvil-session--most-recent-auto-snapshot session-id)))
-         (if snap
-             (or (plist-get snap :preamble-suggested) "")
-           "")))
+              (snap (anvil-session--most-recent-auto-snapshot session-id))
+              (session-preamble (if snap
+                                    (or (plist-get snap :preamble-suggested) "")
+                                  ""))
+              (compact-preamble
+               (when (fboundp 'anvil-compact-on-session-start)
+                 (funcall (intern "anvil-compact-on-session-start")
+                          session-id)))
+              (obs-preamble
+               (when (fboundp 'anvil-memory-obs-build-session-preamble)
+                 (funcall (intern "anvil-memory-obs-build-session-preamble")
+                          session-id default-directory))))
+         (when (fboundp 'anvil-memory-obs-record-session-start)
+           (funcall (intern "anvil-memory-obs-record-session-start")
+                    session-id default-directory))
+         (let* ((primary (if (and (stringp compact-preamble)
+                                  (not (string-empty-p compact-preamble)))
+                             compact-preamble
+                           session-preamble))
+                (obs (if (stringp obs-preamble) obs-preamble "")))
+           (cond
+            ((and (string-empty-p primary) (string-empty-p obs)) "")
+            ((string-empty-p obs)     primary)
+            ((string-empty-p primary) obs)
+            (t (concat obs "\n" primary))))))
       ('post-tool-use
        (let* ((session-id (or (nth 0 args) "unknown"))
               (tool (nth 1 args))
               (summary (nth 2 args)))
+         (when (fboundp 'anvil-memory-obs-record-post-tool-use)
+           (funcall (intern "anvil-memory-obs-record-post-tool-use")
+                    session-id tool summary))
          (anvil-session-log-event session-id 'tool-use
                                   :tool tool :summary summary)))
       ('user-prompt
        (let* ((session-id (or (nth 0 args) "unknown"))
               (prompt (nth 1 args)))
+         (when (fboundp 'anvil-memory-obs-record-user-prompt)
+           (funcall (intern "anvil-memory-obs-record-user-prompt")
+                    session-id prompt))
          (anvil-session-log-event session-id 'user-prompt
-                                  :summary prompt)))
+                                  :summary prompt)
+         (let ((nudge (when (fboundp 'anvil-compact-on-user-prompt)
+                        (funcall (intern "anvil-compact-on-user-prompt")
+                                 session-id))))
+           (if (and (stringp nudge) (not (string-empty-p nudge)))
+               nudge
+             ""))))
       ('session-end
        (let ((session-id (or (nth 0 args) "unknown")))
+         (when (fboundp 'anvil-memory-obs-record-session-end)
+           (funcall (intern "anvil-memory-obs-record-session-end")
+                    session-id))
          (anvil-session-log-event session-id 'session-end
                                   :summary "session ended")))
       (_ (list :error
@@ -456,6 +511,8 @@ the shell wrapper does not crash the Claude hook pipeline."
 
 (defconst anvil-session--hook-events
   '(("PreCompact"       . "pre-compact")
+    ("PostCompact"      . "post-compact")
+    ("Stop"             . "stop")
     ("SessionStart"     . "session-start")
     ("PostToolUse"      . "post-tool-use")
     ("UserPromptSubmit" . "user-prompt")
@@ -475,6 +532,11 @@ Claude Code's hooks schema is shell-like."
   (pcase event-cli
     ("pre-compact"    (format "%s pre-compact $CLAUDE_SESSION_ID"
                               script))
+    ("post-compact"   (format "%s post-compact $CLAUDE_SESSION_ID"
+                              script))
+    ("stop"           (format
+                       "%s stop $CLAUDE_SESSION_ID $CLAUDE_TRANSCRIPT_PATH"
+                       script))
     ("session-start"  (format "%s session-start $CLAUDE_SESSION_ID"
                               script))
     ("post-tool-use"  (format
@@ -486,6 +548,49 @@ Claude Code's hooks schema is shell-like."
     ("session-end"    (format "%s session-end $CLAUDE_SESSION_ID"
                               script))
     (_ (error "anvil-session: unknown hook sub-command %S" event-cli))))
+
+(defun anvil-session--claude-hook-entry (command)
+  "Wrap COMMAND shell string in Claude Code's hook-value schema.
+Claude Code rejects plain string hook values; it requires an
+array of matcher objects whose `hooks' field is itself an array
+of `{type:\"command\", command:…}' entries.  Return a 1-element
+vector of hash-tables matching that shape so `json-serialize'
+emits the documented layout."
+  (let ((inner (make-hash-table :test 'equal))
+        (outer (make-hash-table :test 'equal)))
+    (puthash "type" "command" inner)
+    (puthash "command" command inner)
+    (puthash "matcher" "" outer)
+    (puthash "hooks" (vector inner) outer)
+    (vector outer)))
+
+(defun anvil-session--hook-value-command (value)
+  "Return the shell command string embedded in Claude hook VALUE.
+Handles both the current schema (vector-of-matcher hash-tables)
+and legacy plain-string entries written by earlier anvil
+versions, so uninstall diffs stay human-readable after a
+settings-schema upgrade."
+  (cond
+   ((stringp value) value)
+   ((and (vectorp value) (> (length value) 0)
+         (hash-table-p (aref value 0)))
+    (let* ((outer (aref value 0))
+           (inner-vec (gethash "hooks" outer)))
+      (if (and (vectorp inner-vec) (> (length inner-vec) 0)
+               (hash-table-p (aref inner-vec 0)))
+          (or (gethash "command" (aref inner-vec 0))
+              (format "%S" value))
+        (format "%S" value))))
+   (t (format "%S" value))))
+
+(defun anvil-session--hook-value-equal (a b)
+  "Structural equality for Claude hook JSON values.
+`equal' compares hash-tables by identity, so two payloads with
+identical content but different allocations never match.  Encode
+both sides and compare the serialized text instead."
+  (and a b
+       (equal (json-serialize a :false-object :false :null-object :null)
+              (json-serialize b :false-object :false :null-object :null))))
 
 (defun anvil-session--read-settings (path)
   "Return the JSON object at PATH as a hash-table, or an empty one.
@@ -531,24 +636,27 @@ printout: ACTION ∈ {`add', `update', `remove', `keep'}."
        (dolist (pair anvil-session--hook-events)
          (let* ((claude-key (car pair))
                 (sub-cmd (cdr pair))
-                (desired (anvil-session--hook-command-for sub-cmd script))
+                (cmd-str (anvil-session--hook-command-for sub-cmd script))
+                (desired (anvil-session--claude-hook-entry cmd-str))
                 (existing (gethash claude-key existing-hooks)))
            (cond
             ((null existing)
              (puthash claude-key desired new)
-             (push (list 'add claude-key desired) diff))
-            ((equal existing desired)
-             (push (list 'keep claude-key desired) diff))
+             (push (list 'add claude-key cmd-str) diff))
+            ((anvil-session--hook-value-equal existing desired)
+             (push (list 'keep claude-key cmd-str) diff))
             (t
              (puthash claude-key desired new)
-             (push (list 'update claude-key desired) diff))))))
+             (push (list 'update claude-key cmd-str) diff))))))
       ('uninstall
        (dolist (pair anvil-session--hook-events)
          (let* ((claude-key (car pair))
                 (existing (gethash claude-key existing-hooks)))
            (when existing
              (remhash claude-key new)
-             (push (list 'remove claude-key existing) diff))))))
+             (push (list 'remove claude-key
+                         (anvil-session--hook-value-command existing))
+                   diff))))))
     (cons new (nreverse diff))))
 
 (defun anvil-session--format-diff (diff)

@@ -1062,19 +1062,42 @@ virtual server-ids share the same handler pool."
                     (if (plist-get tool :encode-result)
                         (anvil-server-encode-for-mcp raw-result)
                       raw-result))
-                   ;; Ensure result is string or nil, error on other types
+                   ;; Coerce result to string for MCP transport.
+                   ;;
+                   ;; Contract widen (T118 / T97-FOLLOWUP-1):
+                   ;;   string / nil  → pass through (legacy)
+                   ;;   plist / list / cons / hash-table / vector
+                   ;;                 → JSON-encode via
+                   ;;                   `anvil-server-encode-for-mcp'
+                   ;;   symbol / function / buffer / process / marker
+                   ;;                 → reject (cannot be wire-encoded)
+                   ;;
+                   ;; This removes the "string or nil" hard reject that
+                   ;; surfaced as `defs-index-status` etc returning a
+                   ;; plist (= boot-smoke WARN, T97 M1 / T110 M2).  The
+                   ;; existing `:encode-result' wrapper path stays the
+                   ;; preferred long-form (it round-trips through the
+                   ;; raw handler for ERT), but un-wrapped handlers no
+                   ;; longer need to hand-stringify.
                    (result-text
                     (cond
                      ((null result)
                       "")
                      ((stringp result)
                       result)
+                     ((or (consp result)        ; plist / alist / list / dotted
+                          (hash-table-p result)
+                          (vectorp result))
+                      (anvil-server-encode-for-mcp result))
                      (t
                       (signal
                        'anvil-server-invalid-params
                        (list
                         (format
-                         "Tool handler must return string or nil, got: %s"
+                         (concat
+                          "Tool handler must return a JSON-serialisable"
+                          " value (string / nil / plist / list /"
+                          " hash-table / vector), got: %s")
                          (type-of result)))))))
                    ;; Wrap the handler result in the MCP format
                    (formatted-result
@@ -1304,6 +1327,119 @@ REQUEST should be a JSON string containing a valid JSON-RPC 2.0 request.
 Call `anvil-server-process-jsonrpc' and return its result as a parsed alist."
   (json-read-from-string
    (anvil-server-process-jsonrpc request server-id)))
+
+;;; API - MCP Content-Length framing (T71)
+;;
+;; Standard MCP stdio transport uses HTTP-like framing:
+;;
+;;     Content-Length: <N>\r\n
+;;     \r\n
+;;     <N bytes of UTF-8 JSON body>
+;;
+;; The legacy line-delimited JSON path (one JSON object per line) is kept
+;; as a backward-compatibility / dev-mode fallback when no
+;; `Content-Length:' header is detected.  See
+;; `anvil-server-run-batch-stdio' for the dispatcher that auto-detects
+;; mode.
+
+(defconst anvil-server-mcp-framing-header-name "Content-Length"
+  "Header name used for MCP stdio Content-Length framing.")
+
+(defun anvil-server-mcp-frame-encode (json-string)
+  "Encode JSON-STRING as an MCP Content-Length framed message.
+
+Returns a unibyte string of the form
+
+    Content-Length: <N>\\r\\n\\r\\n<body>
+
+where N is the UTF-8 byte length of JSON-STRING.  JSON-STRING is
+encoded to UTF-8 before length is computed so that multi-byte
+characters report the correct on-the-wire byte count.
+
+Raises `wrong-type-argument' if JSON-STRING is not a string."
+  (unless (stringp json-string)
+    (signal 'wrong-type-argument (list 'stringp json-string)))
+  (let* ((body (encode-coding-string json-string 'utf-8 t))
+         (n (length body))
+         (header (format "%s: %d\r\n\r\n"
+                         anvil-server-mcp-framing-header-name n)))
+    ;; Header is ASCII, body is already a unibyte UTF-8 string.
+    (concat (encode-coding-string header 'utf-8 t) body)))
+
+(defun anvil-server-mcp-parse-content-length-header (header-block)
+  "Parse HEADER-BLOCK and return the Content-Length integer or nil.
+
+HEADER-BLOCK is the raw text up to (but not including) the empty
+line that terminates the header section — i.e. CR-LF separated
+lines, no trailing CRLF CRLF.
+
+Header names are matched case-insensitively (RFC 7230 §3.2).  Returns
+nil if the header is absent or its value is not a non-negative
+integer."
+  (when (stringp header-block)
+    (let ((case-fold-search t)
+          (re (format "^[ \t]*%s[ \t]*:[ \t]*\\([0-9]+\\)[ \t]*\\(?:\r\\)?$"
+                      (regexp-quote anvil-server-mcp-framing-header-name))))
+      (when (string-match re header-block)
+        (string-to-number (match-string 1 header-block))))))
+
+(defun anvil-server-mcp-frame-parse-string (input)
+  "Parse a single MCP framed message from INPUT string.
+
+Returns a plist (:body BODY :consumed N) where BODY is the decoded
+UTF-8 JSON string and N is the number of bytes consumed from INPUT,
+or nil if INPUT does not yet contain a complete framed message.
+
+Signals an error tagged `anvil-mcp-frame-error' on malformed
+framing (e.g. missing Content-Length header)."
+  (unless (stringp input)
+    (signal 'wrong-type-argument (list 'stringp input)))
+  (let* ((unibyte (if (multibyte-string-p input)
+                      (encode-coding-string input 'utf-8 t)
+                    input))
+         ;; \r\n\r\n separator between header section and body.
+         (sep "\r\n\r\n")
+         (sep-pos (string-match (regexp-quote sep) unibyte)))
+    (cond
+     ((null sep-pos)
+      ;; Header section incomplete.
+      nil)
+     (t
+      (let* ((header-block (substring unibyte 0 sep-pos))
+             (body-start (+ sep-pos (length sep)))
+             (n (anvil-server-mcp-parse-content-length-header
+                 header-block)))
+        (cond
+         ((null n)
+          (signal 'anvil-mcp-frame-error
+                  (list "Missing or invalid Content-Length header"
+                        header-block)))
+         ((< (- (length unibyte) body-start) n)
+          ;; Body not yet fully buffered.
+          nil)
+         (t
+          (let* ((body-bytes (substring unibyte body-start
+                                        (+ body-start n)))
+                 (body (decode-coding-string body-bytes 'utf-8 t))
+                 (consumed (+ body-start n)))
+            (list :body body :consumed consumed)))))))))
+
+(define-error 'anvil-mcp-frame-error
+  "Malformed MCP Content-Length framing")
+
+(defun anvil-server-mcp-detect-framing-p (initial)
+  "Return non-nil if INITIAL bytes look like MCP Content-Length framing.
+
+A heuristic: the first non-whitespace byte starts the
+`Content-Length:' header (case-insensitive).  This lets the batch
+stdio loop sniff the very first line without consuming it."
+  (when (stringp initial)
+    (let ((case-fold-search t)
+          (trimmed (string-trim-left initial)))
+      (string-prefix-p
+       (concat anvil-server-mcp-framing-header-name ":")
+       trimmed
+       t))))
 
 ;;; API - Utilities
 

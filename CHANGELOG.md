@@ -5,6 +5,79 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-04-27
+
+First stable release.  Two landmark capabilities ship together:
+
+1. **anvil.el now runs without an Emacs install** — thanks to NeLisp's
+   v1.0 standalone Rust runtime (`anvil-runtime`).  `bin/anvil mcp serve --no-emacs`
+   spawns zero Emacs processes; the Rust binary itself reads + evaluates
+   the loaded anvil modules and serves MCP tools over stdio.
+2. **anvil-ide split** — Emacs-only IDE features (treesit-based code
+   navigation, the worker dashboard, Info/Help lookup) moved out of
+   `anvil.el` into the dedicated [anvil-ide.el](https://github.com/zawatton/anvil-ide.el)
+   repo.  The remaining `anvil.el` is the AI-side workbench: pure
+   stdio MCP server + tool registry + library helpers, no human IDE
+   surface.
+
+This is a **breaking** release (anvil-ide tools are no longer in this
+repo) and a **major architecture milestone** (anvil + NeLisp standalone
+proves the AI workbench can run on a substrate other than the Emacs
+binary).  Hence the jump 0.4.x → 1.0.0.
+
+### Added — Doc 38 anvil-ide split (Phases A → G)
+
+- **Doc 38 §3 — full split pipeline shipped 2026-04-26 → 04-27.**
+  Phase A (audit + classification of all 60+ modules) → Phase B
+  (5-wave adapter migration: anvil-buffer / anvil-elisp / anvil-org-index /
+  anvil-org / anvil-browser) → Phase C (rename `anvil-treesit` /
+  `anvil-worker-ui` → `anvil-ide-*`, split `info-lookup-symbol` into
+  `anvil-ide-elisp.el`) → Phase D (`git filter-repo` extract preserving
+  12-commit history) → Phase E (cleanup + soft `(require 'anvil-ide-*
+  nil 'noerror)`) → Phase F (treesit backend abstraction so anvil-ts /
+  anvil-js / anvil-py stay AI-callable on NeLisp substrate via
+  subprocess fallback) → Phase G (subprocess backend impl: Python full
+  ast / JavaScript acorn / TypeScript degraded acorn).  All phases
+  documented in [docs/design/38-anvil-ide-split.org](docs/design/38-anvil-ide-split.org).
+- **Architecture α now active** — anvil-defs, anvil-state, anvil-http
+  internals delegate to NeLisp side via `fboundp` guard + fallback,
+  letting the Rust runtime evaluate them without a host Emacs.
+
+### Added — Standalone deployment paths
+
+- **Stage D v2.0** (bundled-Emacs tarball, ~25 MB) and **v3.0**
+  (Rust-only tarball, ~2.3 MB) ship as part of NeLisp v1.0; both
+  expose the same MCP tools so existing Claude Code `.mcp.json`
+  entries keep working.  See `dist/anvil-stage-d-v3.0-*` in the
+  NeLisp repo for the artifact.
+
+### Removed — anvil-ide.el extraction (BREAKING)
+
+- `anvil-treesit.el`, `anvil-worker-ui.el`, `anvil-ide.el`, the
+  `elisp-info-lookup-symbol` MCP tool, and the org-element /
+  org-edit-body tree-walk surface are no longer in this repo.
+  Install [anvil-ide.el](https://github.com/zawatton/anvil-ide.el)
+  separately if you want the IDE layer.  Cross-package wires use
+  `(require 'anvil-ide-* nil 'noerror)` so anvil.el continues to
+  load even when anvil-ide is absent.
+
+### Changed — CI + tests
+
+- **CI subprocess test gating** — 49 slow subprocess ERTs gated on
+  `ANVIL_SLOW_TESTS=1` so the default GitHub Actions matrix exits 0
+  on every push.  Local `make test-all` still runs everything.
+- **Test count**: 1198 (v0.4.0) → 1610+ (v1.0.0), with all of
+  Phase F backend abstraction + Phase G subprocess paths under
+  ERT.
+
+### Internal — design + audit
+
+- 3 audit-correction notes appended to Doc 38: anvil-buffer is
+  namespace-disjoint, not drop-in compatible; the
+  `org-capture-templates` reference in anvil-browser is
+  docstring-only; anvil-ts / -js / -py wrap `treesit-*` and were
+  reclassified PURE-via-backend in Phase F.
+
 ## [0.4.1] - 2026-04-22
 
 Two small fixes released same-day as v0.4.0, both reached the repo

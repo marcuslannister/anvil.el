@@ -463,5 +463,43 @@ symbols in the default `anvil-manifest-server-profiles'."
               (cdr (assoc "emacs-eval-edit"
                           (default-value 'anvil-manifest-server-profiles))))))
 
+;;;; Stage D (Doc 18) — headless profile for non-Emacs user distribution
+
+(ert-deftest anvil-manifest-test-headless-profile-is-id-list ()
+  "headless profile is an ID-list (non-empty list of strings)."
+  (let ((toolset (anvil-manifest--profile-toolset 'headless)))
+    (should (listp toolset))
+    (should (> (length toolset) 0))
+    (should (cl-every #'stringp toolset))))
+
+(ert-deftest anvil-manifest-test-headless-profile-covers-phase5e-7-tools ()
+  "Stage D Phase 6.1 MVP は NeLisp Phase 5-E の 7 tool を必ず expose する。"
+  (let ((toolset (anvil-manifest--profile-toolset 'headless)))
+    (dolist (id '("file-read" "file-outline"
+                  "git-log" "git-status"
+                  "http-fetch"
+                  "data-get-path" "data-set-path"))
+      (should (member id toolset)))))
+
+(ert-deftest anvil-manifest-test-headless-excludes-ui-dependent ()
+  "headless は TUI / browser / orchestrator / worker-admin 等の UI 依存 tool を含まない。"
+  (let ((toolset (anvil-manifest--profile-toolset 'headless))
+        (ui-deps '("anvil-browser-open" "anvil-browser-close"
+                   "orchestrator-submit" "orchestrator-stream"
+                   "anvil-worker-probe" "anvil-worker-reset-pool"
+                   "bisect-test" "cron-run"
+                   "emacs-eval" "emacs-eval-async"
+                   "pty-spawn" "pty-read-filtered")))
+    (dolist (id ui-deps)
+      (should-not (member id toolset)))))
+
+(ert-deftest anvil-manifest-test-headless-alias-and-server-profile ()
+  "emacs-eval-headless virtual server-id が default alias + server-profile の両方に含まれる。"
+  (should (member '("emacs-eval-headless" . "emacs-eval")
+                  anvil-manifest--default-aliases))
+  (should (eq 'headless
+              (cdr (assoc "emacs-eval-headless"
+                          (default-value 'anvil-manifest-server-profiles))))))
+
 (provide 'anvil-manifest-test)
 ;;; anvil-manifest-test.el ends here

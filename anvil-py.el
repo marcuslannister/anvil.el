@@ -29,7 +29,12 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'anvil-server)
-(require 'anvil-treesit)
+;; Doc 38 Phase F — anvil-treesit-backend (architecture α: backend
+;; abstraction with treesit + subprocess dispatch).  See anvil-ts.el
+;; for the full rationale.  The legacy anvil-ide-treesit soft-require
+;; stays for downstream compat.
+(require 'anvil-treesit-backend nil 'noerror)
+(require 'anvil-ide-treesit nil 'noerror)
 
 (defconst anvil-py--server-id "emacs-eval"
   "Server ID under which py-* MCP tools are registered.")

@@ -181,7 +181,7 @@ capabilities directly.  Highlights:
 | Capability | What it does |
 |------------+--------------|
 | =anvil-orchestrator= | Fan out one prompt to up to five AI CLIs (=claude= / =aider= / =gemini= / =ollama= / =codex=) in parallel. Jaccard consensus + meta-LLM judge + DAG dependencies + =anvil-cron= integration for nightly PDCA loops |
-| =anvil-memory= (v0.4.0) | Auto-memory engine with Bayesian TTL + FTS5 full-text search.  16 MCP tools: memory-scan / -audit / -search / -duplicates / -promote, etc.  Surfaces stale rows, detects contradictions, tracks URL liveness across all =~/.claude/projects/*/memory/*.md= |
+| =anvil-memory= (v0.4.0) | Auto-memory engine with Bayesian TTL + FTS5 full-text search.  16 MCP tools: memory-scan / -audit / -search / -duplicates / -promote, etc.  Surfaces stale rows, detects contradictions, tracks URL liveness.  Multi-provider: auto-detects =~/.claude/projects/*/memory/=, =~/.codex/memories/=, =~/.gemini/memories/=, Continue / Aider / Cline / Cursor — one SQLite DB shared across every AI CLI the user has installed |
 | =anvil-tools-by-intent= + =anvil-manifest= (v0.4.0) | Intent-based tool discovery plus =ANVIL_PROFILE= filter.  Tools tagged with =:intent / :layer / :stability= are discoverable via runtime query; =agent= / =edit= / =ultra= profiles shrink =tools/list= ~3-7× for orchestrator child sessions (full ~20k → ultra ~2.7k tokens of manifest) |
 | =anvil-sexp= / =sexp-cst= / =py= / =ts= / =js= (v0.4.0) | Language-aware structural edits.  Reader-based Elisp edits, tree-sitter CST for Python / TypeScript / TSX / JavaScript — AST-level refactors without touching whole files |
 | =anvil-session= + Claude Code hooks (v0.4.0) | Session snapshot / resume + 5 lifecycle hooks (PreCompact / SessionStart / PostToolUse / UserPromptSubmit / SessionEnd).  Captures branch + task summary with 14-day TTL so session restarts don't re-cold |
@@ -203,6 +203,65 @@ For the full module list, see [[*Modules]].
 - *Org-mode native* — first-class org read/write/refactor support
 - *Large file safe* — handles 1.2MB+ files without data loss or truncation
 - *Cross-platform* — Linux, macOS, Windows, WSL
+
+* Standalone deployment via NeLisp (2026-04-27)
+
+Anvil is now usable *without an Emacs install on the host*, by way of
+the sister project [[https://github.com/zawatton/nelisp][NeLisp]] v1.0
+(tagged 2026-04-27).  Two paths are available:
+
+- *Bundled-Emacs tarball* — NeLisp Stage D v2.0 ships a stripped Emacs
+  inside the archive (~25 MB compressed); =bin/anvil mcp serve= works
+  on hosts that never ran =apt install emacs=.
+- *Rust binary, zero Emacs spawn* — =bin/anvil mcp serve --no-emacs=
+  dispatches to a ~421 KB Rust binary (=anvil-runtime=) implementing
+  the Elisp reader, evaluator, MCP stdio JSON-RPC server, and an
+  =anvil-host-*= tool registry.  An MCP client can call anvil tools
+  through this path with no Emacs process spawn (NeLisp Doc 44 LOCKED
+  2026-04-27).
+
+** Architecture α — NeLisp delegate active
+
+Several anvil modules now delegate their core helpers to NeLisp when
+available (=fboundp= guard + fallback for standalone usage).  Modules
+ported as of 2026-04-25 architecture α 11-commit run:
+
+- =anvil-http= — 8 commits, 25 helpers (~467 LOC) delegate to
+  =nelisp-http=
+- =anvil-state= — 5 pure helpers delegate to =nelisp-state=
+- =anvil-defs= — 2 commits delegating SQLite Elisp index to
+  =nelisp-defs-index= (Doc 25 SHIPPED)
+- =anvil-org-index= — 2 functions delegate to =nelisp-org-index=
+  (Doc 26 SHIPPED)
+
+Total ≈ 37 helpers / ~573 LOC delegated.  Behaviour with NeLisp
+absent is unchanged (tests cover both paths).
+
+** Doc 38 — anvil-ide split SHIPPED (2026-04)
+
+The Emacs-only IDE layer (xref / diagnostics / imenu / tree-sitter
+wrappers / info-lookup / worker-ui dashboard) extracted to
+[[https://github.com/zawatton/anvil-ide.el][zawatton/anvil-ide.el]].
+Phases B-G all SHIPPED:
+
+- *Phase B* — soft NeLisp compatibility (=anvil-elisp= /
+  =anvil-org-index= / =anvil-org= / =anvil-browser= delegate where
+  feasible).
+- *Phase C* — module rename to =anvil-ide-*= prefix.
+- *Phase D + E* — IDE files extracted; =require= chains made
+  =noerror=; tests gated on =--ide-ready= predicate.
+- *Phase F* — tree-sitter backend abstraction (=anvil-treesit-backend.el=,
+  484 LOC) so =ts= / =js= / =py= work over either an in-process Emacs
+  tree-sitter or a subprocess backend.
+- *Phase G* — subprocess backend impl (Python full ast / JavaScript
+  acorn full / TypeScript degraded acorn fallback).  Lets NeLisp
+  standalone consumers do TS/JS/Python structural analysis through
+  the subprocess fallback.
+
+Net result: =anvil.el= itself runs under NeLisp; install
+=anvil-ide.el= alongside if you want the full IDE feature set in a
+real Emacs.  Doc 38 in =docs/design/= for the full audit and
+phase-by-phase decisions.
 - *Modular* — load only what you need, extend with your own modules
 
 * Efficiency — why Anvil saves AI tokens
@@ -522,7 +581,7 @@ budget goes to reasoning about your code, not re-reading it.
 | =data=       | JSON/CSV read/write with UTF-8 enforcement     | —                |
 | =xlsx=       | Excel read/write (optional)                    | Python, openpyxl |
 | =pdf=        | PDF text extraction (optional)                 | Python, pymupdf  |
-| =ide=        | xref, diagnostics, imenu, tree-sitter (opt.)   | project.el       |
+| =ide= (split) | Moved to [[https://github.com/zawatton/anvil-ide.el][zawatton/anvil-ide.el]] in 2026-04 (Doc 38).  =anvil.el= is now NeLisp-runnable; =anvil-ide.el= bundles the Emacs-only IDE layer (xref / diagnostics / imenu / tree-sitter / info-look / worker-ui dashboard).  Install both for the original feature set | anvil-ide.el repo |
 | =cron=       | Scheduled task runner with worker dispatch      | —                |
 | =elisp=      | Agentic Elisp development tools (optional)     | —                |
 | =browser=    | Web fetch / interact / capture / screenshot via agent-browser (opt.) | agent-browser CLI |
@@ -789,6 +848,81 @@ Phase 2 adds:
   worker-vs-main-daemon trade-off.
 
 Requires Emacs 29+ (via =anvil-state=).
+
+** Memory module (optional) — indexing auto-memory across AI CLIs
+
+The =memory= module is an opt-in, provider-agnostic index over
+every =.md= auto-memory file on disk, so any MCP client (Claude
+Code, Codex CLI, Gemini CLI, Continue, Aider, Cline, Cursor, …)
+can share the same long-term context.
+
+Enable it:
+
+#+begin_src emacs-lisp
+(add-to-list 'anvil-optional-modules 'memory)
+(anvil-enable)   ; reload the module set
+#+end_src
+
+Then index everything currently on disk:
+
+#+begin_src text
+;; From Emacs:
+M-x anvil-memory-scan
+
+;; From an MCP client:
+call the `memory-scan' tool (no args)
+#+end_src
+
+=memory-scan= walks every directory matched by
+=anvil-memory-provider-paths= (default below), inserts one row per
+=.md= (=MEMORY.md= index files are skipped), and refreshes the FTS5
+body index.  It is idempotent — existing =access_count= /
+=validity_prior= rows are preserved on conflict, so you can rerun
+it anytime.
+
+Default provider map (edit to add your own):
+
+#+begin_src emacs-lisp
+(setq anvil-memory-provider-paths
+      '((claude   . "~/.claude/projects/*/memory")
+        (codex    . "~/.codex/memories")
+        (gemini   . "~/.gemini/memories")
+        (continue . "~/.continue/memories")
+        (aider    . "~/.aider/memories")
+        (cline    . "~/.cline/memories")
+        (cursor   . "~/.cursor/memories")
+        (windsurf . "~/.windsurf/memories")
+        (zed      . "~/.config/zed/memories")))
+#+end_src
+
+Patterns may contain =*= globs.  Non-existent expansions are
+dropped silently, so adding a provider you have not installed
+costs nothing.  Set =anvil-memory-roots= to a fixed list when you
+want to override auto-detection entirely (tests / sandboxes use
+this).
+
+Once indexed, all of the normal tools operate across providers in
+a single SQLite DB (=~/.emacs.d/anvil-memory-index.db=):
+
+- =memory-search QUERY= — FTS5 full-text across every provider's
+  memory body (=:limit=, =:type= keyword filters supported).
+- =memory-audit= — TTL check; =:with_urls t= pings reference
+  URLs via =anvil-http-head=.
+- =memory-list= — all rows with optional =:with-decay t
+  :sort 'decay= ranking.
+- =memory-save-check SUBJECT BODY= — Jaccard top-N duplicate
+  candidates before you write a new memory (provider-agnostic).
+- =memory-duplicates= — cross-provider near-duplicate pairs.
+- =memory-promote OLD NEW-TYPE= — rename + re-index, useful
+  when a row that started as =project_= matures into =user_=.
+- =memory-regenerate-index= — emit a fresh =MEMORY.md= body
+  sorted by decay-score (read-only output; the caller decides
+  whether to write).
+
+Non-Claude clients reach these by connecting to the same anvil
+MCP server; the module never writes into =.md= files (promote is
+the only file operation, and that is a rename), so it is safe to
+point at memory directories managed by other tools.
 
 ** Git helpers
 
