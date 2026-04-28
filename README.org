@@ -17,7 +17,7 @@ with that in mind.
 * TL;DR
 
 anvil.el is an *MCP server* that exposes a running Emacs (or a small
-Rust runtime called NeLisp) as 40+ tools an AI agent can call (default install; ~150 with all optional modules enabled).
+Rust runtime called NeLisp) as 40+ tools an AI agent can call out of the box.  Optional modules (memory / orchestrator / session / http / …) each add their own tools when you enable them.
 Claude Code, Claude Desktop, GPT, local LLMs via Ollama — anything
 that speaks [[https://modelcontextprotocol.io/][Model Context Protocol]] can edit files, navigate org-mode,
 run elisp, query SQLite, and more *through Emacs primitives* instead
@@ -81,7 +81,7 @@ small and has its own release cadence:
 
 | Repo | Role | Required? |
 |------+------+-----------|
-| [[https://github.com/zawatton/anvil.el][anvil.el]]      | The AI brain — MCP server, ~40 default tools (+~110 via optional modules) | yes |
+| [[https://github.com/zawatton/anvil.el][anvil.el]]      | The AI brain — MCP server, ~40 tools by default (each optional module adds its own) | yes |
 | [[https://github.com/zawatton/anvil-ide.el][anvil-ide.el]]  | Human IDE layer — treesit nav, dashboard, info-look | optional, Emacs users |
 | [[https://github.com/zawatton/anvil-pkg][anvil-pkg]]     | Nix-backed pkg manager — lets the AI install its own dependencies | optional |
 | [[https://github.com/zawatton/nelisp][NeLisp]]        | Rust runtime — runs Elisp without Emacs | optional, =--no-emacs= path |
@@ -251,7 +251,7 @@ above.
 
 * Feature Highlights
 
-Anvil's v1.0.0 surface ranges from *~40 tools* in the default install to *~150 tools* when commonly used optional modules (memory / orchestrator / session / http / …) are enabled
+Anvil's default install exposes *~40 MCP tools* (=anvil.el= core modules).  Each optional module you enable adds its own tools — anvil-memory ~22, anvil-orchestrator ~23, anvil-http ~9, anvil-defs ~7, anvil-session ~6, etc.  Pick what you actually want; you don't have to load everything
 (=anvil.el= core + the [[https://github.com/zawatton/anvil-ide.el][anvil-ide.el]] split + the [[https://github.com/zawatton/anvil-pkg][anvil-pkg]]
 sister package).  Highlights:
 
@@ -1205,7 +1205,7 @@ trade-off is /permission granularity/ — a single eval tool can't be
 marked =:read-only=, so you can't auto-approve reads while gating
 writes.
 
-Anvil exposes ~40 default + ~110 optional named primitives (~150 total when fully loaded), each registered with an explicit
+Anvil's default install exposes ~40 named primitives.  Optional modules add their own when enabled (max upper bound depends on which modules you load)., each registered with an explicit
 =:read-only= hint where applicable. In Claude Code that maps cleanly
 onto =/permissions=: auto-approve ~org-read-outline~, ~file-read~,
 ~elisp-describe-function~; force a prompt on ~file-batch~,
