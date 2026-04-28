@@ -85,7 +85,7 @@ Anvil は Emacs の機能を [[https://modelcontextprotocol.io/][Model Context P
 Claude Code、Claude Desktop、GPT、Ollama/llama.cpp 経由のローカルモデルなど、
 MCP を話すクライアントならどれでも対応しています。
 
-~(anvil-enable)~ の一行で、Emacs が 198 以上のツールを備えた AI 向け作業台に変わります。
+~(anvil-enable)~ の一行で、Emacs が約 150 のツールを備えた AI 向け作業台に変わります。
 ファイル編集、org-mode 操作、git 参照、Elisp 評価など、すべて安全なサンドボックス
 インターフェース越しに利用できます。
 
@@ -168,7 +168,7 @@ iwr -useb https://raw.githubusercontent.com/zawatton/anvil.el/master/install.ps1
 
 * 機能ハイライト
 
-Anvil は v1.0.0 時点で *200+ 個の MCP ツール* を提供します
+Anvil は v1.0.0 時点で *~170 個の MCP ツール* を提供します
 (=anvil.el= 本体 + 分離された [[https://github.com/zawatton/anvil-ide.el][anvil-ide.el]] + 姉妹 package
 [[https://github.com/zawatton/anvil-pkg][anvil-pkg]])。AI が Emacs の機能を直接呼べます。
 主なハイライト:
@@ -999,7 +999,7 @@ claude-code-ide で Emacs 内インライン Claude セッション、anvil は
 単一 eval ツールを =:read-only= として登録できないので、読み取りを
 自動承認し書き込みだけ確認を要求、という分け方ができません。
 
-anvil は約 198 の named primitive を公開し、該当するものは =:read-only=
+anvil は約 150 の named primitive を公開し、該当するものは =:read-only=
 hint 付きで登録されています。Claude Code の =/permissions= と綺麗に噛み合い、
 ~org-read-outline~ / ~file-read~ / ~elisp-describe-function~ は自動承認、
 ~file-batch~ / ~org-edit-body~ / ~file-replace-string~ は確認要求、という

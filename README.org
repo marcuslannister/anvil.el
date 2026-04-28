@@ -17,7 +17,7 @@ with that in mind.
 * TL;DR
 
 anvil.el is an *MCP server* that exposes a running Emacs (or a small
-Rust runtime called NeLisp) as 200+ tools an AI agent can call.
+Rust runtime called NeLisp) as ~170 tools an AI agent can call.
 Claude Code, Claude Desktop, GPT, local LLMs via Ollama — anything
 that speaks [[https://modelcontextprotocol.io/][Model Context Protocol]] can edit files, navigate org-mode,
 run elisp, query SQLite, and more *through Emacs primitives* instead
@@ -56,7 +56,7 @@ A typical refactoring session saves *15,000-25,000 tokens*.
        └────────────┬─────────────┘
                     │ MCP / stdio JSON-RPC
        ┌────────────▼─────────────┐
-       │       anvil.el           │  ← 200+ Emacs primitives
+       │       anvil.el           │  ← Emacs primitives
        │  ┌──────┬──────┬──────┐  │     exposed as MCP tools
        │  │ file │ org  │ elisp│  │
        │  └──────┴──────┴──────┘  │
@@ -81,7 +81,7 @@ small and has its own release cadence:
 
 | Repo | Role | Required? |
 |------+------+-----------|
-| [[https://github.com/zawatton/anvil.el][anvil.el]]      | The AI brain — MCP server + 200+ tools | yes |
+| [[https://github.com/zawatton/anvil.el][anvil.el]]      | The AI brain — MCP server + ~150 tools | yes |
 | [[https://github.com/zawatton/anvil-ide.el][anvil-ide.el]]  | Human IDE layer — treesit nav, dashboard, info-look | optional, Emacs users |
 | [[https://github.com/zawatton/anvil-pkg][anvil-pkg]]     | Nix-backed pkg manager — lets the AI install its own dependencies | optional |
 | [[https://github.com/zawatton/nelisp][NeLisp]]        | Rust runtime — runs Elisp without Emacs | optional, =--no-emacs= path |
@@ -251,7 +251,7 @@ above.
 
 * Feature Highlights
 
-Anvil exposes *200+ MCP tools* across the v1.0.0 surface
+Anvil exposes *~170 MCP tools* across the v1.0.0 surface
 (=anvil.el= core + the [[https://github.com/zawatton/anvil-ide.el][anvil-ide.el]] split + the [[https://github.com/zawatton/anvil-pkg][anvil-pkg]]
 sister package).  Highlights:
 
@@ -1205,7 +1205,7 @@ trade-off is /permission granularity/ — a single eval tool can't be
 marked =:read-only=, so you can't auto-approve reads while gating
 writes.
 
-Anvil exposes ~198 named primitives, each registered with an explicit
+Anvil exposes ~150 named primitives, each registered with an explicit
 =:read-only= hint where applicable. In Claude Code that maps cleanly
 onto =/permissions=: auto-approve ~org-read-outline~, ~file-read~,
 ~elisp-describe-function~; force a prompt on ~file-batch~,
