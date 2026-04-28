@@ -1112,6 +1112,23 @@ MCP Parameters:
   (anvil-server-with-error-handling
     (format "%S" (anvil-file-append path content))))
 
+(defun anvil-file--tool-create (path content &optional overwrite)
+  "Create a new file at PATH with CONTENT.
+
+Errors if the file already exists unless OVERWRITE is a non-empty
+string (\"1\" / \"true\" / any truthy value).  Parent directory must
+exist; this tool will not create it.  Returns the absolute path and
+byte count.  Use this in place of `touch + file-append' for new
+file creation in a single MCP call.
+
+MCP Parameters:
+  path - Absolute path to the new file
+  content - Initial content of the file
+  overwrite - Optional. Non-empty string to overwrite an existing file (e.g. \"1\")"
+  (anvil-server-with-error-handling
+    (let ((ow (and overwrite (stringp overwrite) (not (string-empty-p overwrite)))))
+      (format "%S" (anvil-file-create path content ow)))))
+
 ;;;; --- batch operations ----------------------------------------------------
 ;;
 ;; Execute multiple file operations in a single MCP call.  This is the
@@ -2352,6 +2369,18 @@ read specific sections."
    :description
    "Append text to the end of a file.  A leading newline is added
 if the file does not end with one.  Safe for files over 1.2MB."
+   :server-id anvil-file--server-id)
+
+  (anvil-server-register-tool
+   #'anvil-file--tool-create
+   :id "file-create"
+   :intent '(file-edit)
+   :layer 'core
+   :description
+   "Create a new file with given content in a single call.  Replaces
+the `touch + file-append' two-step pattern.  Errors if the file
+exists unless an overwrite flag is passed.  Parent directory must
+exist; this tool will not create it.  Safe for files over 1.2MB."
    :server-id anvil-file--server-id)
 
   (anvil-server-register-tool
