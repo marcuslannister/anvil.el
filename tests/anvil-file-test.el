@@ -846,4 +846,74 @@ Uses a fixture whose target line is already on disk so no write fires."
      (should-error
       (anvil-code-extract-pattern path '(:block-start "^A"))))))
 
+;;;; --- file-create ---------------------------------------------------------
+
+(defun anvil-file-test--with-tmp-dir (fn)
+  "Create a fresh temp directory, call FN with its path, then clean up."
+  (let ((dir (make-temp-file "anvil-file-create-" t)))
+    (unwind-protect
+        (funcall fn dir)
+      (when (file-directory-p dir)
+        (delete-directory dir t)))))
+
+(ert-deftest anvil-file-test-create-new-file ()
+  "anvil-file-create writes content to a fresh path."
+  (anvil-file-test--with-tmp-dir
+   (lambda (dir)
+     (let* ((path (expand-file-name "fresh.txt" dir))
+            (result (anvil-file-create path "hello\n")))
+       (should (equal (plist-get result :created) (expand-file-name path)))
+       (should (= (plist-get result :bytes) 6))
+       (should (file-exists-p path))
+       (should (equal (anvil-file-test--read path) "hello\n"))))))
+
+(ert-deftest anvil-file-test-create-existing-without-overwrite-errors ()
+  "anvil-file-create refuses to clobber an existing file by default."
+  (anvil-file-test--with-tmp
+   "old\n"
+   (lambda (path)
+     (should-error (anvil-file-create path "new\n"))
+     ;; Original content must be preserved.
+     (should (equal (anvil-file-test--read path) "old\n")))))
+
+(ert-deftest anvil-file-test-create-existing-with-overwrite-replaces ()
+  "anvil-file-create with OVERWRITE replaces existing content."
+  (anvil-file-test--with-tmp
+   "old\n"
+   (lambda (path)
+     (let ((result (anvil-file-create path "new\n" t)))
+       (should (= (plist-get result :bytes) 4))
+       (should (equal (anvil-file-test--read path) "new\n"))))))
+
+(ert-deftest anvil-file-test-create-missing-parent-dir-errors ()
+  "anvil-file-create errors when parent directory is absent."
+  (anvil-file-test--with-tmp-dir
+   (lambda (dir)
+     (let ((path (expand-file-name "no-such-subdir/file.txt" dir)))
+       (should-error (anvil-file-create path "x"))
+       (should-not (file-exists-p path))))))
+
+(ert-deftest anvil-file-test-tool-create-roundtrip ()
+  "MCP wrapper handles new file creation with string args."
+  (anvil-file-test--with-tmp-dir
+   (lambda (dir)
+     (let* ((path (expand-file-name "tool.txt" dir))
+            (out (anvil-file--tool-create path "via-tool\n")))
+       (should (stringp out))
+       (should (string-match-p ":bytes 9" out))
+       (should (equal (anvil-file-test--read path) "via-tool\n"))))))
+
+(ert-deftest anvil-file-test-tool-create-overwrite-flag ()
+  "MCP wrapper treats non-empty overwrite string as truthy."
+  (anvil-file-test--with-tmp
+   "first\n"
+   (lambda (path)
+     ;; Empty string -> still refuses.
+     (should-error (anvil-file--tool-create path "second\n" ""))
+     (should (equal (anvil-file-test--read path) "first\n"))
+     ;; Non-empty -> overwrites.
+     (let ((out (anvil-file--tool-create path "second\n" "1")))
+       (should (string-match-p ":bytes 7" out))
+       (should (equal (anvil-file-test--read path) "second\n"))))))
+
 ;;; anvil-file-test.el ends here
