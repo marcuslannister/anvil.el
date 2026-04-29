@@ -148,7 +148,7 @@ onto this alist; built-ins stay in the list for defaults."
   :group 'anvil-memory)
 
 (defconst anvil-memory-supported
-  '(scan audit access list
+  '(scan prune audit access list
          search save-check duplicates audit-urls
          decay promote regenerate reindex-fts llm-verdict
          mdl-distill export-html serve contradictions)
@@ -501,6 +501,39 @@ Returns the number of .md files seen."
                  "INSERT INTO memory_body_fts(file, body) VALUES (?1, ?2)"
                  (list path (or body "")))
                 (cl-incf n)))))))
+    n))
+
+;;;###autoload
+(defun anvil-memory-prune (&optional roots)
+  "Remove `memory_meta' rows whose backing file no longer exists on disk.
+When ROOTS is non-nil, only inspect rows whose file lives under one of
+those directories — useful for sandboxed tests so a stray row from
+another project is not collected.  When ROOTS is omitted, every row in
+`memory_meta' is checked.
+
+Also clears the matching `memory_body_fts' rows so search no longer
+surfaces stale bodies.
+
+Returns the number of rows pruned."
+  (let* ((db (anvil-memory--db))
+         (rows (sqlite-select db "SELECT file FROM memory_meta"))
+         (roots* (mapcar (lambda (r)
+                           (file-name-as-directory (expand-file-name r)))
+                         roots))
+         (n 0))
+    (dolist (row rows)
+      (let* ((path (car row))
+             (path-abs (expand-file-name path))
+             (in-scope (or (null roots*)
+                           (cl-some (lambda (r)
+                                      (string-prefix-p r path-abs))
+                                    roots*))))
+        (when (and in-scope (not (file-exists-p path)))
+          (sqlite-execute
+           db "DELETE FROM memory_meta WHERE file = ?1" (list path))
+          (sqlite-execute
+           db "DELETE FROM memory_body_fts WHERE file = ?1" (list path))
+          (cl-incf n))))
     n))
 
 
@@ -1805,6 +1838,24 @@ Returns (:count N :roots DIRS)."
           (n (anvil-memory-scan roots*)))
      (list :count n :roots resolved))))
 
+(defun anvil-memory--tool-prune (&optional roots)
+  "Prune `memory_meta' rows whose backing .md file no longer exists.
+
+MCP Parameters:
+  roots - Optional colon-separated list of directories.  When set,
+          only rows under those roots are inspected.  Empty / omitted
+          inspects every row in the index.
+
+Returns (:pruned N :roots DIRS-OR-ALL)."
+  (anvil-server-with-error-handling
+   (let* ((roots* (cond ((null roots) nil)
+                        ((listp roots) roots)
+                        ((and (stringp roots) (string-empty-p roots)) nil)
+                        ((stringp roots) (split-string roots ":" t))
+                        (t nil)))
+          (n (anvil-memory-prune roots*)))
+     (list :pruned n :roots (or roots* 'all)))))
+
 (defun anvil-memory--coerce-int (v default)
   "Coerce V (integer / digit-string / nil) to an integer, else DEFAULT."
   (cond ((integerp v) v)
@@ -2164,6 +2215,18 @@ reads each .md file's mtime as `created' when the row is new, and
 leaves access_count / validity_prior untouched on conflict so
 existing metadata survives a rescan.  Phase 1b also refreshes the
 FTS5 body index for every file encountered.")
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-prune)
+     :id "memory-prune"
+     :intent '(memory admin)
+     :layer 'workflow
+     :description
+     "Remove memory_meta rows whose backing .md file is missing on disk.
+Pair with `memory-scan' (which only adds / refreshes) to keep the
+index in sync after a user deletes a memory file.  Empty ROOTS
+prunes globally; passing ROOTS scopes the pruning to those
+directories so a sandbox / test root can be cleaned without
+touching unrelated providers.")
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-audit)
      :id "memory-audit"
