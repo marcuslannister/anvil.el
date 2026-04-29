@@ -241,6 +241,38 @@ Binds:
       (should (equal dates (sort (copy-sequence dates) #'string>))))))
 
 
+;;;; --- symlink dedup -----------------------------------------------------
+
+(ert-deftest anvil-worklog-test/scan-dedupes-symlink-roots ()
+  "When two roots resolve to the same canonical path, scan visits once."
+  (skip-unless (anvil-worklog-test--supported-p 'scan))
+  ;; Build root + a sibling symlink pointing at it; pass both as roots.
+  ;; Without dedup each entry would be inserted twice (once per surface
+  ;; path) and the second pass would update the first instead of being
+  ;; a no-op, so :unchanged would never reach the expected count.
+  (let* ((root (make-temp-file "anvil-wldedup-" t))
+         (link (concat root "-link"))
+         (anvil-worklog-db-path (make-temp-file "anvil-wldedup-" nil ".db"))
+         (anvil-worklog--db nil)
+         (anvil-worklog--resolved-db-path nil)
+         (anvil-worklog-shared-db-roots nil)
+         (anvil-worklog-roots (list root link)))
+    (unwind-protect
+        (progn
+          (when (fboundp 'anvil-worklog-enable)
+            (anvil-worklog-enable))
+          (anvil-worklog-test--seed root)
+          (make-symbolic-link root link)
+          (let ((counts (anvil-worklog-scan)))
+            (should (= 2 (plist-get counts :files)))
+            (should (= 4 (plist-get counts :inserted)))))
+      (when (fboundp 'anvil-worklog-disable)
+        (anvil-worklog-disable))
+      (ignore-errors (delete-file anvil-worklog-db-path))
+      (ignore-errors (delete-file link))
+      (ignore-errors (delete-directory root t)))))
+
+
 ;;;; --- prune ------------------------------------------------------------
 
 (ert-deftest anvil-worklog-test/prune-removes-missing-file-rows ()
