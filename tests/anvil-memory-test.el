@@ -1935,6 +1935,67 @@ ROOT-VAR is the temp memory root.  Binds `port' (int) and `info'
 
 
 
+;;;; --- prune (GC for deleted .md files) ----------------------------------
+
+(ert-deftest anvil-memory-test/prune-removes-row-for-deleted-file ()
+  "After `delete-file', `anvil-memory-prune' clears the row + FTS body."
+  (skip-unless (anvil-memory-test--supported-p 'prune))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-mixed root)
+    (anvil-memory-scan)
+    (should (= 4 (length (anvil-memory-list))))
+    (delete-file (expand-file-name "user_role.md" root))
+    (let ((pruned (anvil-memory-prune)))
+      (should (= 1 pruned)))
+    (should (= 3 (length (anvil-memory-list))))
+    ;; FTS body for the removed file is gone too.
+    (let ((db (anvil-memory--db)))
+      (should
+       (= 0
+          (caar
+           (sqlite-select
+            db
+            "SELECT COUNT(*) FROM memory_body_fts WHERE file LIKE ?1"
+            (list (concat "%/user_role.md")))))))))
+
+(ert-deftest anvil-memory-test/prune-noop-when-all-files-present ()
+  "Calling `anvil-memory-prune' with no missing files returns 0."
+  (skip-unless (anvil-memory-test--supported-p 'prune))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-mixed root)
+    (anvil-memory-scan)
+    (should (= 0 (anvil-memory-prune)))
+    (should (= 4 (length (anvil-memory-list))))))
+
+(ert-deftest anvil-memory-test/prune-scoped-to-roots ()
+  "ROOTS arg restricts pruning so a row outside scope survives."
+  (skip-unless (anvil-memory-test--supported-p 'prune))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-mixed root)
+    (anvil-memory-scan)
+    (let* ((other-root (make-temp-file "anvil-memtest-other-" t)))
+      (unwind-protect
+          (progn
+            ;; Delete a file inside ROOT.
+            (delete-file (expand-file-name "user_role.md" root))
+            ;; Prune restricted to OTHER-ROOT — no overlap, so nothing
+            ;; should be pruned even though user_role.md is missing.
+            (let ((pruned (anvil-memory-prune (list other-root))))
+              (should (= 0 pruned)))
+            (should (= 4 (length (anvil-memory-list))))
+            ;; Now prune scoped to ROOT — the missing row gets removed.
+            (let ((pruned (anvil-memory-prune (list root))))
+              (should (= 1 pruned)))
+            (should (= 3 (length (anvil-memory-list)))))
+        (ignore-errors (delete-directory other-root t))))))
+
+(ert-deftest anvil-memory-test/prune-empty-index-zero ()
+  "Pruning an empty index returns 0 cleanly."
+  (skip-unless (anvil-memory-test--supported-p 'prune))
+  (anvil-memory-test--with-env
+    (should (= 0 (anvil-memory-prune)))))
+
+
 ;;;; --- shared-db-roots / resolve-db-path ---------------------------------
 
 (ert-deftest anvil-memory-test/resolve-db-path-default ()
