@@ -1934,6 +1934,305 @@ ROOT-VAR is the temp memory root.  Binds `port' (int) and `info'
       (ignore-errors (delete-directory sandbox t)))))
 
 
+
+;;;; --- prune (GC for deleted .md files) ----------------------------------
+
+(ert-deftest anvil-memory-test/prune-removes-row-for-deleted-file ()
+  "After `delete-file', `anvil-memory-prune' clears the row + FTS body."
+  (skip-unless (anvil-memory-test--supported-p 'prune))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-mixed root)
+    (anvil-memory-scan)
+    (should (= 4 (length (anvil-memory-list))))
+    (delete-file (expand-file-name "user_role.md" root))
+    (let ((pruned (anvil-memory-prune)))
+      (should (= 1 pruned)))
+    (should (= 3 (length (anvil-memory-list))))
+    ;; FTS body for the removed file is gone too.
+    (let ((db (anvil-memory--db)))
+      (should
+       (= 0
+          (caar
+           (sqlite-select
+            db
+            "SELECT COUNT(*) FROM memory_body_fts WHERE file LIKE ?1"
+            (list (concat "%/user_role.md")))))))))
+
+(ert-deftest anvil-memory-test/prune-noop-when-all-files-present ()
+  "Calling `anvil-memory-prune' with no missing files returns 0."
+  (skip-unless (anvil-memory-test--supported-p 'prune))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-mixed root)
+    (anvil-memory-scan)
+    (should (= 0 (anvil-memory-prune)))
+    (should (= 4 (length (anvil-memory-list))))))
+
+(ert-deftest anvil-memory-test/prune-scoped-to-roots ()
+  "ROOTS arg restricts pruning so a row outside scope survives."
+  (skip-unless (anvil-memory-test--supported-p 'prune))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-mixed root)
+    (anvil-memory-scan)
+    (let* ((other-root (make-temp-file "anvil-memtest-other-" t)))
+      (unwind-protect
+          (progn
+            ;; Delete a file inside ROOT.
+            (delete-file (expand-file-name "user_role.md" root))
+            ;; Prune restricted to OTHER-ROOT — no overlap, so nothing
+            ;; should be pruned even though user_role.md is missing.
+            (let ((pruned (anvil-memory-prune (list other-root))))
+              (should (= 0 pruned)))
+            (should (= 4 (length (anvil-memory-list))))
+            ;; Now prune scoped to ROOT — the missing row gets removed.
+            (let ((pruned (anvil-memory-prune (list root))))
+              (should (= 1 pruned)))
+            (should (= 3 (length (anvil-memory-list)))))
+        (ignore-errors (delete-directory other-root t))))))
+
+(ert-deftest anvil-memory-test/prune-empty-index-zero ()
+  "Pruning an empty index returns 0 cleanly."
+  (skip-unless (anvil-memory-test--supported-p 'prune))
+  (anvil-memory-test--with-env
+    (should (= 0 (anvil-memory-prune)))))
+
+
+;;;; --- shared-db-roots / resolve-db-path ---------------------------------
+
+(ert-deftest anvil-memory-test/resolve-db-path-default ()
+  "When neither env nor shared roots are set, resolver returns the default."
+  (skip-unless (fboundp 'anvil-memory--resolve-db-path))
+  (let* ((default (anvil-memory--default-db-path))
+         (anvil-memory-db-path default)
+         (anvil-memory-shared-db-roots nil)
+         (process-environment (cons "ANVIL_MEMORY_DB=" process-environment)))
+    (should (equal default (anvil-memory--resolve-db-path)))))
+
+(ert-deftest anvil-memory-test/resolve-db-path-explicit-override ()
+  "When `anvil-memory-db-path' is customized, resolver returns it verbatim."
+  (skip-unless (fboundp 'anvil-memory--resolve-db-path))
+  (let* ((custom-path (make-temp-file "anvil-memtest-explicit-" nil ".db"))
+         (anvil-memory-db-path custom-path)
+         (anvil-memory-shared-db-roots (list "/nonexistent/notes"))
+         (process-environment (cons "ANVIL_MEMORY_DB=" process-environment)))
+    (unwind-protect
+        (should (equal custom-path (anvil-memory--resolve-db-path)))
+      (ignore-errors (delete-file custom-path)))))
+
+(ert-deftest anvil-memory-test/resolve-db-path-shared-root-match ()
+  "When shared root has the marker file, resolver returns it."
+  (skip-unless (fboundp 'anvil-memory--resolve-db-path))
+  (let* ((root (make-temp-file "anvil-memtest-root-" t))
+         (mem-dir (expand-file-name ".anvil-memory" root))
+         (db-file (expand-file-name "anvil-memory-index.db" mem-dir))
+         (anvil-memory-db-path (anvil-memory--default-db-path))
+         (anvil-memory-shared-db-roots (list root))
+         (process-environment (cons "ANVIL_MEMORY_DB=" process-environment)))
+    (unwind-protect
+        (progn
+          (make-directory mem-dir t)
+          (with-temp-file db-file (insert ""))
+          (should (equal db-file (anvil-memory--resolve-db-path))))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest anvil-memory-test/resolve-db-path-shared-root-no-marker ()
+  "Shared roots without the marker fall through to default."
+  (skip-unless (fboundp 'anvil-memory--resolve-db-path))
+  (let* ((root (make-temp-file "anvil-memtest-empty-" t))
+         (default (anvil-memory--default-db-path))
+         (anvil-memory-db-path default)
+         (anvil-memory-shared-db-roots (list root))
+         (process-environment (cons "ANVIL_MEMORY_DB=" process-environment)))
+    (unwind-protect
+        (should (equal default (anvil-memory--resolve-db-path)))
+      (ignore-errors (delete-directory root t)))))
+
+(ert-deftest anvil-memory-test/resolve-db-path-env-wins ()
+  "`ANVIL_MEMORY_DB' env var beats both explicit and shared roots."
+  (skip-unless (fboundp 'anvil-memory--resolve-db-path))
+  (let* ((env-path (make-temp-file "anvil-memtest-env-" nil ".db"))
+         (anvil-memory-db-path "/should/be/ignored.db")
+         (anvil-memory-shared-db-roots '("/also/ignored"))
+         (process-environment
+          (cons (concat "ANVIL_MEMORY_DB=" env-path) process-environment)))
+    (unwind-protect
+        (should (equal env-path (anvil-memory--resolve-db-path)))
+      (ignore-errors (delete-file env-path)))))
+
+(ert-deftest anvil-memory-test/effective-db-path-uses-cache-when-open ()
+  "`anvil-memory-effective-db-path' returns the cached path while DB is open."
+  (skip-unless (fboundp 'anvil-memory-effective-db-path))
+  (let* ((cached "/cached/path/from/open.db")
+         (anvil-memory--resolved-db-path cached)
+         (anvil-memory-db-path "/something/else.db"))
+    (should (equal cached (anvil-memory-effective-db-path)))))
+
+
+;;;; --- Phase 5: DB-direct add ----------------------------------------
+
+(ert-deftest anvil-memory-test/add-inserts-row ()
+  "memory-add stores meta + FTS rows under a synthetic file id."
+  (skip-unless (anvil-memory-test--supported-p 'add))
+  (anvil-memory-test--with-env
+    (let ((id (anvil-memory-add
+               "feedback_phase5_rule"
+               'feedback
+               "Use DB-direct write for new memories."
+               :description "DB-primary write rule")))
+      (should (string-prefix-p "anvil-memory:db:" (plist-get id :file)))
+      (should (equal "feedback_phase5_rule" (plist-get id :name)))
+      (should (eq 'feedback (plist-get id :type))))
+    (let ((rows (anvil-memory-list)))
+      (should (= 1 (length rows)))
+      (should (eq 'feedback (plist-get (car rows) :type))))))
+
+(ert-deftest anvil-memory-test/add-auto-prefixes-name ()
+  "When NAME omits the type prefix, memory-add prepends it."
+  (skip-unless (anvil-memory-test--supported-p 'add))
+  (anvil-memory-test--with-env
+    (let ((id (anvil-memory-add "my_rule" 'feedback "body")))
+      (should (equal "feedback_my_rule" (plist-get id :name)))
+      (should (string-suffix-p ":feedback_my_rule"
+                               (plist-get id :file))))))
+
+(ert-deftest anvil-memory-test/add-fts-searchable ()
+  "memory-search hits a freshly-added DB-direct entry."
+  (skip-unless (and (anvil-memory-test--supported-p 'add)
+                    (anvil-memory-test--supported-p 'search)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_searchable" 'feedback
+                      "phase5_unique_keyword inside the body")
+    (let ((hits (anvil-memory-search "phase5_unique_keyword")))
+      (should hits)
+      (should (string-prefix-p "anvil-memory:db:"
+                               (plist-get (car hits) :file))))))
+
+(ert-deftest anvil-memory-test/add-rejects-duplicate ()
+  "Calling memory-add twice with the same NAME is an error."
+  (skip-unless (anvil-memory-test--supported-p 'add))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_dup_rule" 'feedback "first")
+    (should-error (anvil-memory-add "feedback_dup_rule" 'feedback "second"))))
+
+
+;;;; --- Phase 5: prune skips synthetic ---------------------------------
+
+(ert-deftest anvil-memory-test/prune-skips-synthetic-paths ()
+  "DB-direct rows survive a global prune even though their `file'
+sentinel does not exist on disk."
+  (skip-unless (and (anvil-memory-test--supported-p 'prune)
+                    (anvil-memory-test--supported-p 'add)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_survives_prune" 'feedback "body")
+    (let ((before (length (anvil-memory-list)))
+          (n (anvil-memory-prune)))
+      (should (= 1 before))
+      (should (= 0 n))
+      (should (= 1 (length (anvil-memory-list)))))))
+
+
+;;;; --- Phase 5: export-md ---------------------------------------------
+
+(ert-deftest anvil-memory-test/export-md-roundtrip ()
+  "export-md renders frontmatter + body to a .md file."
+  (skip-unless (and (anvil-memory-test--supported-p 'export-md)
+                    (anvil-memory-test--supported-p 'add)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_export_target" 'feedback
+                      "Body line 1\nBody line 2"
+                      :description "round-trip me")
+    (let* ((out-path (expand-file-name "feedback_export_target.md" root))
+           (result (anvil-memory-export-md "feedback_export_target"))
+           (content (with-temp-buffer
+                      (insert-file-contents out-path)
+                      (buffer-substring-no-properties (point-min) (point-max)))))
+      (should (equal out-path (plist-get result :path)))
+      (should (string-match-p "^type: feedback" content))
+      (should (string-match-p "Body line 1" content))
+      (should (string-match-p "Body line 2" content)))))
+
+(ert-deftest anvil-memory-test/export-md-refuses-overwrite ()
+  "export-md errors when the target already exists unless :overwrite is t."
+  (skip-unless (and (anvil-memory-test--supported-p 'export-md)
+                    (anvil-memory-test--supported-p 'add)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_overwrite_target" 'feedback "v1")
+    (anvil-memory-export-md "feedback_overwrite_target")
+    (should-error (anvil-memory-export-md "feedback_overwrite_target"))
+    (let ((res (anvil-memory-export-md
+                "feedback_overwrite_target" :overwrite t)))
+      (should (plist-get res :written)))))
+
+
+
+;;;; --- Phase 5: memory-get (read-side completion) -----------------------
+
+(ert-deftest anvil-memory-test/get-by-basename-db-direct ()
+  "memory-get resolves a bare basename to its DB-direct synthetic id
+and returns the body verbatim."
+  (skip-unless (and (anvil-memory-test--supported-p 'get)
+                    (anvil-memory-test--supported-p 'add)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_get_target" 'feedback
+                      "Line A\nLine B"
+                      :description "round-trip get")
+    (let ((entry (anvil-memory-get "feedback_get_target")))
+      (should entry)
+      (should (string-prefix-p "anvil-memory:db:" (plist-get entry :file)))
+      (should (eq 'feedback (plist-get entry :type)))
+      (should (equal "feedback_get_target" (plist-get entry :name)))
+      (should (equal "Line A\nLine B" (plist-get entry :body))))))
+
+(ert-deftest anvil-memory-test/get-by-synthetic-id ()
+  "memory-get accepts the synthetic id verbatim."
+  (skip-unless (and (anvil-memory-test--supported-p 'get)
+                    (anvil-memory-test--supported-p 'add)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_get_synthetic" 'feedback "x")
+    (let ((entry (anvil-memory-get
+                  "anvil-memory:db:feedback_get_synthetic")))
+      (should entry)
+      (should (equal "x" (plist-get entry :body))))))
+
+(ert-deftest anvil-memory-test/get-scan-from-md-parses-frontmatter ()
+  "memory-get on a scan-from-md row parses YAML frontmatter for
+:name / :description and exposes the verbatim body."
+  (skip-unless (and (anvil-memory-test--supported-p 'get)
+                    (anvil-memory-test--supported-p 'scan)))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_md_target.md" root)
+     "---\nname: Md target rule\ndescription: short hook\ntype: feedback\n---\nBody from disk.\n")
+    (anvil-memory-scan)
+    (let ((entry (anvil-memory-get "feedback_md_target")))
+      (should entry)
+      (should (equal "Md target rule" (plist-get entry :name)))
+      (should (equal "short hook" (plist-get entry :description)))
+      (should (string-match-p "Body from disk" (plist-get entry :body))))))
+
+(ert-deftest anvil-memory-test/get-unknown-returns-nil ()
+  "memory-get returns nil for an unknown key (does not error)."
+  (skip-unless (anvil-memory-test--supported-p 'get))
+  (anvil-memory-test--with-env
+    (should-not (anvil-memory-get "nonexistent_basename"))
+    (should-not (anvil-memory-get "anvil-memory:db:does_not_exist"))
+    (should-not (anvil-memory-get nil))
+    (should-not (anvil-memory-get ""))))
+
+(ert-deftest anvil-memory-test/get-bump-access-updates-count ()
+  ":bump-access t increments access-count and last-accessed."
+  (skip-unless (and (anvil-memory-test--supported-p 'get)
+                    (anvil-memory-test--supported-p 'add)
+                    (anvil-memory-test--supported-p 'access)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_bump_target" 'feedback "x")
+    (let ((before (anvil-memory-get "feedback_bump_target")))
+      (should (= 0 (plist-get before :access-count))))
+    (anvil-memory-get "feedback_bump_target" :bump-access t)
+    (let ((after (anvil-memory-get "feedback_bump_target")))
+      (should (= 1 (plist-get after :access-count)))
+      (should (plist-get after :last-accessed)))))
+
+
 (provide 'anvil-memory-test)
 
 ;;; anvil-memory-test.el ends here
