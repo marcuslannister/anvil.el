@@ -407,7 +407,7 @@ MCP Parameters:
   (when (fboundp 'anvil-server-unregister-tool)
     (anvil-server-unregister-tool
      "anvil-claude-watchdog-recent"
-     :server-id anvil-claude-watchdog--server-id)))
+     anvil-claude-watchdog--server-id)))
 
 ;;;###autoload
 (defun anvil-claude-watchdog-status ()
