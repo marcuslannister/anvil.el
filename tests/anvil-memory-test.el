@@ -2067,6 +2067,102 @@ ROOT-VAR is the temp memory root.  Binds `port' (int) and `info'
     (should (equal cached (anvil-memory-effective-db-path)))))
 
 
+;;;; --- Phase 5: DB-direct add ----------------------------------------
+
+(ert-deftest anvil-memory-test/add-inserts-row ()
+  "memory-add stores meta + FTS rows under a synthetic file id."
+  (skip-unless (anvil-memory-test--supported-p 'add))
+  (anvil-memory-test--with-env
+    (let ((id (anvil-memory-add
+               "feedback_phase5_rule"
+               'feedback
+               "Use DB-direct write for new memories."
+               :description "DB-primary write rule")))
+      (should (string-prefix-p "anvil-memory:db:" (plist-get id :file)))
+      (should (equal "feedback_phase5_rule" (plist-get id :name)))
+      (should (eq 'feedback (plist-get id :type))))
+    (let ((rows (anvil-memory-list)))
+      (should (= 1 (length rows)))
+      (should (eq 'feedback (plist-get (car rows) :type))))))
+
+(ert-deftest anvil-memory-test/add-auto-prefixes-name ()
+  "When NAME omits the type prefix, memory-add prepends it."
+  (skip-unless (anvil-memory-test--supported-p 'add))
+  (anvil-memory-test--with-env
+    (let ((id (anvil-memory-add "my_rule" 'feedback "body")))
+      (should (equal "feedback_my_rule" (plist-get id :name)))
+      (should (string-suffix-p ":feedback_my_rule"
+                               (plist-get id :file))))))
+
+(ert-deftest anvil-memory-test/add-fts-searchable ()
+  "memory-search hits a freshly-added DB-direct entry."
+  (skip-unless (and (anvil-memory-test--supported-p 'add)
+                    (anvil-memory-test--supported-p 'search)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_searchable" 'feedback
+                      "phase5_unique_keyword inside the body")
+    (let ((hits (anvil-memory-search "phase5_unique_keyword")))
+      (should hits)
+      (should (string-prefix-p "anvil-memory:db:"
+                               (plist-get (car hits) :file))))))
+
+(ert-deftest anvil-memory-test/add-rejects-duplicate ()
+  "Calling memory-add twice with the same NAME is an error."
+  (skip-unless (anvil-memory-test--supported-p 'add))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_dup_rule" 'feedback "first")
+    (should-error (anvil-memory-add "feedback_dup_rule" 'feedback "second"))))
+
+
+;;;; --- Phase 5: prune skips synthetic ---------------------------------
+
+(ert-deftest anvil-memory-test/prune-skips-synthetic-paths ()
+  "DB-direct rows survive a global prune even though their `file'
+sentinel does not exist on disk."
+  (skip-unless (and (anvil-memory-test--supported-p 'prune)
+                    (anvil-memory-test--supported-p 'add)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_survives_prune" 'feedback "body")
+    (let ((before (length (anvil-memory-list)))
+          (n (anvil-memory-prune)))
+      (should (= 1 before))
+      (should (= 0 n))
+      (should (= 1 (length (anvil-memory-list)))))))
+
+
+;;;; --- Phase 5: export-md ---------------------------------------------
+
+(ert-deftest anvil-memory-test/export-md-roundtrip ()
+  "export-md renders frontmatter + body to a .md file."
+  (skip-unless (and (anvil-memory-test--supported-p 'export-md)
+                    (anvil-memory-test--supported-p 'add)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_export_target" 'feedback
+                      "Body line 1\nBody line 2"
+                      :description "round-trip me")
+    (let* ((out-path (expand-file-name "feedback_export_target.md" root))
+           (result (anvil-memory-export-md "feedback_export_target"))
+           (content (with-temp-buffer
+                      (insert-file-contents out-path)
+                      (buffer-substring-no-properties (point-min) (point-max)))))
+      (should (equal out-path (plist-get result :path)))
+      (should (string-match-p "^type: feedback" content))
+      (should (string-match-p "Body line 1" content))
+      (should (string-match-p "Body line 2" content)))))
+
+(ert-deftest anvil-memory-test/export-md-refuses-overwrite ()
+  "export-md errors when the target already exists unless :overwrite is t."
+  (skip-unless (and (anvil-memory-test--supported-p 'export-md)
+                    (anvil-memory-test--supported-p 'add)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_overwrite_target" 'feedback "v1")
+    (anvil-memory-export-md "feedback_overwrite_target")
+    (should-error (anvil-memory-export-md "feedback_overwrite_target"))
+    (let ((res (anvil-memory-export-md
+                "feedback_overwrite_target" :overwrite t)))
+      (should (plist-get res :written)))))
+
+
 (provide 'anvil-memory-test)
 
 ;;; anvil-memory-test.el ends here
