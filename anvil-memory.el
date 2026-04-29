@@ -151,10 +151,40 @@ onto this alist; built-ins stay in the list for defaults."
   '(scan prune audit access list
          search save-check duplicates audit-urls
          decay promote regenerate reindex-fts llm-verdict
-         mdl-distill export-html serve contradictions)
+         mdl-distill export-html serve contradictions
+         add export-md)
   "Capability tags this module currently provides.
 Tests in tests/anvil-memory-test.el gate their `skip-unless' on
 membership here so a half-shipped feature never breaks CI.")
+
+(defconst anvil-memory--synthetic-prefix "anvil-memory:db:"
+  "Sentinel prefix marking Phase 5 DB-direct memory rows.
+The `file' column of these rows is a synthetic identifier of the
+shape `anvil-memory:db:<basename>' so they coexist with scan-from-md
+rows under the same `memory_meta' primary key.  `anvil-memory-prune'
+skips this prefix because there is no on-disk file to check.")
+
+(defun anvil-memory--synthetic-file-p (path)
+  "Return non-nil when PATH is a Phase 5 DB-direct synthetic file id."
+  (and (stringp path)
+       (string-prefix-p anvil-memory--synthetic-prefix path)))
+
+(defconst anvil-memory--type-prefixes
+  '("feedback_" "project_" "reference_" "user_")
+  "Filename prefixes stripped / prepended by `anvil-memory-promote'.
+Order matches `anvil-memory--infer-type' so a `feedback_' file
+cannot be mis-stripped as `user_*'.")
+
+(defun anvil-memory--strip-type-prefix (basename)
+  "Return BASENAME with any known type prefix removed once."
+  (let ((result basename)
+        (stripped nil))
+    (dolist (p anvil-memory--type-prefixes)
+      (unless stripped
+        (when (string-prefix-p p result)
+          (setq result (substring result (length p))
+                stripped t))))
+    result))
 
 (defcustom anvil-memory-decay-half-life-days 30
   "Days after which the recency component of decay-score decays to ~1/e.
@@ -528,13 +558,180 @@ Returns the number of rows pruned."
                            (cl-some (lambda (r)
                                       (string-prefix-p r path-abs))
                                     roots*))))
-        (when (and in-scope (not (file-exists-p path)))
+        (when (and in-scope
+                   (not (anvil-memory--synthetic-file-p path))
+                   (not (file-exists-p path)))
           (sqlite-execute
            db "DELETE FROM memory_meta WHERE file = ?1" (list path))
           (sqlite-execute
            db "DELETE FROM memory_body_fts WHERE file = ?1" (list path))
           (cl-incf n))))
     n))
+
+
+;;;; --- DB-direct add (Phase 5) ----------------------------------------
+
+(defun anvil-memory--auto-prefix-name (name type)
+  "Return NAME with TYPE's filename prefix prepended when missing.
+TYPE is a symbol; recognized prefixes come from
+`anvil-memory--type-prefixes'.  When NAME already starts with any
+recognized prefix it is returned unchanged."
+  (let ((prefix (format "%s_" (symbol-name type)))
+        (already (cl-some (lambda (p) (string-prefix-p p name))
+                          anvil-memory--type-prefixes)))
+    (if already name (concat prefix name))))
+
+(cl-defun anvil-memory-add (name type body
+                                 &key description created tags ttl-policy)
+  "Insert a DB-direct memory entry and return its identity plist.
+
+Required:
+  NAME — basename without `.md' (e.g. `feedback_my_rule').  When the
+         leading `<type>_' prefix is absent it is added automatically.
+  TYPE — one of `user' / `feedback' / `project' / `reference' / `memo'.
+  BODY — body string without YAML frontmatter (frontmatter is
+         re-synthesized on `anvil-memory-export-md').
+
+Optional keys:
+  :description — short hook used in `MEMORY.md' / export.  When nil,
+                 derived from NAME (prefix-stripped + underscores → spaces).
+  :created     — unix epoch (default: current time).
+  :tags        — string list, joined with comma in storage.
+  :ttl-policy  — TTL key symbol (default: TYPE).
+
+Stores a row in `memory_meta' under file =anvil-memory:db:<name>' so
+DB-direct entries coexist with Phase 1 scan-from-md rows under the
+same primary key.  Body is also indexed in `memory_body_fts' so
+`memory-search' returns the new row immediately.
+
+Returns =(:file SYNTHETIC :name BASENAME :type TYPE :description DESC
+:created CREATED :digest SHA1)=."
+  (unless (and (stringp name) (not (string-empty-p name)))
+    (user-error "anvil-memory-add: NAME must be a non-empty string"))
+  (unless (and type (symbolp type)
+               (assq type anvil-memory-ttl-policies))
+    (user-error
+     "anvil-memory-add: TYPE must be one of %S"
+     (mapcar #'car anvil-memory-ttl-policies)))
+  (unless (stringp body)
+    (user-error "anvil-memory-add: BODY must be a string"))
+  (let* ((db (anvil-memory--db))
+         (basename (anvil-memory--auto-prefix-name name type))
+         (file (concat anvil-memory--synthetic-prefix basename))
+         (existing (sqlite-select
+                    db
+                    "SELECT 1 FROM memory_meta WHERE file = ?1 LIMIT 1"
+                    (list file))))
+    (when existing
+      (user-error "anvil-memory-add: already exists (%s)" basename))
+    (let* ((created* (or created (truncate (float-time))))
+           (description*
+            (or description
+                (anvil-memory--fallback-display-name basename)))
+           (body-trimmed (replace-regexp-in-string "[ \t\n]+\\'" "" body))
+           (digest (secure-hash 'sha1 body-trimmed))
+           (tags*
+            (cond ((null tags) nil)
+                  ((stringp tags) tags)
+                  ((listp tags) (mapconcat #'identity tags ","))
+                  (t nil)))
+           (ttl* (or ttl-policy type)))
+      (sqlite-execute
+       db
+       "INSERT INTO memory_meta
+          (file, type, created, ttl_policy, tags)
+          VALUES (?1, ?2, ?3, ?4, ?5)"
+       (list file (symbol-name type) created* (symbol-name ttl*) tags*))
+      (sqlite-execute
+       db
+       "INSERT INTO memory_body_fts(file, body) VALUES (?1, ?2)"
+       (list file body-trimmed))
+      (list :file file
+            :name basename
+            :type type
+            :description description*
+            :created created*
+            :digest digest))))
+
+
+;;;; --- optional .md export (Phase 5) ----------------------------------
+
+(defun anvil-memory--render-frontmatter (name type description created)
+  "Return the YAML frontmatter block for a DB-direct memory row.
+Format mirrors what `anvil-memory--parse-frontmatter' already
+recognizes so an export round-trips through the existing scan path."
+  (concat "---\n"
+          (format "name: %s\n" (or description name))
+          (format "description: %s\n" (or description name))
+          (format "type: %s\n" (symbol-name type))
+          (when created
+            (format "created: %s\n"
+                    (format-time-string "%Y-%m-%dT%H:%M:%S%z"
+                                        (seconds-to-time created))))
+          "---\n"))
+
+(defun anvil-memory--get-fts-body (db file)
+  "Return the body string stored in `memory_body_fts' for FILE, or nil."
+  (let ((rows (sqlite-select
+               db
+               "SELECT body FROM memory_body_fts WHERE file = ?1 LIMIT 1"
+               (list file))))
+    (and rows (caar rows))))
+
+(defun anvil-memory--resolve-export-name (file-or-name)
+  "Coerce FILE-OR-NAME into the synthetic file used in `memory_meta'."
+  (cond
+   ((anvil-memory--synthetic-file-p file-or-name) file-or-name)
+   ((string-match-p "/" file-or-name)
+    (user-error
+     "anvil-memory-export-md: only DB-direct synthetic ids or basenames are exportable"))
+   (t (concat anvil-memory--synthetic-prefix file-or-name))))
+
+(cl-defun anvil-memory-export-md (file-or-name &key path overwrite)
+  "Export a DB-direct memory entry to a .md file (DB → md, one-way).
+
+FILE-OR-NAME is either the synthetic id (`anvil-memory:db:<basename>')
+or just the basename string.  Optional :PATH overrides the output
+location; default is `<first anvil-memory-roots entry>/<basename>.md'.
+Refuses to overwrite an existing path unless :OVERWRITE is non-nil.
+
+Returns =(:path PATH :written t)=."
+  (let* ((db (anvil-memory--db))
+         (file (anvil-memory--resolve-export-name file-or-name))
+         (rows (sqlite-select
+                db
+                "SELECT type, created, ttl_policy, tags FROM memory_meta
+                  WHERE file = ?1 LIMIT 1"
+                (list file))))
+    (unless rows
+      (user-error "anvil-memory-export-md: not found in index: %s" file))
+    (let* ((row (car rows))
+           (type (intern (nth 0 row)))
+           (created (nth 1 row))
+           (basename (substring file (length anvil-memory--synthetic-prefix)))
+           (body (or (anvil-memory--get-fts-body db file) ""))
+           (display-name (anvil-memory--fallback-display-name basename))
+           (out (or path
+                    (let ((root (cl-some (lambda (r)
+                                           (and (file-directory-p r) r))
+                                         (anvil-memory--effective-roots))))
+                      (unless root
+                        (user-error
+                         "anvil-memory-export-md: no PATH and no writable root"))
+                      (expand-file-name (concat basename ".md") root)))))
+      (when (and (file-exists-p out) (not overwrite))
+        (user-error
+         "anvil-memory-export-md: refusing to overwrite (set :overwrite t to allow): %s"
+         out))
+      (make-directory (file-name-directory out) t)
+      (with-temp-file out
+        (let ((coding-system-for-write 'utf-8))
+          (insert (anvil-memory--render-frontmatter
+                   basename type display-name created))
+          (insert body)
+          (unless (string-suffix-p "\n" body)
+            (insert "\n"))))
+      (list :path out :written t))))
 
 
 ;;;; --- list ---------------------------------------------------------------
@@ -944,23 +1141,6 @@ detection to Phase 2."
 
 
 ;;;; --- Phase 2a: promote + regenerate-index ------------------------------
-
-(defconst anvil-memory--type-prefixes
-  '("feedback_" "project_" "reference_" "user_")
-  "Filename prefixes stripped / prepended by `anvil-memory-promote'.
-Order matches `anvil-memory--infer-type' so a `feedback_' file
-cannot be mis-stripped as `user_*'.")
-
-(defun anvil-memory--strip-type-prefix (basename)
-  "Return BASENAME with any known type prefix removed once."
-  (let ((result basename)
-        (stripped nil))
-    (dolist (p anvil-memory--type-prefixes)
-      (unless stripped
-        (when (string-prefix-p p result)
-          (setq result (substring result (length p))
-                stripped t))))
-    result))
 
 ;;;###autoload
 (defun anvil-memory-promote (old-file new-type)
@@ -1922,6 +2102,13 @@ non-nil → t."
     (not (member (downcase v) '("" "false" "nil" "0" "no" "off"))))
    (t t)))
 
+(defun anvil-memory--coerce-string (v)
+  "Return V as a non-empty string, or nil."
+  (cond ((null v) nil)
+        ((and (stringp v) (string-empty-p v)) nil)
+        ((stringp v) v)
+        (t nil)))
+
 (defun anvil-memory--tool-save-check (subject body
                                               &optional with_llm provider model)
   "Return top-N indexed memories similar to a draft SUBJECT/BODY.
@@ -2200,6 +2387,52 @@ Returns (:rows ROWS).  Each row carries :file-a / :file-b /
   (anvil-server-with-error-handling
    (list :rows (anvil-memory-contradictions))))
 
+(defun anvil-memory--tool-add (name type body
+                                    &optional description tags ttl_policy)
+  "Insert a DB-direct memory entry (Phase 5 write path).
+
+MCP Parameters:
+  name        - Required basename (e.g. `feedback_my_rule').  When the
+                leading `<type>_' prefix is missing it is added
+                automatically.
+  type        - Required one of user / feedback / project / reference / memo.
+  body        - Required body string (no YAML frontmatter — that is
+                synthesized on `memory-export-md').
+  description - Optional short hook (default derived from NAME).
+  tags        - Optional comma-separated string or list.
+  ttl_policy  - Optional TTL key (default: matches TYPE).
+
+Returns =(:file SYNTHETIC :name BASENAME :type TYPE :description DESC
+:created CREATED :digest SHA1)=."
+  (anvil-server-with-error-handling
+   (let ((typ (anvil-memory--coerce-type type)))
+     (unless typ
+       (user-error "memory-add: type must be supplied"))
+     (anvil-memory-add
+      (or name "") typ (or body "")
+      :description (anvil-memory--coerce-string description)
+      :tags (anvil-memory--coerce-string tags)
+      :ttl-policy (anvil-memory--coerce-type ttl_policy)))))
+
+(defun anvil-memory--tool-export-md (file_or_name
+                                          &optional path overwrite)
+  "Render a DB-direct memory entry to a .md file (DB → md, one-way).
+
+MCP Parameters:
+  file_or_name - Required synthetic id (`anvil-memory:db:<basename>') or
+                 plain basename string.
+  path         - Optional output path.  Default: `<roots>/<basename>.md'
+                 under the first writable `anvil-memory-roots' entry.
+  overwrite    - Optional truthy flag; default refuses to clobber an
+                 existing file.
+
+Returns =(:path PATH :written t)=."
+  (anvil-server-with-error-handling
+   (anvil-memory-export-md
+    (or file_or_name "")
+    :path (anvil-memory--coerce-string path)
+    :overwrite (anvil-memory--coerce-bool overwrite))))
+
 
 ;;;; --- module lifecycle ---------------------------------------------------
 
@@ -2406,7 +2639,34 @@ with canonical (sorted) pair ordering.  Returns :scanned / :stored /
      "Phase 3c: return every stored contradiction / candidate edge as
 plists with :file-a / :file-b / :verdict / :score / :checked-at.
 Read-only — rows are populated by `memory-scan-contradictions'."
-     :read-only t))
+     :read-only t)
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-add)
+     :id "memory-add"
+     :intent '(memory)
+     :layer 'workflow
+     :description
+     "Phase 5 DB-direct write path — insert a new memory entry straight
+into the SQLite index without touching any .md file.  Used as the
+primary write API in place of editing files under
+~/.claude/projects/*/memory/.  Required: `name', `type', `body'.
+Optional: `description', `tags', `ttl_policy'.  Body should NOT
+include YAML frontmatter — it is synthesized on `memory-export-md'.
+Returns the synthetic file id so callers can later round-trip the
+entry to disk via `memory-export-md'.")
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-export-md)
+     :id "memory-export-md"
+     :intent '(memory admin)
+     :layer 'workflow
+     :description
+     "Phase 5 optional: render a DB-direct memory entry back to a `.md'
+file (DB → md, one-way).  Caller-driven — no automatic hook writes
+through this tool.  Used to publish a DB-direct memory for cross-AI
+sharing (Codex CLI / Gemini CLI / Cursor read .md files).  Required:
+`file_or_name'.  Optional: `path' (default
+`<root>/<basename>.md'), `overwrite' (default false → refuses to
+clobber).  Returns =(:path PATH :written t)=."))
   "Spec list consumed by `anvil-server-register-tools'.")
 
 (defun anvil-memory--register-tools ()

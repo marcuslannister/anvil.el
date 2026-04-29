@@ -18,6 +18,18 @@ verdict + MDL distillation + static HTML viewer + live TCP server
 + contradiction store & graph + multi-provider scan を全カバー。
 Phase 4b (global user-layer promote) のみ optional / 未着手。
 
+*Phase 5 (DRAFT、本書 update 2026-04-29):* DB-primary write — Claude
+側書き込みを =memory-add= MCP tool で SQLite に直接 INSERT に切替、
+=.md= file は optional な逆出力 (=memory-export-md=、hook 非配線) と
+位置付け直す。worklog Phase 2 と同パターン。理由: Claude が両端を
+専有する場面で「scan 経由で .md → DB」は二重書き込みパスを生み認知
+負荷を増やしていた。他 AI provider (Codex CLI / Gemini CLI 等) は
+従来通り =.md= を直接編集できるよう scan 経路を維持し、user が
+=memory-export-md= を任意 timing で呼んで .md を再生成 → 他 AI に
+渡す、という明示的な interchange に整理する。Non-goals
+「全文 DB 化反対」は Phase 5 で部分撤回 (DB-direct entry のみ canonical
+を DB に移し、scan 由来 row は引き続き .md が真値)。
+
 *Phase 1a (feat/doc-29-memory-engine-phase1a):* =anvil-memory.el=
 metadata 索引 + scan + per-type TTL audit + access tracker + 4
 MCP tool (=memory-scan= / =memory-audit= / =memory-access= /
@@ -167,7 +179,11 @@ git で diff/review できない & 人間が grep できない問題が生じる
 
 - Vector embedding での semantic duplicate: Doc 18 anvil-rag の
   scope。ここは FTS5 + Levenshtein で keyword-based 重複のみ。
-- Memory の全文 DB 化 (file 廃止): git diff を失うので反対。
+- Memory の全文 DB 化 (=.md= file 廃止): 全廃 stance は Phase 5 で
+  部分撤回。Phase 5 は DB-direct entry を新たに導入するが、scan 由来
+  =.md= row は引き続き file canonical のまま (他 AI provider との
+  interchange を残すため)。「scan 由来 row は file 真値、DB-direct
+  entry は DB 真値」の hybrid 共存。
 - Multi-user memory: anvil は single-user 前提。
 - LLM auto-extraction from tool output (token-savior の
   =TS_AUTO_EXTRACT=): 保存するか否かは人間判断を維持。誤抽出の
@@ -588,6 +604,120 @@ Phase 4a で multi-provider の scan は解決したので、cross-project
 設計ポイント: (1) global DB vs global dir + existing DB 全部
 index のどちらにするか、(2) 同一 subject の重複 merge、(3)
 provider-specific convention の統一。未着手。
+
+** Phase 5 — DB-primary write + optional .md export (DRAFT)
+
+*Motivation:* Claude が両端を専有する書き込みパスでは「Write tool で
+=.md= を作成 → PostToolUse hook が rescan → DB index 更新」の二重化が
+冗長。worklog Phase 2 が DB-primary に倒した先例を踏襲し、Claude 側
+書き込みは =memory-add= MCP tool で SQLite に直接 INSERT、=.md= は
+optional な逆生成にする。他 AI provider との interchange (Codex CLI /
+Gemini CLI など) は =.md= を介する従来経路を維持し、user が任意 timing
+で =memory-export-md= を呼んで両者を同期する明示的な workflow に整理。
+
+*Non-goal (再確認):* DB-direct entry を作っても =.md= による cross-AI
+共有は維持する。auto export を hook に組まない (worklog Phase 2 と
+同方針)。conflict は「scan-from-md が後勝ち」で吸収。
+
+*** Schema 互換戦略
+
+既存 PK (=memory_meta.file=) は不変。DB-direct entry は file 列を
+synthetic prefix =anvil-memory:db:<basename>= で命名し、scan 由来 row
+(file = 実 path) と並行投入。
+
+例:
+- 既存 (scan): =/home/user/.claude/projects/X/memory/feedback_foo.md=
+- 新規 (DB):   =anvil-memory:db:feedback_foo=
+
+basename は frontmatter =name= があれば slugify して使う。type prefix
+が無ければ自動付与。
+
+migration 不要 — 既存 130+ scan-derived row は手付かず、新規分のみ
+synthetic 経路に。
+
+*** =anvil-memory-add= API
+
+#+begin_src elisp
+(anvil-memory-add NAME TYPE BODY
+                  &key description created tags ttl-policy)
+#+end_src
+
+| Param        | Default                                     |
+|--------------+---------------------------------------------|
+| NAME         | 必須。type prefix 無しならば auto prepend   |
+| TYPE         | 必須 symbol (user / feedback / project / reference / memo) |
+| BODY         | 必須 string (frontmatter なしの本文)        |
+| description  | nil = name から派生                          |
+| created      | (float-time) 当時刻                          |
+| tags         | nil                                          |
+| ttl-policy   | TYPE から既定 derive                         |
+
+挙動:
+1. =basename = (or canonical-name (anvil-memory--auto-prefix name type))=
+2. =synthetic-file = (format "anvil-memory:db:%s" basename)=
+3. body 末尾 trim + sha1 digest
+4. =memory_meta= に row INSERT (frontmatter は保存時に再合成可能なので
+   meta column のみで保持、body 全文は =memory_body_fts= 側に store)
+5. =memory_body_fts= に body INSERT (search 即時 hit)
+6. 戻り値 =(:file SYNTHETIC :name BASENAME :type TYPE :digest SHA1)=
+
+*** =anvil-memory-export-md= API (optional)
+
+#+begin_src elisp
+(anvil-memory-export-md FILE-OR-NAME &key path overwrite)
+#+end_src
+
+| Param        | Behaviour                                                |
+|--------------+----------------------------------------------------------|
+| FILE-OR-NAME | DB-direct entry の synthetic file path、または basename  |
+| path         | 出力先 (default: =<root>/<basename>.md=、root は frontmatter root か =anvil-memory-roots= の先頭) |
+| overwrite    | 既存 .md があった時の挙動 (default nil = error)         |
+
+挙動:
+1. =memory_meta= + =memory_body_fts= から row 取得
+2. frontmatter (=type= / =name= / =description= / =created=) を
+   Phase 2a で使った =anvil-memory--parse-frontmatter= 互換 format で
+   合成
+3. body 本文を append、UTF-8 で =path= に write
+
+返り値 =(:path PATH :written t)=
+
+scan を使えば書き戻した .md が次の scan で同 basename の通常 row として
+再 INSERT される (DB-direct row との両方が残る) ので、export 後に
+=memory-prune= の sandbox 化された別 invocation で synthetic 側を消す
+か否かは caller 判断。
+
+*** =memory-prune= の synthetic skip
+
+DB-direct row は file が =anvil-memory:db:= prefix なので、=file-exists-p=
+チェックで全削除されてしまう。worklog と同じ guard を入れる:
+synthetic prefix は prune 対象外。
+
+*** Test surface (Phase 5 追加分)
+
+| Test                                          | Verifies                                          |
+|-----------------------------------------------+---------------------------------------------------|
+| =memory-add-inserts-row=                      | minimal call で row + FTS が増える                 |
+| =memory-add-auto-prefixes-name=               | type prefix 無しの NAME に auto prepend           |
+| =memory-add-fts-searchable=                   | 投入直後に =memory-search= で hit                  |
+| =prune-skips-synthetic-paths=                 | DB-direct row は global prune で生存             |
+| =export-md-roundtrip=                         | export → frontmatter + body 形式で再現            |
+| =export-md-refuses-overwrite=                 | 既存 .md があれば error (overwrite=t で許可)    |
+
+合計 +6 ERT。Phase 4a 累計 130 → 136 を目標。
+
+*** MCP tools
+
+- =memory-add= — DB-direct write
+- =memory-export-md= — optional snapshot
+
+両方 server id =emacs-eval=、anvil-memory.el の audit opt-out header
+配下なので plist-return audit は通る。
+
+*** Migration の有無
+
+無し。現行 daemon に新コードを reload するだけで =memory-add= が即時
+利用可。既存 .md 関連の scan / search / list は全て不変。
 
 * Testing strategy
 
