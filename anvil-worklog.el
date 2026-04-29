@@ -354,18 +354,34 @@ Each plist has :file :start-line :end-line :machine :year :date
 ;;;; --- scan / prune -----------------------------------------------------
 
 (defun anvil-worklog--effective-roots ()
-  "Return the directory list to scan for ai-logs files."
-  (cl-remove-if-not
-   #'file-directory-p
-   (or anvil-worklog-roots anvil-worklog-default-roots)))
+  "Return the directory list to scan for ai-logs files.
+Roots whose `file-truename' resolves to a path already seen are
+dropped so symlink layouts (e.g. ~/Notes → ~/Cowork/Notes) do not
+double-index every entry under both surface paths."
+  (let ((seen (make-hash-table :test 'equal))
+        result)
+    (dolist (root (or anvil-worklog-roots anvil-worklog-default-roots))
+      (when (file-directory-p root)
+        (let ((canonical (file-truename (expand-file-name root))))
+          (unless (gethash canonical seen)
+            (puthash canonical t seen)
+            (push root result)))))
+    (nreverse result)))
 
 (defun anvil-worklog--list-files (roots)
-  "Return the list of `ai-logs-*-YYYY.org' paths under ROOTS."
-  (let (acc)
+  "Return the list of `ai-logs-*-YYYY.org' paths under ROOTS.
+Files whose `file-truename' has already been emitted are skipped
+so a symlink chain pointing at the same backing org never produces
+two index rows for one entry."
+  (let ((seen (make-hash-table :test 'equal))
+        acc)
     (dolist (root roots)
       (when (file-directory-p root)
         (dolist (path (directory-files root t "\\`ai-logs-.+-[0-9]\\{4\\}\\.org\\'"))
-          (push path acc))))
+          (let ((canonical (file-truename path)))
+            (unless (gethash canonical seen)
+              (puthash canonical t seen)
+              (push path acc))))))
     (nreverse acc)))
 
 (defun anvil-worklog--upsert-entry (db entry now)
