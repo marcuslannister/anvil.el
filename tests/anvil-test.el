@@ -457,7 +457,13 @@ from the PID that ran the first call."
            :description "slow"
            :server-id "anvil-test"
            :offload t
-           :offload-timeout 0.4)
+           ;; macOS GitHub Actions runners can spend ~400ms just
+           ;; dispatching an IPC round-trip; a 0.4s budget races
+           ;; with that overhead and the kill misses, leaving the
+           ;; second call landing on the SAME slot (PID equal).
+           ;; Stub sleeps 30s so any value well under that still
+           ;; exercises the budget-exceed path.
+           :offload-timeout 2.0)
           (let* ((metrics (make-anvil-server-metrics))
                  (decode-pid (lambda (resp)
                                (let* ((r (alist-get 'result
