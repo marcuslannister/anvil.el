@@ -116,7 +116,7 @@ not invoked.  Surface today via this path: =file-*= / =shell-*= /
 
 ** Path B — Emacs integrated (recommended for Emacs users)
 
-For day-to-day Emacs users.  Pin to v1.0.0 via your favourite
+For day-to-day Emacs users.  Pin to v1.1.1 via your favourite
 package manager.
 
 *** Quick install (one command)
@@ -142,17 +142,17 @@ installed.
 #+begin_src emacs-lisp
 ;; async-installer
 (async-installer-git-add "https://github.com/zawatton/anvil.el.git"
-                         :tag "v1.0.0"
+                         :tag "v1.1.1"
                          :main "anvil.el")
 
 ;; or straight.el
 (straight-use-package
  '(anvil :type git :host github :repo "zawatton/anvil.el"
-         :branch "v1.0.0"))
+         :branch "v1.1.1"))
 
 ;; or elpaca
 (elpaca (anvil :host github :repo "zawatton/anvil.el"
-               :ref "v1.0.0"))
+               :ref "v1.1.1"))
 #+end_src
 
 After installing:
@@ -533,10 +533,12 @@ refactor in one MCP call.
 
 For legacy data extraction and ETL, the usual flow is "read the
 whole file then assemble with regex." This tool replaces that
-with a single MCP call. =:block-start= matches each block opener,
+with a single MCP call. =:block-start= matches each block header,
 =:block-end= picks the closing strategy (=brace-balance= skips
 braces inside strings), =:fields= regexps capture per-field
 values; the result comes back as a list of plain-data records.
+For =brace-balance=, =:block-start= should stop before the opening
+={=; the matcher then finds that brace and balances from there.
 The file body itself is never sent back to the agent.
 
 Measured: extracted 347 item definitions from =func492.ts= in
